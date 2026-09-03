@@ -4,14 +4,16 @@ Liest Parameter aus einer JSON-Datei und fuehrt GDAL-abhaengige Funktionen aus.
 Ausgabe geht auf stdout -> wird vom GUI live im Log angezeigt.
 
 Aktionen:
-    info    - Metadaten aus Quelldatei lesen, Ergebnis als JSON auf stdout
-    process - DMC-TIFF-Pipeline:
-              1) Mosaik der technischen 200m-Kacheln (bestehendes True_Ortho.vrt
-                 wird uebernommen, falls vorhanden, sonst frisch aus *.tif gebaut)
-              2) Cutline-Clip auf die gueltige Flaeche (alles ausserhalb -> NoData)
-              3) Zuschnitt auf das 1km x 1km-Grid (Dateiname aus Attribut 'NAME'),
-                 parallelisiert ueber mehrere Kerne, Zwischenergebnisse im
-                 Staging-Ordner (z.B. Y:\\02_DMC_tempProcessingFolder)
+    info        - Metadaten aus Quelldatei lesen, Ergebnis als JSON auf stdout
+    process     - DMC-TIFF-Pipeline (Tab "DMC - TIFFconverter"):
+                  1) Mosaik der technischen 200m-Kacheln (bestehendes True_Ortho.vrt
+                     wird uebernommen, falls vorhanden, sonst frisch aus *.tif gebaut)
+                  2) Cutline-Clip auf die gueltige Flaeche (alles ausserhalb -> NoData)
+                  3) Zuschnitt auf das 1km x 1km-Grid (Dateiname aus Attribut 'NAME'),
+                     parallelisiert ueber mehrere Kerne, Zwischenergebnisse im
+                     Staging-Ordner (z.B. Y:\\02_DMC_tempProcessingFolder)
+    process_las - DMC-LAS-Pipeline (Tab "DMC - LASconverter [LHN95]"), siehe
+                  Kommentarblock direkt ueber _process_las() weiter unten.
 """
 
 import sys
@@ -466,7 +468,8 @@ def _process(cfg: dict) -> None:
 # Ablauf:
 #   1) Metadaten (Bounding Box) aller Input-.laz/.las-Kacheln parallel einlesen
 #      (pdal info --metadata, headerbasiert, kein Decompress der Punktdaten)
-#   2) Raster (EIN Gesamt-TIFF fuer die AOI):
+#   2) Raster (EIN Gesamt-TIFF fuer die AOI), nur falls "Create Raster" aktiv -
+#      laeuft als Hintergrund-Thread PARALLEL zu Schritt 3 (nicht seriell davor):
 #      a) alle Input-Kacheln mergen, optional thinnen
 #      b) als Float32-Raster rastern (PDAL writers.gdal, IDW), Pixelursprung
 #         auf ein sauberes GSD-Vielfaches gesnappt (keine AOI-Kante im Grid)
@@ -476,6 +479,8 @@ def _process(cfg: dict) -> None:
 #      croppen, optional thinnen, als .las oder .laz schreiben (out_format,
 #      Default .las - wird u.a. fuer GeoSuite-Reframe LHN95->LN02 benoetigt)
 #      (parallelisiert ueber mehrere Prozesse, analog TIFFconverter)
+#   Vor dem Staging-Aufraeumen wird auf den Raster-Hintergrund-Thread gewartet
+#   (Schritt 2 schreibt Zwischendateien in denselben Staging-Ordner).
 #
 # Hoehensystem: Input-Kacheln sind LHN95, Output bleibt LHN95 (kein Reframe
 # nach LN02 - swisstopo selbst beschreibt diese Transformation als Naeherung

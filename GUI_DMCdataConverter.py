@@ -1,13 +1,20 @@
 """
 GUI_DMCdataConverter.py - DMC Werkzeuge GUI
 Tkinter-Oberflaeche mit zwei Tabs:
-  - "DMC - TIFFconverter" : technische 200m-DOP-Kacheln clippen (gueltige Flaeche)
-                            und ins 1km x 1km-Grid umkacheln (parallelisiert)
-  - "DMC - LASconverter"  : noch nicht definiert (Platzhalter)
+  - "DMC - TIFFconverter"       : technische 200m-DOP-Kacheln clippen (gueltige
+                                   Flaeche) und ins 1km x 1km-Grid umkacheln
+                                   (parallelisiert)
+  - "DMC - LASconverter [LHN95]": technische 200m-LAZ-Kacheln per AOI croppen,
+                                   optional thinnen, ins 1km x 1km-Grid umkacheln
+                                   (.las/.laz) und optional zu einem Gesamt-DSM-
+                                   Raster (.tif/.tfw) rastern - Hoehe bleibt LHN95,
+                                   Reframe zu LN02 erfolgt separat via GeoSuite
 Styling analog zu topo-COGTIFFconverter / GUI_cogtiffConverter.py.
 
 Das GUI laeuft mit Standard-Python (kein osgeo erforderlich).
 GDAL-Operationen werden via _osgeo_runner.py als Subprocess (OSGeo4W Python) ausgefuehrt.
+Punktwolken-Operationen (Tab 2) laufen via PDAL-CLI-Subprocess (pdal.exe, automatisch
+erkannt), orchestriert vom selben OSGeo4W-Python-Prozess.
 """
 
 import ctypes
