@@ -572,12 +572,14 @@ def _las_cell_worker(args) -> tuple:
             pass
 
 
-def _build_las_raster(tiles, run_dir: Path, output_path: str, pdal_exe: str,
-                       gsd: float, thin_m, clip_shape_path: str,
+def _build_las_raster(tiles, run_dir: Path, output_path: str, hillshade_output_path: str,
+                       pdal_exe: str, gsd: float, thin_m, clip_shape_path: str,
                        all_bounds: tuple, num_threads: str, log, progress) -> None:
-    """Ein Gesamt-Raster fuer die AOI: alle Kacheln mergen -> optional thinnen ->
-    rastern (IDW, Pixelursprung auf GSD-Vielfaches gesnapped) ->
-    per AOI-Shape maskieren (NoData ausserhalb, Cutline wie im TIFFconverter)."""
+    """Ein Gesamt-Raster (DSM) fuer die AOI: alle Kacheln mergen -> optional thinnen ->
+    rastern (IDW, Pixelursprung auf GSD-Vielfaches gesnapped) -> per AOI-Shape
+    maskieren (NoData ausserhalb, Cutline wie im TIFFconverter). Danach wird aus dem
+    fertigen (bereits geclippten) DSM ein Hillshade gerechnet und ebenfalls per
+    AOI-Shape maskiert (NoData=255)."""
     import math
     from osgeo import gdal
     gdal.UseExceptions()
@@ -665,7 +667,40 @@ def _build_las_raster(tiles, run_dir: Path, output_path: str, pdal_exe: str,
         raise RuntimeError("gdal.Warp hat None zurueckgegeben - Raster-Clip fehlgeschlagen.")
     out_ds.FlushCache()
     out_ds = None
-    log(f"  Gesamt-Raster geschrieben: {output_path}")
+    log(f"  Gesamt-Raster (DSM) geschrieben: {output_path}")
+
+    # --- Hillshade aus dem fertigen (bereits geclippten) DSM rechnen ---
+    log("\nErzeuge Hillshade aus dem DSM...")
+    raw_hillshade_path = run_dir / "05_hillshade_raw.tif"
+    hs_ds = gdal.DEMProcessing(
+        str(raw_hillshade_path), output_path, "hillshade",
+        options=gdal.DEMProcessingOptions(computeEdges=True),
+    )
+    if hs_ds is None:
+        raise RuntimeError("gdal.DEMProcessing hat None zurueckgegeben - Hillshade fehlgeschlagen.")
+    hs_ds.FlushCache()
+    hs_ds = None
+
+    log(f"  Clippe Hillshade auf AOI (Cutline): {clip_shape_path}  (NoData ausserhalb = 255)")
+    hs_warp_options = gdal.WarpOptions(
+        format="GTiff",
+        cutlineDSName=clip_shape_path,
+        cropToCutline=False,
+        dstNodata=255,
+        multithread=True,
+        warpOptions=[f"NUM_THREADS={num_threads}"],
+        outputSRS="EPSG:2056",
+        creationOptions=[
+            "TILED=YES", "BLOCKXSIZE=512", "BLOCKYSIZE=512",
+            "COMPRESS=LZW", "PREDICTOR=2", "BIGTIFF=YES", "TFW=YES",
+        ],
+    )
+    hs_out_ds = gdal.Warp(hillshade_output_path, str(raw_hillshade_path), options=hs_warp_options)
+    if hs_out_ds is None:
+        raise RuntimeError("gdal.Warp hat None zurueckgegeben - Hillshade-Clip fehlgeschlagen.")
+    hs_out_ds.FlushCache()
+    hs_out_ds = None
+    log(f"  Hillshade geschrieben: {hillshade_output_path}")
 
 
 def _process_las(cfg: dict) -> None:
@@ -759,30 +794,34 @@ def _process_las(cfg: dict) -> None:
     _log(f"Raster erstellen    : {'AKTIV (GSD ' + format(gsd_raster, 'g') + ' m)' if create_raster else 'inaktiv'}")
     _log(f"Punktwolken-Format  : .{out_format}")
     _log(f"Benennung           : {jahr}_{area}_TIN_{thin_token}raw_<NAME>_LV95_LHN95.{out_format}")
-    if create_raster:
-        _log(f"Raster-Benennung    : {jahr}_{area}_TIN_{thin_token}raw_LV95_LHN95.tif  (+ .tfw)")
 
-    # --- Schritt 2: Gesamt-Raster (EIN TIFF fuer die AOI), nur falls aktiviert ---
+    # --- Schritt 2: Gesamt-Raster (DSM + Hillshade fuer die AOI), nur falls aktiviert ---
     # Laeuft als Hintergrund-Thread (der eigentliche Rechenaufwand steckt im
-    # PDAL-Subprocess, nicht im Python-Thread) - parallel zur Punktwolken-
-    # Verarbeitung in Schritt 5, nutzt also einen zusaetzlichen Kern nebenbei
-    # statt seriell davor zu laufen.
+    # PDAL-Subprocess bzw. in gdal.Warp/gdal.DEMProcessing, nicht im Python-Thread) -
+    # parallel zur Punktwolken-Verarbeitung in Schritt 5, nutzt also einen
+    # zusaetzlichen Kern nebenbei statt seriell davor zu laufen.
     raster_name = None
+    hillshade_name = None
     raster_executor = None
     raster_future = None
     if create_raster:
-        raster_name = f"{jahr}_{area}_TIN_{thin_token}raw_LV95_LHN95.tif"
+        gsd_label = f"{round(gsd_raster * 100)}cm"
+        raster_name = f"{jahr}_{area}_DSM_{gsd_label}_LV95_LHN95.tif"
+        hillshade_name = f"{jahr}_{area}_hillshade_{gsd_label}_LV95_LHN95.tif"
         raster_out_path = str(Path(output_dir_raster) / raster_name)
+        hillshade_out_path = str(Path(output_dir_raster) / hillshade_name)
+        _log(f"Raster-Benennung    : {raster_name}  (+ .tfw)")
+        _log(f"Hillshade-Benennung : {hillshade_name}  (+ .tfw)")
         raster_executor = ThreadPoolExecutor(max_workers=1)
         raster_future = raster_executor.submit(
             _build_las_raster,
-            [t[0] for t in tile_bboxes], run_dir, raster_out_path, pdal_exe,
+            [t[0] for t in tile_bboxes], run_dir, raster_out_path, hillshade_out_path, pdal_exe,
             gsd_raster, thin_m, clip_shape_path,
             (all_minx, all_miny, all_maxx, all_maxy),
             str(num_workers), _log, _progress,
         )
-        _log("\nRaster-Build im Hintergrund gestartet (laeuft parallel zur "
-             "Punktwolken-Verarbeitung weiter unten)...")
+        _log("\nRaster-Build (DSM + Hillshade) im Hintergrund gestartet (laeuft parallel "
+             "zur Punktwolken-Verarbeitung weiter unten)...")
 
     # --- Schritt 3: Clip-Shape fuer die LAZ-Ausgabe als WKT einlesen ---
     _log(f"\nLese Clip-Shape (fuer LAZ-Crop): {clip_shape_path}")
@@ -921,7 +960,8 @@ def _process_las(cfg: dict) -> None:
     else:
         _log(f"\nStaging-Dateien bleiben erhalten: {run_dir}")
 
-    raster_line = f"Raster: {raster_name}\n" if raster_name else "Raster: nicht erstellt (Option deaktiviert)\n"
+    raster_line = (f"Raster: {raster_name}, Hillshade: {hillshade_name}\n" if raster_name
+                   else "Raster: nicht erstellt (Option deaktiviert)\n")
     _log(f"\nFertig. {raster_line}"
          f".{out_format}: {written} Kachel(n) geschrieben, {skipped} uebersprungen (kein Overlap), "
          f"{empty_skipped} leer (0 Punkte nach Clip), {errors} Fehler.")

@@ -9,8 +9,8 @@ zwei Tabs:
   parallelisiert ins publikationsfaehige 1km x 1km-Grid um (Dateiname aus Attribut `NAME`).
 - **DMC - LASconverter [LHN95]** (PDAL) — croppt technische LAZ-Kacheln (Punktwolke) per
   AOI-Shape, thinnt optional, schneidet sie parallelisiert ins 1km x 1km-Grid um (`.las`/`.laz`)
-  und rastert optional zusaetzlich ein Gesamt-DSM (`.tif`/`.tfw`) fuer die ganze AOI. Hoehe
-  bleibt LHN95 (kein Reframe im Tool — siehe unten); die `.las`-Ausgabe ist fuer den
+  und rastert optional zusaetzlich ein Gesamt-DSM + Hillshade (`.tif`/`.tfw`) fuer die ganze
+  AOI. Hoehe bleibt LHN95 (kein Reframe im Tool — siehe unten); die `.las`-Ausgabe ist fuer den
   nachgelagerten Reframe LHN95→LN02 via GeoSuite gedacht.
 
 Struktur und Styling analog zu `topo-COGTIFFconverter`.
@@ -89,15 +89,19 @@ automatisch erkannt (PATH, OSGeo4W-/QGIS-Installationspfade), kein eigenes GUI-F
 
 1. **Projekt-Parameter**: Jahr, AREA/AOI-Name, **Thinning** (Dropdown: kein Thinning / 0.1m /
    0.2m / 0.4m / 1m / 2m — Poisson-Disk-Sampling via `filters.sample`, Mindestabstand nach
-   Reduktion), **Create Raster from LAZ** (Checkbox — blendet bei Aktivierung das GSD-Feld und
-   den Raster-Output-Ordner ein). Ergibt zusammen mit dem Attribut `NAME` des Grid-Shapes die
-   Ausgabebenennung:
+   Reduktion), **Create DSM-Raster from LAZ** (Checkbox — blendet bei Aktivierung das GSD-Feld
+   und den Raster-Output-Ordner ein; erzeugt neben dem DSM automatisch auch ein Hillshade, kein
+   separates Haekchen dafuer noetig). Ergibt zusammen mit dem Attribut `NAME` des Grid-Shapes
+   bzw. der GSD die Ausgabebenennung:
    ```
    <JAHR>_<AREA>_TIN_[thinnedout<NN>_]raw_<NAME>_LV95_LHN95.<las|laz>   (pro 1km-Kachel)
-   <JAHR>_<AREA>_TIN_[thinnedout<NN>_]raw_LV95_LHN95.tif  (+ .tfw)      (Gesamt-Raster, optional)
+   <JAHR>_<AREA>_DSM_<GSD>cm_LV95_LHN95.tif  (+ .tfw)                   (DSM, optional)
+   <JAHR>_<AREA>_hillshade_<GSD>cm_LV95_LHN95.tif  (+ .tfw)             (Hillshade, optional)
    ```
-   `<NN>` = Thinning-Wert in Dezimetern, zweistellig (z.B. `04` bei 0.4m).
-   Beispiel: `2026_GUPPENFIRN_TIN_thinnedout04_raw_2713_1206_LV95_LHN95.las`
+   `<NN>` = Thinning-Wert in Dezimetern, zweistellig (z.B. `04` bei 0.4m). `<GSD>cm` = Raster-
+   Aufloesung in Zentimetern (z.B. `50cm` bei 0.5m).
+   Beispiel: `2026_GUPPENFIRN_TIN_thinnedout04_raw_2713_1206_LV95_LHN95.las`,
+   `2026_GUPPENFIRN_DSM_50cm_LV95_LHN95.tif`, `2026_GUPPENFIRN_hillshade_50cm_LV95_LHN95.tif`
 
 2. **Input-Ordner**: Ordner mit den technischen 200m x 200m-LAZ-Kacheln.
 
@@ -105,14 +109,16 @@ automatisch erkannt (PATH, OSGeo4W-/QGIS-Installationspfade), kein eigenes GUI-F
    `las`): Ziel fuer die 1km-Grid-Kacheln. Default `las`, da die Weiterverarbeitung (Reframe
    LHN95→LN02) via GeoSuite unkomprimiertes LAS erwartet.
 
-4. **Output-Ordner (DSM-Raster)**: nur sichtbar, wenn "Create Raster from LAZ" aktiv ist. Ziel
-   fuer das eine Gesamt-TIFF+TFW der AOI.
+4. **Output-Ordner (DSM-Raster)**: nur sichtbar, wenn "Create DSM-Raster from LAZ" aktiv ist.
+   Ziel fuer das eine DSM-TIFF+TFW und das Hillshade-TIFF+TFW der AOI (beide im selben Ordner).
 
 5. **Clip-Shape (AOI)**: Bei den LAZ-Kacheln ein echter Crop (Punkte ausserhalb werden aus der
-   Punktwolke entfernt), beim Raster eine Maskierung (ausserhalb -> NoData, Extent bleibt).
+   Punktwolke entfernt), bei DSM und Hillshade je eine Maskierung (ausserhalb -> NoData, Extent
+   bleibt).
 
 6. **Grid-Shape (1km x 1km)**: wie bei Tab 1 — Attribut `NAME`, Standard `chGRID_1km2.shp`,
-   nur fuer die LAZ/LAS-Ausgabe relevant (das Raster ist ein einzelnes Gesamtbild ohne Kachelung).
+   nur fuer die LAZ/LAS-Ausgabe relevant (DSM/Hillshade sind je ein einzelnes Gesamtbild ohne
+   Kachelung).
 
 7. **Staging & Parallelisierung**: analog Tab 1, eigener Staging-Unterordner (`<AREA>_<JAHR>_LAS`).
 
@@ -122,14 +128,22 @@ automatisch erkannt (PATH, OSGeo4W-/QGIS-Installationspfade), kein eigenes GUI-F
 
 1. Metadaten (Bounding Box) aller Input-Kacheln parallel einlesen (`pdal info --metadata`,
    headerbasiert, kein Decompress der Punktdaten).
-2. *(falls "Create Raster" aktiv, laeuft als Hintergrund-Thread parallel zu Schritt 3, nicht
-   seriell davor)*: alle Kacheln mergen, optional thinnen, als Float32-Raster rastern
+2. *(falls "Create DSM-Raster" aktiv, laeuft als Hintergrund-Thread parallel zu Schritt 3, nicht
+   seriell davor)*: alle Kacheln mergen, optional thinnen, als Float32-DSM rastern
    (`writers.gdal`, IDW-Interpolation) — Pixelursprung auf ein sauberes GSD-Vielfaches gesnappt,
    danach per AOI-Cutline maskiert (NoData = `-3.4028235e+38`, analog GDWH-Konvention bei
-   SB_DSM). Vor dem Staging-Aufraeumen wird auf diesen Hintergrund-Thread gewartet.
+   SB_DSM). Anschliessend wird aus diesem fertigen (bereits geclippten) DSM ein Hillshade
+   gerechnet (`gdal.DEMProcessing`) und ebenfalls per AOI-Cutline maskiert (NoData = `255`).
+   Vor dem Staging-Aufraeumen wird auf diesen Hintergrund-Thread gewartet.
 3. Pro 1km-Grid-Zelle (parallelisiert, `ProcessPoolExecutor`): ueberlappende Input-Kacheln
    mergen → Crop auf Zellgrenzen → Crop auf AOI-Polygon → optional thinnen → als `.las`/`.laz`
    schreiben. Zellen mit 0 Punkten nach dem Clip werden verworfen.
+
+DSM/Hillshade (Schritt 2) und die Punktwolken-Kacheln (Schritt 3) lesen beide direkt aus den
+komprimierten `.laz`-Inputs (PDAL entpackt on-the-fly, kein Zwischenschritt "erst alles zu LAS
+konvertieren"). Ob eine Punktwolken-Kachel als `.las` oder `.laz` geschrieben wird, entscheidet
+sich rein an der Dateiendung des letzten `writers.las`-Schritts — also erst nach Crop, AOI-Clip
+und Thinning, nicht davor.
 
 ### Fachliche Absicherungen
 
@@ -141,6 +155,10 @@ automatisch erkannt (PATH, OSGeo4W-/QGIS-Installationspfade), kein eigenes GUI-F
   wird bewusst die amtliche GeoSuite/REFRAME-Software separat verwendet (`.las`-Output).
 - **`scale_x/y/z = 0.01`** fix in den Output-Kacheln gesetzt (Schweizer Konvention, keine
   uebertriebene Nachkommastellen-Praezision).
+- **NoData-Werte unterscheiden sich bewusst**: DSM = `-3.4028235e+38` (Float32-Minimum, GDWH-
+  Konvention SB_DSM), Hillshade = `255` (Byte) — da 0 im Hillshade ein legitimer Schattenwert
+  ist, wird die AOI-Maskierung rein geometrisch per Cutline vorgenommen (nicht ueber einen
+  Pixelwert), damit echte Schattenpixel innerhalb der AOI nicht faelschlich zu NoData werden.
 - **Punktzahl-Check**: nach dem Schreiben wird die Punktzahl der Ausgabekachel geprueft — 0
   Punkte nach Clip → Kachel wird verworfen statt einer leeren Datei.
 

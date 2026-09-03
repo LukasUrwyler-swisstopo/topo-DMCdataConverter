@@ -366,11 +366,12 @@ class DMCConverterApp(tk.Tk):
         self._dim_labels.append(h_thin)
 
         self._las_create_raster_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(sec, text="Create Raster from LAZ  (ein Gesamt-TIFF+TFW fuer die AOI)",
+        ttk.Checkbutton(sec, text="Create DSM-Raster from LAZ  (ein Gesamt-TIFF+TFW fuer die AOI)",
                          variable=self._las_create_raster_var,
                          command=self._on_las_create_raster_toggle
                          ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(10, 0))
-        h_rast = ttk.Label(sec, text="Alle Tiles mergen -> IDW-Raster -> per AOI NoData-maskiert", font=("", 8))
+        h_rast = ttk.Label(sec, text="Alle Tiles mergen -> IDW-Raster (DSM) -> per AOI NoData-maskiert -> "
+                                      "zusaetzlich automatisch Hillshade daraus gerechnet (NoData=255)", font=("", 8))
         h_rast.grid(row=5, column=0, columnspan=3, sticky="w", padx=(20, 0))
         self._dim_labels.append(h_rast)
 
@@ -384,6 +385,7 @@ class DMCConverterApp(tk.Tk):
         h3 = ttk.Label(self._las_gsd_frame, text="in Metern, z.B. 0.5", font=("", 8))
         h3.pack(side="left")
         self._dim_labels.append(h3)
+        self._las_gsd_var.trace_add("write", lambda *_: self._update_las_name_preview())
         self._on_las_create_raster_toggle()
 
         name_lbl = ttk.Label(sec, text="Ausgabe-Benennung:", font=("Segoe UI", 9, "bold"))
@@ -421,7 +423,12 @@ class DMCConverterApp(tk.Tk):
         ext = out_format.get() if out_format is not None else "las"
         text = f"Punktwolke (pro 1km-Tiles):  {jahr}_{area}_TIN_{thin_token}raw_<NAME>_LV95_LHN95.{ext}"
         if getattr(self, "_las_create_raster_var", None) and self._las_create_raster_var.get():
-            text += f"\nRaster (gesamte AOI):  {jahr}_{area}_TIN_{thin_token}raw_LV95_LHN95.tif  (+ .tfw)"
+            try:
+                gsd_label = f"{round(float(self._las_gsd_var.get().strip().replace('m', '')) * 100)}cm"
+            except (ValueError, AttributeError):
+                gsd_label = "GSD"
+            text += (f"\nDSM (gesamte AOI):        {jahr}_{area}_DSM_{gsd_label}_LV95_LHN95.tif  (+ .tfw)"
+                     f"\nHillshade (gesamte AOI):  {jahr}_{area}_hillshade_{gsd_label}_LV95_LHN95.tif  (+ .tfw)")
         self._las_name_preview_lbl.config(text=text)
 
     def _las_thin_token(self) -> str:
@@ -1419,7 +1426,7 @@ class DMCConverterApp(tk.Tk):
         if self._las_create_raster_var.get():
             out_dir_raster = self._las_out_raster_var.get().strip()
             if not out_dir_raster:
-                errors.append("Output-Ordner (DSM-Raster) fehlt (da 'Create Raster from LAZ' aktiviert ist).")
+                errors.append("Output-Ordner (DSM-Raster) fehlt (da 'Create DSM-Raster from LAZ' aktiviert ist).")
 
         clip = self._las_clip_var.get().strip()
         if not clip:
