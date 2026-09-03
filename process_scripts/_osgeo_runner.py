@@ -492,7 +492,9 @@ def _pdal_info_metadata(pdal_exe: str, path: str) -> dict:
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                              universal_newlines=True)
     if result.returncode != 0:
-        raise RuntimeError((result.stderr or result.stdout or "unbekannter pdal-Fehler").strip())
+        msg = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(f"pdal info beendet mit Exit-Code {result.returncode}"
+                            + (f": {msg}" if msg else " (kein stdout/stderr - moeglicher Absturz)"))
     return json.loads(result.stdout)["metadata"]
 
 
@@ -510,7 +512,16 @@ def _run_pdal_pipeline(pdal_exe: str, pipeline_path: Path) -> None:
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                              universal_newlines=True)
     if result.returncode != 0:
-        raise RuntimeError((result.stderr or result.stdout or "unbekannter pdal-Fehler").strip())
+        msg = (result.stderr or result.stdout or "").strip()
+        rc = result.returncode
+        rc_hex = f" (0x{rc & 0xFFFFFFFF:08X})" if rc < 0 else ""
+        hint = ""
+        if not msg:
+            hint = (" - kein stdout/stderr trotz Fehlercode: deutet auf einen abrupten "
+                    "Prozessabsturz hin (z.B. zu wenig RAM bei vielen parallelen "
+                    "pdal.exe-Prozessen), nicht auf einen regulaeren PDAL-Fehler.")
+        raise RuntimeError(f"pdal pipeline beendet mit Exit-Code {rc}{rc_hex}{hint}"
+                            + (f": {msg}" if msg else ""))
 
 
 def _las_cell_worker(args) -> tuple:
@@ -922,11 +933,18 @@ def _process_las(cfg: dict) -> None:
             "Keine Grid-Kachel ueberlappt die Input-Kacheln - Grid-Shape/Input pruefen."
         )
 
-    _log(f"\nStarte parallele Verarbeitung: {len(jobs)} Kachel(n) auf {num_workers} Prozess(en)\n")
+    # Der Raster-Build (falls aktiv) laeuft als zusaetzlicher pdal.exe-Prozess im
+    # Hintergrund - hier einen Slot dafuer reservieren, damit insgesamt nie mehr
+    # gleichzeitige pdal.exe-Prozesse laufen als unter "CPU-Kerne" eingestellt
+    # (sonst droht bei grossen Projekten Ressourcenueberlastung/Absturz).
+    laz_workers = max(1, num_workers - 1) if create_raster else num_workers
+    _log(f"\nStarte parallele Verarbeitung: {len(jobs)} Kachel(n) auf {laz_workers} Prozess(en)"
+         + (f" ({num_workers} CPU-Kerne, 1 davon fuer den Raster-Build reserviert)" if create_raster else "")
+         + "\n")
 
     laz_progress_start = 0.10  # Raster-Build laeuft parallel im Hintergrund, nicht mehr seriell davor
     written = errors = empty_skipped = done = 0
-    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+    with ProcessPoolExecutor(max_workers=laz_workers) as executor:
         futures = {
             executor.submit(_las_cell_worker,
                              (job, str(run_dir), output_dir_laz, pdal_exe, clip_wkt, thin_m, out_format)
