@@ -1,10 +1,10 @@
 """
 GUI_DMCdataConverter.py - DMC Werkzeuge GUI
 Tkinter-Oberflaeche mit zwei Tabs:
-  - "DMC - TIFFconverter"       : technische 200m-DOP-Kacheln clippen (gueltige
+  - "DMC - TIFFconverter"       : technische 200m-DOP-Tiles clippen (gueltige
                                    Flaeche) und ins 1km x 1km-Grid umkacheln
                                    (parallelisiert)
-  - "DMC - LASconverter [LHN95]": technische 200m-LAZ-Kacheln per AOI croppen,
+  - "DMC - LASconverter [LHN95]": technische 200m-LAZ-Tiles per AOI croppen,
                                    optional thinnen, ins 1km x 1km-Grid umkacheln
                                    (.las/.laz) und optional zu einem Gesamt-DSM-
                                    Raster (.tif/.tfw) rastern - Hoehe bleibt LHN95,
@@ -370,7 +370,7 @@ class DMCConverterApp(tk.Tk):
                          variable=self._las_create_raster_var,
                          command=self._on_las_create_raster_toggle
                          ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(10, 0))
-        h_rast = ttk.Label(sec, text="Alle Kacheln mergen -> IDW-Raster -> per AOI NoData-maskiert", font=("", 8))
+        h_rast = ttk.Label(sec, text="Alle Tiles mergen -> IDW-Raster -> per AOI NoData-maskiert", font=("", 8))
         h_rast.grid(row=5, column=0, columnspan=3, sticky="w", padx=(20, 0))
         self._dim_labels.append(h_rast)
 
@@ -419,7 +419,7 @@ class DMCConverterApp(tk.Tk):
         thin_token = self._las_thin_token()
         out_format = getattr(self, "_las_out_format_var", None)
         ext = out_format.get() if out_format is not None else "las"
-        text = f"Punktwolke (pro 1km-Kachel):  {jahr}_{area}_TIN_{thin_token}raw_<NAME>_LV95_LHN95.{ext}"
+        text = f"Punktwolke (pro 1km-Tiles):  {jahr}_{area}_TIN_{thin_token}raw_<NAME>_LV95_LHN95.{ext}"
         if getattr(self, "_las_create_raster_var", None) and self._las_create_raster_var.get():
             text += f"\nRaster (gesamte AOI):  {jahr}_{area}_TIN_{thin_token}raw_LV95_LHN95.tif  (+ .tfw)"
         self._las_name_preview_lbl.config(text=text)
@@ -444,7 +444,7 @@ class DMCConverterApp(tk.Tk):
         sec.columnconfigure(1, weight=1)
 
         row = 0
-        lbl = ttk.Label(sec, text="Input-Ordner (.laz-Kacheln):", font=("Segoe UI", 9, "bold"))
+        lbl = ttk.Label(sec, text="Input-Ordner (.laz-Tiles):", font=("Segoe UI", 9, "bold"))
         lbl.grid(row=row, column=0, sticky="w", pady=3)
         self._las_in_var = tk.StringVar()
         ttk.Entry(sec, textvariable=self._las_in_var
@@ -473,7 +473,7 @@ class DMCConverterApp(tk.Tk):
                      values=["las", "laz"], state="readonly", width=6
                      ).pack(side="left", padx=(8, 8))
         self._las_out_format_var.trace_add("write", lambda *_: self._update_las_name_preview())
-        h = ttk.Label(fmt_row, text="1km-Grid-Kacheln  |  Default 'las' (fuer GeoSuite-Reframe LHN95->LN02)",
+        h = ttk.Label(fmt_row, text="1km-Grid-Tiles  |  Default 'las' (fuer GeoSuite-Reframe LHN95->LN02)",
                        font=("", 8))
         h.pack(side="left")
         self._dim_labels.append(h)
@@ -495,7 +495,7 @@ class DMCConverterApp(tk.Tk):
         self._on_las_create_raster_toggle()
         row += 1
 
-        lbl = ttk.Label(sec, text="Clip-Shape (AOI / gueltige Flaeche):", font=("Segoe UI", 9, "bold"))
+        lbl = ttk.Label(sec, text="AOI Clip-Shape (gültige Fläche):", font=("Segoe UI", 9, "bold"))
         lbl.grid(row=row, column=0, sticky="w", pady=(8, 3))
         self._las_clip_var = tk.StringVar()
         ttk.Entry(sec, textvariable=self._las_clip_var
@@ -545,7 +545,7 @@ class DMCConverterApp(tk.Tk):
             self._accent_labels.append(val)
 
         info_hint = ttk.Label(sec,
-            text="Metadaten der ersten gefundenen Kachel im Input-Ordner (stellvertretend fuer alle Kacheln), via pdal info",
+            text="Metadaten der ersten gefundenen Tile im Input-Ordner (stellvertretend fuer alle Tiles), via pdal info",
             font=("", 8))
         info_hint.grid(row=len(fields), column=0, columnspan=2, sticky="w", pady=(4, 0))
         self._dim_labels.append(info_hint)
@@ -675,7 +675,7 @@ class DMCConverterApp(tk.Tk):
         self._dim_labels.append(h)
         row += 1
 
-        lbl = ttk.Label(sec, text="Output-Ordner (1km-Kacheln):", font=("Segoe UI", 9, "bold"))
+        lbl = ttk.Label(sec, text="Output-Ordner (1km-Tiles):", font=("Segoe UI", 9, "bold"))
         lbl.grid(row=row, column=0, sticky="w", pady=(8, 3))
         self._out_var = tk.StringVar()
         ttk.Entry(sec, textvariable=self._out_var
@@ -684,7 +684,7 @@ class DMCConverterApp(tk.Tk):
                     ).grid(row=row, column=2, pady=(8, 3))
         row += 1
 
-        lbl = ttk.Label(sec, text="Clip-Shape (gueltige Flaeche):", font=("Segoe UI", 9, "bold"))
+        lbl = ttk.Label(sec, text="AOI Clip-Shape (gültige Fläche):", font=("Segoe UI", 9, "bold"))
         lbl.grid(row=row, column=0, sticky="w", pady=(8, 3))
         self._clip_var = tk.StringVar()
         ttk.Entry(sec, textvariable=self._clip_var
@@ -734,7 +734,7 @@ class DMCConverterApp(tk.Tk):
             self._accent_labels.append(val)
 
         info_hint = ttk.Label(sec,
-            text="Metadaten der ersten gefundenen Kachel im Input-Ordner (stellvertretend fuer alle Kacheln)",
+            text="Metadaten der ersten gefundenen Tile im Input-Ordner (stellvertretend fuer alle Tiles)",
             font=("", 8))
         info_hint.grid(row=len(fields), column=0, columnspan=2, sticky="w", pady=(4, 0))
         self._dim_labels.append(info_hint)
@@ -805,7 +805,7 @@ class DMCConverterApp(tk.Tk):
     def _browse_clip_shape(self):
         current   = self._clip_var.get().strip()
         start_dir = os.path.dirname(current) if current and os.path.isfile(current) else self._in_var.get().strip()
-        kwargs = {"title": "Clip-Shape (gueltige Flaeche) auswaehlen",
+        kwargs = {"title": "AOI Clip-Shape (gültige Flaeche) auswaehlen",
                   "filetypes": [("Shapefile", "*.shp"), ("Alle Dateien", "*.*")]}
         if start_dir and os.path.isdir(start_dir):
             kwargs["initialdir"] = start_dir
@@ -836,13 +836,13 @@ class DMCConverterApp(tk.Tk):
 
     # ── Datei-/Ordner-Dialoge (LAS-Tab) ─────────────────────────────────────────
     def _browse_las_input(self):
-        path = filedialog.askdirectory(title="Input-Ordner (.laz-Kacheln) auswaehlen")
+        path = filedialog.askdirectory(title="Input-Ordner (.laz-Tiles) auswaehlen")
         if path:
             self._las_in_var.set(path.replace("/", "\\"))
             self._refresh_las_info()
 
     def _browse_las_output_laz(self):
-        path = filedialog.askdirectory(title="Output-Ordner (LAZ-Kacheln) auswaehlen")
+        path = filedialog.askdirectory(title="Output-Ordner (LAZ-Tiles) auswaehlen")
         if path:
             self._las_out_laz_var.set(path.replace("/", "\\"))
 
@@ -927,7 +927,7 @@ class DMCConverterApp(tk.Tk):
         )
         if not tiles:
             _reset()
-            self._info_bands.config(text="(keine Kacheln gefunden)")
+            self._info_bands.config(text="(keine Tiles gefunden)")
             return
         sample = tiles[0]
 
@@ -1019,7 +1019,7 @@ class DMCConverterApp(tk.Tk):
         )
         if not tiles:
             _reset()
-            self._las_info_count.config(text="(keine .laz/.las Kacheln gefunden)")
+            self._las_info_count.config(text="(keine .laz/.las Tiles gefunden)")
             return
         sample = tiles[0]
 
@@ -1303,7 +1303,7 @@ class DMCConverterApp(tk.Tk):
 
         clip = self._clip_var.get().strip()
         if not clip:
-            errors.append("Clip-Shape (gueltige Flaeche) fehlt.")
+            errors.append("AOI Clip-Shape (gültige Fläche) fehlt.")
         elif not os.path.isfile(clip):
             errors.append(f"Clip-Shape nicht gefunden:\n  {clip}")
 
@@ -1414,7 +1414,7 @@ class DMCConverterApp(tk.Tk):
 
         out_dir_laz = self._las_out_laz_var.get().strip()
         if not out_dir_laz:
-            errors.append("Output-Ordner (LAZ-Kacheln) fehlt.")
+            errors.append("Output-Ordner (LAZ-Tiles) fehlt.")
 
         if self._las_create_raster_var.get():
             out_dir_raster = self._las_out_raster_var.get().strip()
