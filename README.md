@@ -1,11 +1,11 @@
 # DMC Werkzeuge
 
-GDAL-Werkzeug fuer DMC-Orthophoto-Daten (technische 200m-Kacheln), als GUI mit zwei Tabs:
+GDAL- converter Tool für DMC-Daten DOP und DSM aus Reality Studio (technische 200m-Kacheln), als GUI mit zwei Tabs:
 
 - **DMC - TIFFconverter** — clippt ein technisches DOP-Kachel-Mosaik auf eine manuell erfasste
   gueltige Flaeche (Randverzerrungen entfernen) und schneidet es anschliessend parallelisiert
   ins publikationsfaehige 1km x 1km-Grid um (Dateiname aus Attribut `NAME`).
-- **DMC - LASconverter** — Platzhalter, wird spaeter definiert (LAZ/LAS-Konvertierung).
+- **DMC - LASconverter [LHN95]** — (LAS-Konvertierung für GeoSuite/reframe [LHN95 to LN02]).
 
 Struktur und Styling analog zu `topo-COGTIFFconverter`.
 
@@ -14,6 +14,9 @@ Struktur und Styling analog zu `topo-COGTIFFconverter`.
 ```bash
 python GUI_DMCdataConverter.py
 ```
+
+<img width="642" height="761" alt="image" src="https://github.com/user-attachments/assets/b93eb0db-9d16-40df-b315-3df98e56a77c" />
+
 
 Beim ersten Start erkennt das GUI automatisch die OSGeo4W/QGIS-Installation. Der Pfad kann
 ueber die Schaltflaeche **Aendern…** manuell gesetzt werden und wird in
