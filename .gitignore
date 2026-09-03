@@ -1,0 +1,13 @@
+# Claude Code Einstellungen – nicht ins Repository
+.claude/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Logs
+logs/
+*.log
+
+.pytest_cache/
