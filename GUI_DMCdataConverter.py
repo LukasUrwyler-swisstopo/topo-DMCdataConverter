@@ -1542,6 +1542,7 @@ class DMCConverterApp(tk.Tk):
                             val = None
                         if val is not None:
                             self.after(0, self._update_progress, float(val))
+                        continue  # Steuerzeile - nicht ins Log/GUI schreiben
                     self._log_q.put(line)
                     lf.write(line)
             proc.wait()

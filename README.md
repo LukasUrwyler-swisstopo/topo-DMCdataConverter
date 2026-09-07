@@ -116,9 +116,10 @@ automatisch erkannt (PATH, OSGeo4W-/QGIS-Installationspfade), kein eigenes GUI-F
    Punktwolke entfernt), bei DSM und Hillshade je eine Maskierung (ausserhalb -> NoData, Extent
    bleibt).
 
-6. **Grid-Shape (1km x 1km)**: wie bei Tab 1 — Attribut `NAME`, Standard `chGRID_1km2.shp`,
-   nur fuer die LAZ/LAS-Ausgabe relevant (DSM/Hillshade sind je ein einzelnes Gesamtbild ohne
-   Kachelung).
+6. **Grid-Shape (1km x 1km)**: wie bei Tab 1 — Attribut `NAME`, Standard `chGRID_1km2.shp`.
+   Bestimmt die Kachelung der LAZ/LAS-Ausgabe und intern auch die Zellen des Raster-Builds;
+   DSM und Hillshade werden trotzdem als je ein einzelnes Gesamtbild ausgeliefert (die
+   Zell-Raster sind reine Zwischenprodukte im Staging-Ordner).
 
 7. **Staging & Parallelisierung**: analog Tab 1, eigener Staging-Unterordner (`<AREA>_<JAHR>_LAS`).
 
@@ -128,22 +129,28 @@ automatisch erkannt (PATH, OSGeo4W-/QGIS-Installationspfade), kein eigenes GUI-F
 
 1. Metadaten (Bounding Box) aller Input-Kacheln parallel einlesen (`pdal info --metadata`,
    headerbasiert, kein Decompress der Punktdaten).
-2. *(falls "Create DSM-Raster" aktiv, laeuft als Hintergrund-Thread parallel zu Schritt 3, nicht
-   seriell davor)*: alle Kacheln mergen, optional thinnen, als Float32-DSM rastern
-   (`writers.gdal`, IDW-Interpolation) — Pixelursprung auf ein sauberes GSD-Vielfaches gesnappt,
-   danach per AOI-Cutline maskiert (NoData = `-3.4028235e+38`, analog GDWH-Konvention bei
-   SB_DSM). Anschliessend wird aus diesem fertigen (bereits geclippten) DSM ein Hillshade
-   gerechnet (`gdal.DEMProcessing`) und ebenfalls per AOI-Cutline maskiert (NoData = `255`).
-   Vor dem Staging-Aufraeumen wird auf diesen Hintergrund-Thread gewartet.
-3. Pro 1km-Grid-Zelle (parallelisiert, `ProcessPoolExecutor`): ueberlappende Input-Kacheln
-   mergen → Crop auf Zellgrenzen → Crop auf AOI-Polygon → optional thinnen → als `.las`/`.laz`
-   schreiben. Zellen mit 0 Punkten nach dem Clip werden verworfen.
+2. Pro 1km-Grid-Zelle zwei Job-Arten, die gemeinsam in **einem** Prozess-Pool laufen
+   (`ProcessPoolExecutor`, je Job ein eigener `pdal.exe`-Subprocess):
+   - **Punktwolken-Kachel**: ueberlappende Input-Kacheln mergen → Crop auf Zellgrenzen →
+     Crop auf AOI-Polygon → optional thinnen → als `.las`/`.laz` schreiben. Zellen mit 0
+     Punkten nach dem Clip werden verworfen.
+   - **DSM-Zelle** *(nur falls "Create DSM-Raster" aktiv)*: dieselbe Zelle, aber mit Puffer
+     gecroppt (vollstaendige IDW-Nachbarschaft am Zellrand → nahtloses Mosaik), optional
+     thinnen, als Float32-Raster rastern (`writers.gdal`, IDW). Geschrieben wird exakt der
+     auf das GSD gesnappte Zellausschnitt, damit sich die Zell-Raster luecken- und
+     ueberlappungsfrei zusammensetzen lassen.
 
-DSM/Hillshade (Schritt 2) und die Punktwolken-Kacheln (Schritt 3) lesen beide direkt aus den
-komprimierten `.laz`-Inputs (PDAL entpackt on-the-fly, kein Zwischenschritt "erst alles zu LAS
-konvertieren"). Ob eine Punktwolken-Kachel als `.las` oder `.laz` geschrieben wird, entscheidet
-sich rein an der Dateiendung des letzten `writers.las`-Schritts — also erst nach Crop, AOI-Clip
-und Thinning, nicht davor.
+   Jobs, die fehlschlagen, werden anschliessend **seriell wiederholt** (ein `pdal.exe` mit dem
+   vollen Arbeitsspeicher) — bleibt der Fehler, ist er echt und der Lauf endet mit Fehler.
+3. *(falls "Create DSM-Raster" aktiv)*: Zell-Raster als VRT mosaikieren, per AOI-Cutline
+   maskieren (NoData = `-3.4028235e+38`, analog GDWH-Konvention bei SB_DSM) und aus diesem
+   fertigen (bereits geclippten) DSM den Hillshade rechnen (`gdal.DEMProcessing`), ebenfalls
+   per AOI-Cutline maskiert (NoData = `255`).
+
+Alle Punktwolken-Zugriffe lesen direkt aus den komprimierten `.laz`-Inputs (PDAL entpackt
+on-the-fly, kein Zwischenschritt "erst alles zu LAS konvertieren"). Ob eine Punktwolken-Kachel
+als `.las` oder `.laz` geschrieben wird, entscheidet sich rein an der Dateiendung des letzten
+`writers.las`-Schritts — also erst nach Crop, AOI-Clip und Thinning, nicht davor.
 
 ### Fachliche Absicherungen
 
@@ -179,8 +186,9 @@ process_scripts/_osgeo_runner.py   (OSGeo4W Python, GDAL/OGR)
         │
     Aktion "process_las"  (Tab "DMC - LASconverter [LHN95]"):
         │  1) Metadaten-Scan aller Kacheln, parallel (ProcessPoolExecutor)
-        │  2) Raster-Build (optional) -> pdal.exe Subprocess, Hintergrund-Thread
-        │  3) Grid-Zuschnitt, parallel  -> je 1 pdal.exe Subprocess pro Zelle
+        │  2) Job-Pool ueber alle 1km-Zellen, parallel -> je 1 pdal.exe pro Job
+        │     (Punktwolken-Kachel + optional DSM-Zelle), Retry seriell
+        │  3) Zell-Raster mosaikieren (VRT) -> Cutline-Clip -> Hillshade
         │
         │  stdout → live ins GUI-Log + Logdatei
         ▼
@@ -206,6 +214,11 @@ JSON-Pipelines — orchestriert vom selben OSGeo4W-Python-Prozess.
   (wird automatisch erkannt, kein eigenes GUI-Feld). Entwickelt gegen PDAL 2.8 — beim ersten
   Lauf lohnt sich ein Blick ins Log auf die "Pixelraster-Check"-Zeile beim Raster-Build
   (prueft, ob `writers.gdal` die angeforderten `bounds` in dieser PDAL-Version unterstuetzt).
+- **Arbeitsspeicher:** `filters.merge`/`filters.sample` halten die Punkte im RAM. Deshalb wird
+  bewusst zellweise gerechnet statt einmal ueber das ganze Projekt — ein Gesamt-Merge ueber
+  >1000 Input-Kacheln laesst `pdal.exe` hart abstuerzen (Windows-Exitcode `3221226505` =
+  `0xC0000409`, Fail-Fast ohne stdout/stderr). Massgeblich ist der Speicher pro Job, also die
+  Punktzahl einer 1km-Zelle mal **CPU-Kerne**; bei knappem RAM die Kernzahl reduzieren.
 - **Staging-Laufwerk:** Schreibzugriff auf den Staging-Ordner (Standard `Y:\02_DMC_tempProcessingFolder`).
 
 ---

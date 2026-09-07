@@ -24,8 +24,9 @@ import shutil
 import subprocess
 import traceback
 import time
+import math
 from pathlib import Path
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # NoData-Sentinel fuer Float32-DSM-Raster, analog GDWH-Konvention bei SB_DSM (Raster, nicht Hillshade)
 LAS_RASTER_NODATA = -3.4028235e+38
@@ -468,19 +469,20 @@ def _process(cfg: dict) -> None:
 # Ablauf:
 #   1) Metadaten (Bounding Box) aller Input-.laz/.las-Kacheln parallel einlesen
 #      (pdal info --metadata, headerbasiert, kein Decompress der Punktdaten)
-#   2) Raster (EIN Gesamt-TIFF fuer die AOI), nur falls "Create Raster" aktiv -
-#      laeuft als Hintergrund-Thread PARALLEL zu Schritt 3 (nicht seriell davor):
-#      a) alle Input-Kacheln mergen, optional thinnen
-#      b) als Float32-Raster rastern (PDAL writers.gdal, IDW), Pixelursprung
-#         auf ein sauberes GSD-Vielfaches gesnappt (keine AOI-Kante im Grid)
-#      c) per AOI-Shape maskieren (gdal.Warp Cutline, NoData ausserhalb)
-#   3) Punktwolken-Kacheln (pro 1km-Grid-Kachel):
+#   2) Punktwolken-Kacheln (pro 1km-Grid-Kachel):
 #      pro Grid-Zelle die ueberlappenden Input-Kacheln mergen, per AOI-Polygon
 #      croppen, optional thinnen, als .las oder .laz schreiben (out_format,
 #      Default .las - wird u.a. fuer GeoSuite-Reframe LHN95->LN02 benoetigt)
-#      (parallelisiert ueber mehrere Prozesse, analog TIFFconverter)
-#   Vor dem Staging-Aufraeumen wird auf den Raster-Hintergrund-Thread gewartet
-#   (Schritt 2 schreibt Zwischendateien in denselben Staging-Ordner).
+#   3) DSM-Zellen (nur falls "Create Raster" aktiv), ebenfalls pro 1km-Grid-Kachel:
+#      gleiche Zelle, aber mit Puffer croppen (vollstaendige IDW-Nachbarschaft am
+#      Zellrand), optional thinnen und als Float32-Raster rastern (PDAL
+#      writers.gdal, IDW), Pixelursprung auf ein GSD-Vielfaches gesnappt
+#      Schritt 2) und 3) laufen als EIN gemeinsamer Job-Pool ueber mehrere
+#      Prozesse - bewusst zellweise statt als ein Gesamt-Merge, der bei grossen
+#      Projekten den Arbeitsspeicher sprengt (pdal.exe-Absturz, Code 0xC0000409)
+#   4) Gesamt-Raster: Zell-Raster als VRT mosaikieren, per AOI-Shape maskieren
+#      (gdal.Warp Cutline, NoData ausserhalb), daraus den Hillshade rechnen und
+#      ebenfalls maskieren (NoData=255)
 #
 # Hoehensystem: Input-Kacheln sind LHN95, Output bleibt LHN95 (kein Reframe
 # nach LN02 - swisstopo selbst beschreibt diese Transformation als Naeherung
@@ -583,26 +585,35 @@ def _las_cell_worker(args) -> tuple:
             pass
 
 
-def _build_las_raster(tiles, run_dir: Path, output_path: str, hillshade_output_path: str,
-                       pdal_exe: str, gsd: float, thin_m, clip_shape_path: str,
-                       all_bounds: tuple, num_threads: str, log, progress) -> None:
-    """Ein Gesamt-Raster (DSM) fuer die AOI: alle Kacheln mergen -> optional thinnen ->
-    rastern (IDW, Pixelursprung auf GSD-Vielfaches gesnapped) -> per AOI-Shape
-    maskieren (NoData ausserhalb, Cutline wie im TIFFconverter). Danach wird aus dem
-    fertigen (bereits geclippten) DSM ein Hillshade gerechnet und ebenfalls per
-    AOI-Shape maskiert (NoData=255)."""
-    import math
-    from osgeo import gdal
-    gdal.UseExceptions()
+def _raster_cell_worker(args) -> tuple:
+    """Rastert EINE 1km-Grid-Zelle (PDAL, IDW) - Gegenstueck zu _las_cell_worker.
 
-    all_minx, all_miny, all_maxx, all_maxy = all_bounds
-    snap_minx = (all_minx // gsd) * gsd
-    snap_miny = (all_miny // gsd) * gsd
-    snap_maxx = math.ceil(all_maxx / gsd) * gsd
-    snap_maxy = math.ceil(all_maxy / gsd) * gsd
-    bounds_str = f"([{snap_minx:.3f},{snap_maxx:.3f}],[{snap_miny:.3f},{snap_maxy:.3f}])"
-    log(f"  Raster-Grid (auf {gsd:g}m gesnapped): {snap_minx:.2f}, {snap_miny:.2f} - "
-        f"{snap_maxx:.2f}, {snap_maxy:.2f}")
+    Bewusst KEIN einzelner Gesamt-Merge ueber alle Input-Kacheln: filters.merge
+    (und erst recht filters.sample mit seinem KD-Baum) haelt die komplette
+    Punktwolke im Arbeitsspeicher. Bei grossen Projekten (>1000 Input-Kacheln)
+    fuehrt das zum harten Absturz von pdal.exe (Windows-Exitcode 0xC0000409 =
+    Fail-Fast/abort, typischerweise aus einem bad_alloc). Zellweise bleibt der
+    Speicherbedarf begrenzt (nur die Kacheln EINER Zelle) und die Arbeit laesst
+    sich ueber alle Kerne verteilen.
+
+    Der Crop erfolgt mit einem Puffer um die Zelle, damit die IDW-Nachbarschaft
+    an den Zellraendern vollstaendig ist; geschrieben wird exakt der auf das GSD
+    gesnappte Zellausschnitt, sodass sich die Zell-Raster luecken- und
+    ueberlappungsfrei zu einem Mosaik zusammensetzen."""
+    (job, run_dir_str, cells_dir, pdal_exe, thin_m, gsd) = args
+
+    cell = job["cell"]
+    r_minx, r_miny, r_maxx, r_maxy = job["raster_bounds"]
+    tiles = job["tiles"]
+
+    run_dir = Path(run_dir_str)
+    pipeline_path = run_dir / f"pipeline_dsm_{cell}.json"
+    tif_out = str(Path(cells_dir) / f"dsm_{cell}.tif")
+
+    # Puffer fuer eine vollstaendige IDW-Nachbarschaft am Zellrand
+    # (writers.gdal-Default-Radius = resolution * sqrt(2)) bzw. fuer ein
+    # randunabhaengiges Thinning.
+    buf = max(3.0 * gsd, 5.0 * float(thin_m) if thin_m else 0.0, 2.0)
 
     stages = []
     tags = []
@@ -612,50 +623,84 @@ def _build_las_raster(tiles, run_dir: Path, output_path: str, hillshade_output_p
                         "override_srs": LAS_INPUT_SRS})
         tags.append(tag)
     stages.append({"type": "filters.merge", "inputs": tags})
+    stages.append({"type": "filters.crop",
+                    "bounds": f"([{r_minx - buf:.3f},{r_maxx + buf:.3f}],"
+                              f"[{r_miny - buf:.3f},{r_maxy + buf:.3f}])"})
 
     if thin_m:
         stages.append({"type": "filters.sample", "radius": float(thin_m)})
 
-    raw_raster_path = run_dir / "03_raster_merged_raw.tif"
     stages.append({
         "type": "writers.gdal",
-        "filename": str(raw_raster_path),
+        "filename": tif_out,
         "resolution": float(gsd),
         "output_type": "idw",
         "gdaldriver": "GTiff",
         "data_type": "float32",
-        "bounds": bounds_str,
+        "bounds": f"([{r_minx:.3f},{r_maxx:.3f}],[{r_miny:.3f},{r_maxy:.3f}])",
         "nodata": LAS_RASTER_NODATA,
     })
 
-    pipeline_path = run_dir / "pipeline_raster.json"
-    with open(pipeline_path, "w", encoding="utf-8") as f:
-        json.dump({"pipeline": stages}, f)
+    try:
+        with open(pipeline_path, "w", encoding="utf-8") as f:
+            json.dump({"pipeline": stages}, f)
+        _run_pdal_pipeline(pdal_exe, pipeline_path)
 
-    log(f"\nErzeuge Gesamt-Raster aus {len(tiles)} Kachel(n) (PDAL, IDW, {gsd:g}m)... "
-        f"(ein PDAL-Lauf ohne Fortschrittsanzeige, kann bei grossen Projekten "
-        f"mehrere Minuten dauern - kein Einfrieren)")
-    _run_pdal_pipeline(pdal_exe, pipeline_path)
-    if not raw_raster_path.is_file():
-        raise RuntimeError("PDAL writers.gdal hat kein Raster erzeugt.")
-    log(f"  Rohraster (ungeclippt): {raw_raster_path}")
+        if not os.path.isfile(tif_out):
+            return ("empty", cell, None)
+        return ("written", cell, None)
+    except Exception as e:
+        return ("error", cell, str(e))
+    finally:
+        try:
+            pipeline_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _mosaic_las_raster(cell_rasters, run_dir: Path, output_path: str,
+                        hillshade_output_path: str, gsd: float, clip_shape_path: str,
+                        snap_bounds: tuple, num_threads: str, log, progress) -> None:
+    """Setzt die Zell-Raster zum Gesamt-DSM zusammen (VRT-Mosaik), maskiert per
+    AOI-Shape (gdal.Warp Cutline, NoData ausserhalb) und rechnet daraus den
+    Hillshade (ebenfalls per AOI-Shape maskiert, NoData=255)."""
+    from osgeo import gdal
+    gdal.UseExceptions()
+
+    snap_minx, snap_miny, snap_maxx, snap_maxy = snap_bounds
 
     # Verifizieren, dass PDAL die angeforderten "bounds" tatsaechlich respektiert hat
     # (bounds-Unterstuetzung in writers.gdal ist PDAL-versionsabhaengig).
-    check_ds = gdal.Open(str(raw_raster_path), gdal.GA_ReadOnly)
+    check_ds = gdal.Open(cell_rasters[0], gdal.GA_ReadOnly)
     check_gt = check_ds.GetGeoTransform()
     check_ds = None
-    origin_off = max(abs(check_gt[0] - snap_minx), abs(check_gt[3] - snap_maxy))
+    dx = (check_gt[0] - snap_minx) / gsd
+    dy = (check_gt[3] - snap_maxy) / gsd
+    origin_off = max(abs(dx - round(dx)), abs(dy - round(dy))) * gsd
     if origin_off > 0.001:
-        log(f"  WARNUNG: PDAL-Rohraster-Ursprung ({check_gt[0]:.3f}, {check_gt[3]:.3f}) weicht "
-            f"vom angeforderten gesnappten Ursprung ({snap_minx:.3f}, {snap_maxy:.3f}) ab "
-            f"(Differenz {origin_off:.3f}m) - 'bounds' wird von dieser PDAL-Version in "
-            f"writers.gdal evtl. nicht wie erwartet unterstuetzt. Bitte pruefen.")
+        log(f"  WARNUNG: Ursprung der Zell-Raster ({check_gt[0]:.3f}, {check_gt[3]:.3f}) liegt nicht "
+            f"auf dem gesnappten {gsd:g}m-Raster (Versatz {origin_off:.3f}m) - 'bounds' wird von "
+            f"dieser PDAL-Version in writers.gdal evtl. nicht wie erwartet unterstuetzt. Das Mosaik "
+            f"wird beim Clip auf das Zielraster resampled. Bitte pruefen.")
     else:
-        log(f"  Pixelraster-Check OK: Rohraster-Ursprung entspricht dem gesnappten {gsd:g}m-Raster.")
+        log(f"  Pixelraster-Check OK: Zell-Raster liegen auf dem gesnappten {gsd:g}m-Raster.")
+
+    vrt_path = run_dir / "03_raster_merged_raw.vrt"
+    log(f"\nSetze {len(cell_rasters)} Zell-Raster zum Gesamt-Mosaik zusammen: {vrt_path}")
+    vrt_ds = gdal.BuildVRT(
+        str(vrt_path), cell_rasters,
+        options=gdal.BuildVRTOptions(srcNodata=LAS_RASTER_NODATA,
+                                      VRTNodata=LAS_RASTER_NODATA),
+    )
+    if vrt_ds is None:
+        raise RuntimeError("gdal.BuildVRT hat None zurueckgegeben - Raster-Mosaik fehlgeschlagen.")
+    vrt_ds.FlushCache()
+    vrt_ds = None
 
     log(f"\nClippe Raster auf AOI (Cutline): {clip_shape_path}")
     log(f"  Ausserhalb -> NoData = {LAS_RASTER_NODATA:g}")
+    log(f"  Ziel-Grid (auf {gsd:g}m gesnapped): {snap_minx:.2f}, {snap_miny:.2f} - "
+        f"{snap_maxx:.2f}, {snap_maxy:.2f}")
     warp_options = gdal.WarpOptions(
         format="GTiff",
         cutlineDSName=clip_shape_path,
@@ -673,7 +718,7 @@ def _build_las_raster(tiles, run_dir: Path, output_path: str, hillshade_output_p
         ],
         callback=progress,
     )
-    out_ds = gdal.Warp(output_path, str(raw_raster_path), options=warp_options)
+    out_ds = gdal.Warp(output_path, str(vrt_path), options=warp_options)
     if out_ds is None:
         raise RuntimeError("gdal.Warp hat None zurueckgegeben - Raster-Clip fehlgeschlagen.")
     out_ds.FlushCache()
@@ -762,7 +807,7 @@ def _process_las(cfg: dict) -> None:
             pct = float(complete)
             now = time.time()
             if (now - last_emit["t"]) >= 1.0 or (pct - last_emit["p"]) >= 0.005:
-                print(f"PROGRESS:{0.30 + pct * 0.10:.6f}", flush=True)
+                print(f"PROGRESS:{0.90 + pct * 0.10:.6f}", flush=True)
                 last_emit["t"] = now
                 last_emit["p"] = pct
         except Exception:
@@ -787,7 +832,8 @@ def _process_las(cfg: dict) -> None:
                 meta_errors.append((path, err))
             else:
                 tile_bboxes.append((path, minx, miny, maxx, maxy))
-            print(f"PROGRESS:{(i / len(tiles)) * 0.10:.6f}", flush=True)
+            if i == len(tiles) or i % max(1, len(tiles) // 100) == 0:
+                print(f"PROGRESS:{(i / len(tiles)) * 0.10:.6f}", flush=True)
 
     for p, e in meta_errors:
         _log(f"  WARNUNG: Metadaten von {Path(p).name} nicht lesbar: {e}")
@@ -806,33 +852,32 @@ def _process_las(cfg: dict) -> None:
     _log(f"Punktwolken-Format  : .{out_format}")
     _log(f"Benennung           : {jahr}_{area}_TIN_{thin_token}raw_<NAME>_LV95_LHN95.{out_format}")
 
-    # --- Schritt 2: Gesamt-Raster (DSM + Hillshade fuer die AOI), nur falls aktiviert ---
-    # Laeuft als Hintergrund-Thread (der eigentliche Rechenaufwand steckt im
-    # PDAL-Subprocess bzw. in gdal.Warp/gdal.DEMProcessing, nicht im Python-Thread) -
-    # parallel zur Punktwolken-Verarbeitung in Schritt 5, nutzt also einen
-    # zusaetzlichen Kern nebenbei statt seriell davor zu laufen.
+    # --- Schritt 2: Zielnamen + Zielraster fuer DSM/Hillshade, nur falls aktiviert ---
+    # Das Raster wird NICHT mehr in einem einzigen PDAL-Lauf ueber alle Input-
+    # Kacheln gebaut (ein Merge der kompletten Punktwolke sprengt bei grossen
+    # Projekten den Arbeitsspeicher), sondern zellweise zusammen mit den
+    # Punktwolken-Kacheln (Schritt 5) und danach mosaikiert (Schritt 6).
     raster_name = None
     hillshade_name = None
-    raster_executor = None
-    raster_future = None
+    raster_out_path = None
+    hillshade_out_path = None
+    cells_dir = None
+    snap_bounds = None
     if create_raster:
         gsd_label = f"{round(gsd_raster * 100)}cm"
         raster_name = f"{jahr}_{area}_DSM_{gsd_label}_LV95_LHN95.tif"
         hillshade_name = f"{jahr}_{area}_hillshade_{gsd_label}_LV95_LHN95.tif"
         raster_out_path = str(Path(output_dir_raster) / raster_name)
         hillshade_out_path = str(Path(output_dir_raster) / hillshade_name)
+        # Pixelursprung auf ein sauberes GSD-Vielfaches snappen (keine AOI-Kante im Grid)
+        snap_bounds = ((all_minx // gsd_raster) * gsd_raster,
+                       (all_miny // gsd_raster) * gsd_raster,
+                       math.ceil(all_maxx / gsd_raster) * gsd_raster,
+                       math.ceil(all_maxy / gsd_raster) * gsd_raster)
+        cells_dir = run_dir / "03_raster_cells"
+        cells_dir.mkdir(parents=True, exist_ok=True)
         _log(f"Raster-Benennung    : {raster_name}  (+ .tfw)")
         _log(f"Hillshade-Benennung : {hillshade_name}  (+ .tfw)")
-        raster_executor = ThreadPoolExecutor(max_workers=1)
-        raster_future = raster_executor.submit(
-            _build_las_raster,
-            [t[0] for t in tile_bboxes], run_dir, raster_out_path, hillshade_out_path, pdal_exe,
-            gsd_raster, thin_m, clip_shape_path,
-            (all_minx, all_miny, all_maxx, all_maxy),
-            str(num_workers), _log, _progress,
-        )
-        _log("\nRaster-Build (DSM + Hillshade) im Hintergrund gestartet (laeuft parallel "
-             "zur Punktwolken-Verarbeitung weiter unten)...")
 
     # --- Schritt 3: Clip-Shape fuer die LAZ-Ausgabe als WKT einlesen ---
     _log(f"\nLese Clip-Shape (fuer LAZ-Crop): {clip_shape_path}")
@@ -923,8 +968,21 @@ def _process_las(cfg: dict) -> None:
             continue
 
         stem = f"{jahr}_{area}_TIN_{thin_token}raw_{str(name_val).strip()}_LV95_LHN95"
-        jobs.append({"cell_bounds": (cminx, cminy, cmaxx, cmaxy),
-                     "tiles": cell_tiles, "stem": stem})
+        job = {"cell_bounds": (cminx, cminy, cmaxx, cmaxy),
+               "tiles": cell_tiles, "stem": stem, "cell": str(name_val).strip()}
+        if create_raster:
+            # Zellausschnitt auf das globale, gesnappte GSD-Raster legen (Ursprung
+            # snap_bounds), damit sich die Zell-Raster luecken- und ueberlappungsfrei
+            # mosaikieren lassen und exakt auf dem Ziel-Grid liegen. Das Epsilon faengt
+            # Float-Rauschen ab (sonst gelegentlich eine Pixelspalte Ueberlappung).
+            ox, oy = snap_bounds[0], snap_bounds[1]
+            job["raster_bounds"] = (
+                ox + math.floor((cminx - ox) / gsd_raster + 1e-6) * gsd_raster,
+                oy + math.floor((cminy - oy) / gsd_raster + 1e-6) * gsd_raster,
+                ox + math.ceil((cmaxx - ox) / gsd_raster - 1e-6) * gsd_raster,
+                oy + math.ceil((cmaxy - oy) / gsd_raster - 1e-6) * gsd_raster,
+            )
+        jobs.append(job)
 
     shp_ds = None
 
@@ -933,41 +991,100 @@ def _process_las(cfg: dict) -> None:
             "Keine Grid-Kachel ueberlappt die Input-Kacheln - Grid-Shape/Input pruefen."
         )
 
-    # Der Raster-Build (falls aktiv) laeuft als zusaetzlicher pdal.exe-Prozess im
-    # Hintergrund - hier einen Slot dafuer reservieren, damit insgesamt nie mehr
-    # gleichzeitige pdal.exe-Prozesse laufen als unter "CPU-Kerne" eingestellt
-    # (sonst droht bei grossen Projekten Ressourcenueberlastung/Absturz).
-    laz_workers = max(1, num_workers - 1) if create_raster else num_workers
-    _log(f"\nStarte parallele Verarbeitung: {len(jobs)} Kachel(n) auf {laz_workers} Prozess(en)"
-         + (f" ({num_workers} CPU-Kerne, 1 davon fuer den Raster-Build reserviert)" if create_raster else "")
+    # --- Schritt 5: Punktwolken-Kacheln (+ DSM-Zellen) parallel verarbeiten ---
+    # Beides sind zellweise Jobs mit begrenztem Speicherbedarf (jeweils nur die
+    # Input-Kacheln EINER Gitterzelle) und laufen im selben Pool - so sind nie
+    # mehr pdal.exe-Prozesse gleichzeitig aktiv als unter "CPU-Kerne" eingestellt.
+    cell_workers = {"las": _las_cell_worker, "dsm": _raster_cell_worker}
+    cell_tasks = [("las", job["stem"],
+                   (job, str(run_dir), output_dir_laz, pdal_exe, clip_wkt, thin_m, out_format))
+                  for job in jobs]
+    if create_raster:
+        cell_tasks += [("dsm", job["cell"],
+                        (job, str(run_dir), str(cells_dir), pdal_exe, thin_m, gsd_raster))
+                       for job in jobs]
+
+    total_tasks = len(cell_tasks)
+    _log(f"\nStarte parallele Verarbeitung: {total_tasks} Job(s) auf {num_workers} Prozess(en)"
+         + (f" ({len(jobs)} Punktwolken-Kachel(n) + {len(jobs)} DSM-Zelle(n))" if create_raster else "")
          + "\n")
 
-    laz_progress_start = 0.10  # Raster-Build laeuft parallel im Hintergrund, nicht mehr seriell davor
-    written = errors = empty_skipped = done = 0
-    with ProcessPoolExecutor(max_workers=laz_workers) as executor:
-        futures = {
-            executor.submit(_las_cell_worker,
-                             (job, str(run_dir), output_dir_laz, pdal_exe, clip_wkt, thin_m, out_format)
-                             ): job for job in jobs
-        }
-        for future in as_completed(futures):
-            done += 1
-            status, stem, err = future.result()
-            if status == "written":
-                written += 1
-                _log(f"  [{done}/{len(jobs)}] {stem}.{out_format}")
-            elif status == "empty":
-                empty_skipped += 1
-                _log(f"  [{done}/{len(jobs)}] {stem} - uebersprungen (keine Punkte nach Clip)")
-            else:
-                errors += 1
-                _log(f"  [{done}/{len(jobs)}] FEHLER bei {stem}: {err}")
-            print(f"PROGRESS:{laz_progress_start + (done / len(jobs)) * (1.0 - laz_progress_start):.6f}", flush=True)
+    def _job_label(kind: str, name: str) -> str:
+        return f"{name}.{out_format}" if kind == "las" else f"DSM-Zelle {name}"
 
-    if raster_future is not None:
-        _log("\nWarte auf Abschluss des Gesamt-Raster-Builds (Hintergrund)...")
-        raster_future.result()  # wirft die Exception hier weiter, falls der Raster-Build fehlschlug
-        raster_executor.shutdown(wait=True)
+    written = empty_skipped = errors = 0
+    dsm_written = dsm_empty = 0
+    done = 0
+    failed = []
+    errors_by_kind = {"las": 0, "dsm": 0}
+    progress_start = 0.10
+    progress_span = (0.90 if create_raster else 1.0) - progress_start
+
+    def _count_result(kind: str, status: str) -> None:
+        """Erfolgs-/Leer-Zaehler pro Job-Art (Punktwolke bzw. DSM-Zelle)."""
+        nonlocal written, empty_skipped, dsm_written, dsm_empty
+        if status == "written":
+            if kind == "las":
+                written += 1
+            else:
+                dsm_written += 1
+        else:
+            if kind == "las":
+                empty_skipped += 1
+            else:
+                dsm_empty += 1
+
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        futures = {executor.submit(cell_workers[kind], args): (kind, name, args)
+                   for kind, name, args in cell_tasks}
+        for future in as_completed(futures):
+            kind, name, args = futures[future]
+            status, _name, err = future.result()
+            done += 1
+            label = _job_label(kind, name)
+            if status == "written":
+                _count_result(kind, status)
+                _log(f"  [{done}/{total_tasks}] {label}")
+            elif status == "empty":
+                _count_result(kind, status)
+                _log(f"  [{done}/{total_tasks}] {label} - uebersprungen (keine Punkte nach Clip)")
+            else:
+                # Noch nicht als Fehler zaehlen: ein abgestuerzter pdal-Prozess ist
+                # meist Speicherdruck durch die parallelen Jobs - wird unten
+                # seriell wiederholt.
+                failed.append((kind, name, args))
+                _log(f"  [{done}/{total_tasks}] FEHLER bei {label} (Wiederholung folgt): {err}")
+            print(f"PROGRESS:{progress_start + (done / total_tasks) * progress_span:.6f}", flush=True)
+
+    # --- Fehlgeschlagene Jobs seriell wiederholen ---
+    # Ein einzelner pdal.exe-Prozess hat den vollen Arbeitsspeicher zur Verfuegung -
+    # damit faellt die haeufigste Absturzursache (Speicherdruck durch parallele
+    # Prozesse) weg. Bleibt der Fehler, ist er echt.
+    if failed:
+        _log(f"\nWiederhole {len(failed)} fehlgeschlagene(n) Job(s) seriell "
+             f"(ein pdal-Prozess nach dem anderen)...")
+        for i, (kind, name, args) in enumerate(failed, 1):
+            label = _job_label(kind, name)
+            status, _name, err = cell_workers[kind](args)
+            if status == "error":
+                errors += 1
+                errors_by_kind[kind] += 1
+                _log(f"  [Retry {i}/{len(failed)}] FEHLER bleibt bei {label}: {err}")
+            else:
+                _count_result(kind, status)
+                _log(f"  [Retry {i}/{len(failed)}] OK: {label}")
+
+    # --- Schritt 6: Zell-Raster zum Gesamt-DSM mosaikieren, dann Hillshade ---
+    if create_raster:
+        if errors_by_kind["dsm"]:
+            _log(f"\nWARNUNG: {errors_by_kind['dsm']} DSM-Zelle(n) fehlgeschlagen - das "
+                 f"Gesamt-Raster erhaelt dort Loecher (NoData). Siehe Fehler oben.")
+        cell_rasters = sorted(str(p) for p in cells_dir.glob("dsm_*.tif"))
+        if not cell_rasters:
+            raise RuntimeError("Keine DSM-Zelle wurde erzeugt - Gesamt-Raster nicht moeglich.")
+        _mosaic_las_raster(cell_rasters, run_dir, raster_out_path, hillshade_out_path,
+                            gsd_raster, clip_shape_path, snap_bounds, str(num_workers),
+                            _log, _progress)
 
     if not keep_staging:
         _log(f"\nRaeume Staging-Ordner auf: {run_dir}")
@@ -978,15 +1095,18 @@ def _process_las(cfg: dict) -> None:
     else:
         _log(f"\nStaging-Dateien bleiben erhalten: {run_dir}")
 
-    raster_line = (f"Raster: {raster_name}, Hillshade: {hillshade_name}\n" if raster_name
-                   else "Raster: nicht erstellt (Option deaktiviert)\n")
+    raster_line = (f"Raster: {raster_name}, Hillshade: {hillshade_name}\n"
+                   f"DSM-Zellen: {dsm_written} gerastert, {dsm_empty} leer (0 Punkte).\n"
+                   if raster_name else "Raster: nicht erstellt (Option deaktiviert)\n")
     _log(f"\nFertig. {raster_line}"
          f".{out_format}: {written} Kachel(n) geschrieben, {skipped} uebersprungen (kein Overlap), "
-         f"{empty_skipped} leer (0 Punkte nach Clip), {errors} Fehler.")
+         f"{empty_skipped} leer (0 Punkte nach Clip).\n"
+         f"Fehler gesamt: {errors}.")
     if written == 0:
         raise RuntimeError("Keine Punktwolken-Kachel wurde geschrieben.")
     if errors:
-        raise RuntimeError(f"{errors} Punktwolken-Kachel(n) konnten nicht verarbeitet werden - siehe Log.")
+        raise RuntimeError(f"{errors} Job(s) konnten auch beim seriellen Wiederholen nicht "
+                            f"verarbeitet werden - siehe Log.")
 
 
 def main() -> None:
