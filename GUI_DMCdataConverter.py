@@ -1,14 +1,19 @@
 """
 GUI_DMCdataConverter.py - DMC Werkzeuge GUI
-Tkinter-Oberflaeche mit zwei Tabs:
+Tkinter-Oberflaeche mit drei Tabs:
   - "DMC - TIFFconverter"       : technische 200m-DOP-Tiles clippen (gueltige
-                                   Flaeche) und ins 1km x 1km-Grid umkacheln
+                                   Flaeche) und in 1km x 1km-Tiles zerlegen
                                    (parallelisiert)
   - "DMC - LASconverter [LHN95]": technische 200m-LAZ-Tiles per AOI croppen,
-                                   optional thinnen, ins 1km x 1km-Grid umkacheln
+                                   optional thinnen, in 1km x 1km-Tiles zerlegen
                                    (.las/.laz) und optional zu einem Gesamt-DSM-
                                    Raster (.tif/.tfw) rastern - Hoehe bleibt LHN95,
                                    Reframe zu LN02 erfolgt separat via GeoSuite
+  - "DMC - LASconverter [LN02]"  : die via GeoSuite nach LN02 reframten 1km-Tiles
+                                   in die GDWH-taugliche LAS-1.4-Form bringen (PF6,
+                                   global_encoding 17, scale 0.01, Offset =
+                                   Tile-Ursprung, byte-exakte LV95/LN02-CRS-VLRs)
+                                   und optional ebenfalls DSM + Hillshade rastern
 Styling analog zu topo-COGTIFFconverter / GUI_cogtiffConverter.py.
 
 Das GUI laeuft mit Standard-Python (kein osgeo erforderlich).
@@ -25,6 +30,7 @@ import importlib.util
 import json
 import os
 import queue
+import re
 import subprocess
 import sys
 import tempfile
@@ -188,6 +194,58 @@ DARK = {
 }
 
 
+# ─── Formatierung der Punktwolken-Datei-Info (beide LAS-Tabs) ─────────────────
+# Jede Funktion bekommt die 'metadata'-Struktur aus 'pdal info --metadata' und den
+# Pfad des Beispiel-Tiles und liefert den anzuzeigenden Text.
+def _pc_count(meta: dict, path: str) -> str:
+    c = meta.get("count")
+    return f"{c:,}".replace(",", "'") if c is not None else "–"
+
+
+def _pc_extent(meta: dict, path: str) -> str:
+    return "{:.1f} – {:.1f}  /  {:.1f} – {:.1f}".format(
+        meta.get("minx", 0), meta.get("maxx", 0),
+        meta.get("miny", 0), meta.get("maxy", 0))
+
+
+def _pc_zrange(meta: dict, path: str) -> str:
+    return "{:.2f} – {:.2f} m".format(meta.get("minz", 0), meta.get("maxz", 0))
+
+
+def _pc_crs(meta: dict, path: str) -> str:
+    srs  = meta.get("srs", {}) or {}
+    name = srs.get("compoundwkt", "") or srs.get("wkt", "")
+    if not name:
+        return "– (kein CRS-Tag in der Datei)"
+    m = re.search(r'(?:COMPD_CS|COMPOUNDCRS)\["([^"]+)"', name)
+    label = m.group(1) if m else name[:60]
+    # Hoehenbezug explizit ausweisen - der CompoundCRS-Name allein sagt nichts darueber
+    for token in ("LN02", "LHN95"):
+        if token in name:
+            return f"{label}  [{token}]"
+    return label
+
+
+def _pc_version(meta: dict, path: str) -> str:
+    return (f"LAS {meta.get('major_version', 1)}.{meta.get('minor_version', '?')}"
+            f"  /  PF{meta.get('dataformat_id', '?')}")
+
+
+def _pc_globalenc(meta: dict, path: str) -> str:
+    ge = meta.get("global_encoding")
+    if ge is None:
+        return "–"
+    return str(ge) if ge == 17 else f"{ge}   (Ziel: 17)"
+
+
+def _pc_compressed(meta: dict, path: str) -> str:
+    return "Ja (LAZ)" if meta.get("compressed") else "Nein (LAS)"
+
+
+def _pc_size(meta: dict, path: str) -> str:
+    return f"{Path(path).stat().st_size / (1024 ** 2):.1f} MB"
+
+
 # ─── Haupt-App ─────────────────────────────────────────────────────────────────
 class DMCConverterApp(tk.Tk):
 
@@ -256,11 +314,14 @@ class DMCConverterApp(tk.Tk):
 
         tab_tiff = ttk.Frame(self._notebook)
         tab_las  = ttk.Frame(self._notebook)
+        tab_ln02 = ttk.Frame(self._notebook)
         self._notebook.add(tab_tiff, text="DMC - TIFFconverter")
         self._notebook.add(tab_las,  text="DMC - LASconverter [LHN95]")
+        self._notebook.add(tab_ln02, text="DMC - LASconverter [LN02]")
 
         self._build_tiff_tab(tab_tiff)
         self._build_las_tab(tab_las)
+        self._build_ln02_tab(tab_ln02)
 
         # Log
         ttk.Separator(self).pack(fill="x", padx=12, pady=4)
@@ -320,7 +381,7 @@ class DMCConverterApp(tk.Tk):
         self._build_group_header(sf, "Dateien")
         self._build_las_dateien(sf)
 
-        self._build_group_header(sf, "Datei-Info  (aus erster gefundenen Kachel)")
+        self._build_group_header(sf, "Datei-Info  (aus erstem gefundenen Tile gelesen)")
         self._build_las_dateiinfo(sf)
 
         self._build_group_header(sf, "Staging & Parallelisierung")
@@ -480,8 +541,9 @@ class DMCConverterApp(tk.Tk):
                      values=["las", "laz"], state="readonly", width=6
                      ).pack(side="left", padx=(8, 8))
         self._las_out_format_var.trace_add("write", lambda *_: self._update_las_name_preview())
-        h = ttk.Label(fmt_row, text="1km-Grid-Tiles  |  Default 'las' (fuer GeoSuite-Reframe LHN95->LN02)",
-                       font=("", 8))
+        h = ttk.Label(fmt_row, text="1km-Grid-Tiles als LAS 1.2 / PF1, CRS-Tag EPSG:2056  |  Default 'las':\n"
+                                     "genau dieses Format liest GeoSuite/REFRAME (LHN95->LN02) ein",
+                       font=("", 8), justify="left")
         h.pack(side="left")
         self._dim_labels.append(h)
         row += 1
@@ -590,6 +652,291 @@ class DMCConverterApp(tk.Tk):
                          variable=self._las_keep_staging_var
                          ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
+    # ── Tab: DMC - LASconverter [LN02] ─────────────────────────────────────────
+    def _build_ln02_tab(self, parent):
+        sf = self._build_scrollable(parent, "_canvas_ln02", "_sf_ln02")
+
+        self._build_group_header(sf, "Projekt-Parameter")
+        self._build_ln02_projekt(sf)
+
+        self._build_group_header(sf, "Dateien")
+        self._build_ln02_dateien(sf)
+
+        self._build_group_header(sf, "Datei-Info  (aus erstem gefundenen Tile gelesen)")
+        self._build_ln02_dateiinfo(sf)
+
+        self._build_group_header(sf, "Staging & Parallelisierung")
+        self._build_ln02_staging(sf)
+
+        btn_row = ttk.Frame(parent)
+        btn_row.pack(fill="x", pady=(6, 0))
+        self._start_btn_ln02 = ttk.Button(btn_row, text="▶   DMC LAS KONVERTIEREN  [LN02]",
+                                           command=self._start_ln02)
+        self._start_btn_ln02.pack(side="right", ipadx=22, ipady=7)
+
+    def _build_ln02_projekt(self, parent):
+        sec = ttk.LabelFrame(parent, text="Projekt", padding=10,
+                              style="Section.TLabelframe")
+        sec.pack(fill="x", pady=(0, 6))
+        sec.columnconfigure(1, weight=0)
+
+        intro = ttk.Label(sec, text="Nachgelagert zum Tab [LHN95]: dessen .las-Tiles, nachdem sie mit "
+                                     "GeoSuite/REFRAME\nvon LHN95 nach LN02 reframt wurden. Kein Reframe, "
+                                     "kein Re-Tiling, kein Punktwolken-Crop\nim Tool - nur die "
+                                     "GDWH-Metadaten (LAS 1.4 / PF6 / global_encoding 17 / LV95_LN02).",
+                           font=("", 8), justify="left")
+        intro.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
+        self._dim_labels.append(intro)
+
+        lbl1 = ttk.Label(sec, text="Jahr:", font=("Segoe UI", 9, "bold"))
+        lbl1.grid(row=1, column=0, sticky="w", pady=3)
+        self._ln02_jahr_var = tk.StringVar(value=str(datetime.date.today().year))
+        ttk.Entry(sec, textvariable=self._ln02_jahr_var, width=10
+                   ).grid(row=1, column=1, sticky="w", padx=(8, 0), pady=3)
+
+        lbl2 = ttk.Label(sec, text="AREA / AOI - Name:", font=("Segoe UI", 9, "bold"))
+        lbl2.grid(row=2, column=0, sticky="w", pady=3)
+        self._ln02_area_var = tk.StringVar()
+        ttk.Entry(sec, textvariable=self._ln02_area_var, width=24
+                   ).grid(row=2, column=1, sticky="w", padx=(8, 0), pady=3)
+        h2 = ttk.Label(sec, text="z.B.  GUPPENFIRN", font=("", 8))
+        h2.grid(row=2, column=2, sticky="w", padx=(8, 0))
+        self._dim_labels.append(h2)
+
+        self._ln02_create_raster_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(sec, text="Create DSM-Raster from LAS/LAZ  (ein Gesamt-TIFF+TFW fuer die AOI)",
+                         variable=self._ln02_create_raster_var,
+                         command=self._on_ln02_create_raster_toggle
+                         ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        h_rast = ttk.Label(sec, text="Alle Tiles -> IDW-Raster (DSM) -> per AOI NoData-maskiert -> "
+                                      "zusaetzlich automatisch Hillshade daraus gerechnet (NoData=255)",
+                            font=("", 8))
+        h_rast.grid(row=4, column=0, columnspan=3, sticky="w", padx=(20, 0))
+        self._dim_labels.append(h_rast)
+
+        self._ln02_gsd_frame = ttk.Frame(sec)
+        self._ln02_gsd_frame.grid(row=5, column=0, columnspan=3, sticky="w",
+                                   padx=(20, 0), pady=(4, 0))
+        lbl3 = ttk.Label(self._ln02_gsd_frame, text="Raster-Aufloesung (GSD):",
+                          font=("Segoe UI", 9, "bold"))
+        lbl3.pack(side="left")
+        self._ln02_gsd_var = tk.StringVar(value="0.5")
+        ttk.Entry(self._ln02_gsd_frame, textvariable=self._ln02_gsd_var, width=10
+                   ).pack(side="left", padx=(8, 8))
+        h3 = ttk.Label(self._ln02_gsd_frame, text="in Metern, z.B. 0.5", font=("", 8))
+        h3.pack(side="left")
+        self._dim_labels.append(h3)
+        self._ln02_gsd_var.trace_add("write", lambda *_: self._update_ln02_name_preview())
+        self._on_ln02_create_raster_toggle()
+
+        name_lbl = ttk.Label(sec, text="Ausgabe-Benennung:", font=("Segoe UI", 9, "bold"))
+        name_lbl.grid(row=6, column=0, sticky="nw", pady=(10, 3))
+        self._ln02_name_preview_lbl = ttk.Label(sec, text="–", font=("Courier New", 9),
+                                                 justify="left")
+        self._ln02_name_preview_lbl.grid(row=6, column=1, columnspan=2, sticky="w",
+                                          padx=(8, 0), pady=(10, 3))
+        self._accent_labels.append(self._ln02_name_preview_lbl)
+
+        h_name = ttk.Label(sec, text="[thinnedout<NN>_] und <E>_<N> werden aus dem Input-Dateinamen "
+                                      "uebernommen -\nausgeduennt wurde bereits im Tab [LHN95], "
+                                      "hier wird nichts mehr veraendert.", font=("", 8), justify="left")
+        h_name.grid(row=7, column=1, columnspan=2, sticky="w", padx=(8, 0))
+        self._dim_labels.append(h_name)
+
+        meta_lbl = ttk.Label(sec, text="Ziel-Metadaten:", font=("Segoe UI", 9, "bold"))
+        meta_lbl.grid(row=8, column=0, sticky="nw", pady=(6, 3))
+        meta_val = ttk.Label(sec, justify="left", font=("", 8),
+                              text="LAS 1.4, Point Data Record Format 6, global_encoding 17, "
+                                   "scale 0.01,\nOffset = Tile-Ursprung (aus dem Dateinamen), "
+                                   "CRS-Tag LV95 + LN02 (EPSG:2056+5728)\n"
+                                   "als byte-exakte Referenz-VLRs 34735 + 2112 "
+                                   "(identisch zu SB_DSM_PUNKTWOLKE)")
+        meta_val.grid(row=8, column=1, columnspan=2, sticky="w", padx=(8, 0), pady=(6, 3))
+        self._dim_labels.append(meta_val)
+
+        for var in (self._ln02_jahr_var, self._ln02_area_var):
+            var.trace_add("write", lambda *_: self._update_ln02_name_preview())
+        self._update_ln02_name_preview()
+
+    def _on_ln02_create_raster_toggle(self):
+        """GSD-Feld, Raster-Output-Ordner und AOI-Shape nur zeigen, wenn ein Raster
+        gebaut wird - fuer die reine Punktwolken-Konversion wird nichts davon gebraucht."""
+        active = self._ln02_create_raster_var.get()
+        for attr in ("_ln02_gsd_frame", "_ln02_out_raster_frame", "_ln02_clip_frame"):
+            frame = getattr(self, attr, None)
+            if frame is None:
+                continue
+            if active:
+                frame.grid()
+            else:
+                frame.grid_remove()
+        self._update_ln02_name_preview()
+
+    def _update_ln02_name_preview(self):
+        if getattr(self, "_ln02_name_preview_lbl", None) is None:
+            return
+        jahr = self._ln02_jahr_var.get().strip() or "JAHR"
+        area = self._ln02_area_var.get().strip() or "AREA"
+        out_format = getattr(self, "_ln02_out_format_var", None)
+        ext = out_format.get() if out_format is not None else "laz"
+        text = (f"Punktwolke (pro 1km-Tile):  "
+                f"{jahr}_{area}_TIN_[thinnedout<NN>_]raw_<E>_<N>_LV95_LN02.{ext}")
+        if getattr(self, "_ln02_create_raster_var", None) and self._ln02_create_raster_var.get():
+            try:
+                gsd_label = f"{round(float(self._ln02_gsd_var.get().strip().replace('m', '')) * 100)}cm"
+            except (ValueError, AttributeError):
+                gsd_label = "GSD"
+            text += (f"\nDSM (gesamte AOI):            {jahr}_{area}_DSM_{gsd_label}_LV95_LN02.tif  (+ .tfw)"
+                     f"\nHillshade (gesamte AOI):      {jahr}_{area}_hillshade_{gsd_label}_LV95_LN02.tif  (+ .tfw)")
+        self._ln02_name_preview_lbl.config(text=text)
+
+    def _build_ln02_dateien(self, parent):
+        sec = ttk.LabelFrame(parent, text="Ordner & Shapes", padding=10,
+                              style="Section.TLabelframe")
+        sec.pack(fill="x", pady=(0, 6))
+        sec.columnconfigure(1, weight=1)
+
+        row = 0
+        lbl = ttk.Label(sec, text="Input-Ordner (LN02-Tiles):", font=("Segoe UI", 9, "bold"))
+        lbl.grid(row=row, column=0, sticky="w", pady=3)
+        self._ln02_in_var = tk.StringVar()
+        ttk.Entry(sec, textvariable=self._ln02_in_var
+                   ).grid(row=row, column=1, sticky="ew", padx=(8, 4), pady=3)
+        ttk.Button(sec, text="Ordner…", command=self._browse_ln02_input
+                    ).grid(row=row, column=2, pady=3)
+        row += 1
+        h = ttk.Label(sec, text="1km-Tiles (.las/.laz) nach dem GeoSuite-Reframe, CH1903+/LV95 + LN02.\n"
+                                 "Dateiname muss auf '_<E>_<N>_LV95_<LHN95|LN02>' enden - daraus kommt "
+                                 "der Tile-Ursprung.", font=("", 8), justify="left")
+        h.grid(row=row, column=1, sticky="w", padx=(8, 0))
+        self._dim_labels.append(h)
+        row += 1
+
+        lbl = ttk.Label(sec, text="Output-Ordner (Tiles):", font=("Segoe UI", 9, "bold"))
+        lbl.grid(row=row, column=0, sticky="w", pady=(8, 3))
+        self._ln02_out_las_var = tk.StringVar()
+        ttk.Entry(sec, textvariable=self._ln02_out_las_var
+                   ).grid(row=row, column=1, sticky="ew", padx=(8, 4), pady=(8, 3))
+        ttk.Button(sec, text="Ordner…", command=self._browse_ln02_output_las
+                    ).grid(row=row, column=2, pady=(8, 3))
+        row += 1
+        fmt_row = ttk.Frame(sec)
+        fmt_row.grid(row=row, column=1, columnspan=2, sticky="w", padx=(8, 0))
+        ttk.Label(fmt_row, text="Ausgabeformat:", font=("Segoe UI", 9, "bold")).pack(side="left")
+        self._ln02_out_format_var = tk.StringVar(value="laz")
+        ttk.Combobox(fmt_row, textvariable=self._ln02_out_format_var,
+                     values=["las", "laz"], state="readonly", width=6
+                     ).pack(side="left", padx=(8, 8))
+        self._ln02_out_format_var.trace_add("write", lambda *_: self._update_ln02_name_preview())
+        h = ttk.Label(fmt_row, text="Default 'laz' (GDWH-Auslieferungsformat, analog SB_DSM_PUNKTWOLKE)",
+                       font=("", 8))
+        h.pack(side="left")
+        self._dim_labels.append(h)
+        row += 1
+
+        self._ln02_out_raster_frame = ttk.Frame(sec)
+        self._ln02_out_raster_frame.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(8, 3))
+        self._ln02_out_raster_frame.columnconfigure(1, weight=1)
+        lbl = ttk.Label(self._ln02_out_raster_frame, text="Output-Ordner (DSM-Raster):",
+                         font=("Segoe UI", 9, "bold"))
+        lbl.grid(row=0, column=0, sticky="w")
+        self._ln02_out_raster_var = tk.StringVar()
+        ttk.Entry(self._ln02_out_raster_frame, textvariable=self._ln02_out_raster_var
+                   ).grid(row=0, column=1, sticky="ew", padx=(8, 4))
+        ttk.Button(self._ln02_out_raster_frame, text="Ordner…",
+                    command=self._browse_ln02_output_raster).grid(row=0, column=2)
+        h = ttk.Label(self._ln02_out_raster_frame,
+                       text="Ein Gesamt-.tif/.tfw (DSM) + ein Hillshade-.tif/.tfw fuer die AOI",
+                       font=("", 8))
+        h.grid(row=1, column=1, sticky="w", padx=(8, 0))
+        self._dim_labels.append(h)
+        row += 1
+
+        self._ln02_clip_frame = ttk.Frame(sec)
+        self._ln02_clip_frame.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(8, 3))
+        self._ln02_clip_frame.columnconfigure(1, weight=1)
+        lbl = ttk.Label(self._ln02_clip_frame, text="Footprint / AOI-Shape:",
+                         font=("Segoe UI", 9, "bold"))
+        lbl.grid(row=0, column=0, sticky="w")
+        self._ln02_clip_var = tk.StringVar()
+        ttk.Entry(self._ln02_clip_frame, textvariable=self._ln02_clip_var
+                   ).grid(row=0, column=1, sticky="ew", padx=(8, 4))
+        ttk.Button(self._ln02_clip_frame, text="Datei…",
+                    command=self._browse_ln02_clip_shape).grid(row=0, column=2)
+        h = ttk.Label(self._ln02_clip_frame,
+                       text="Nur fuer das Raster: alles ausserhalb wird NoData (DSM -3.4028235e+38, "
+                            "Hillshade 255).\nDie Punktwolken-Tiles sind bereits im Tab [LHN95] "
+                            "gecroppt und werden hier nicht angetastet.", font=("", 8), justify="left")
+        h.grid(row=1, column=1, sticky="w", padx=(8, 0))
+        self._dim_labels.append(h)
+        self._on_ln02_create_raster_toggle()
+
+    def _build_ln02_dateiinfo(self, parent):
+        sec = ttk.LabelFrame(parent, text="Datei-Info  (aus Quelldatei gelesen)",
+                              padding=10, style="Section.TLabelframe")
+        sec.pack(fill="x", pady=(0, 6))
+        sec.columnconfigure(1, weight=1)
+
+        fields = [
+            ("Anzahl Punkte:",   "_ln02_info_count"),
+            ("Extent (X/Y):",    "_ln02_info_extent"),
+            ("Z-Bereich:",       "_ln02_info_zrange"),
+            ("Koordinatensys.:", "_ln02_info_crs"),
+            ("LAS-Version:",     "_ln02_info_version"),
+            ("global_encoding:", "_ln02_info_globalenc"),
+            ("Komprimiert:",     "_ln02_info_compressed"),
+            ("Dateigroesse:",    "_ln02_info_size"),
+        ]
+        for row, (label, attr) in enumerate(fields):
+            lbl = ttk.Label(sec, text=label, font=("Segoe UI", 9, "bold"))
+            lbl.grid(row=row, column=0, sticky="w", pady=1)
+            val = ttk.Label(sec, text="–", font=("Segoe UI", 9))
+            val.grid(row=row, column=1, sticky="w", padx=(8, 0), pady=1)
+            setattr(self, attr, val)
+            self._accent_labels.append(val)
+
+        info_hint = ttk.Label(sec,
+            text="Metadaten des ersten gefundenen Tiles im Input-Ordner (stellvertretend fuer alle), "
+                 "via pdal info.\nZeigt LAS-Version/Point-Format und global_encoding der QUELLE - "
+                 "'LAS 1.4 / PF6' + '17' heisst: bereits im Zielformat.",
+            font=("", 8), justify="left")
+        info_hint.grid(row=len(fields), column=0, columnspan=2, sticky="w", pady=(4, 0))
+        self._dim_labels.append(info_hint)
+
+        refresh_btn = ttk.Button(sec, text="Datei-Info aktualisieren",
+                                  command=self._refresh_ln02_info)
+        refresh_btn.grid(row=len(fields) + 1, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+    def _build_ln02_staging(self, parent):
+        sec = ttk.LabelFrame(parent, text="Staging & Parallelisierung", padding=10,
+                              style="Section.TLabelframe")
+        sec.pack(fill="x", pady=(0, 6))
+        sec.columnconfigure(1, weight=1)
+
+        lbl = ttk.Label(sec, text="Staging-Ordner:", font=("Segoe UI", 9, "bold"))
+        lbl.grid(row=0, column=0, sticky="w", pady=3)
+        self._ln02_staging_var = tk.StringVar(value=DEFAULT_STAGING_DIR)
+        ttk.Entry(sec, textvariable=self._ln02_staging_var
+                   ).grid(row=0, column=1, sticky="ew", padx=(8, 4), pady=3)
+        ttk.Button(sec, text="Ordner…", command=self._browse_ln02_staging
+                    ).grid(row=0, column=2, pady=3)
+        h = ttk.Label(sec, text="Zwischendateien (PDAL-Pipelines, Zell-Rohraster) fuer die Verarbeitung",
+                       font=("", 8))
+        h.grid(row=1, column=1, sticky="w", padx=(8, 0))
+        self._dim_labels.append(h)
+
+        lbl2 = ttk.Label(sec, text="CPU-Kerne:", font=("Segoe UI", 9, "bold"))
+        lbl2.grid(row=2, column=0, sticky="w", pady=(8, 3))
+        cpu_max = max(1, os.cpu_count() or 8)
+        self._ln02_workers_var = tk.StringVar(value=str(min(6, cpu_max)))
+        tk.Spinbox(sec, from_=1, to=cpu_max, textvariable=self._ln02_workers_var, width=6
+                   ).grid(row=2, column=1, sticky="w", padx=(8, 0), pady=(8, 3))
+
+        self._ln02_keep_staging_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(sec, text="Staging-Dateien nach Abschluss behalten (nicht loeschen)",
+                         variable=self._ln02_keep_staging_var
+                         ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 0))
+
     # ── Tab: DMC - TIFFconverter ───────────────────────────────────────────────
     def _build_tiff_tab(self, parent):
         self.bind_class("TCombobox", "<MouseWheel>", self._fwd_wheel)
@@ -603,7 +950,7 @@ class DMCConverterApp(tk.Tk):
         self._build_group_header(sf, "Dateien")
         self._build_dateien(sf)
 
-        self._build_group_header(sf, "Datei-Info  (aus erster gefundenen Kachel)")
+        self._build_group_header(sf, "Datei-Info  (aus erstem gefundenen Tile)")
         self._build_dateiinfo(sf)
 
         self._build_group_header(sf, "Staging & Parallelisierung")
@@ -712,7 +1059,7 @@ class DMCConverterApp(tk.Tk):
         ttk.Button(sec, text="Datei…", command=self._browse_grid_shape
                     ).grid(row=row, column=2, pady=(8, 3))
         row += 1
-        h = ttk.Label(sec, text="Attributfeld 'NAME' liefert die Kachel-Bezeichnung  |  Shape wird nach EPSG:2056 referenziert",
+        h = ttk.Label(sec, text="Attributfeld 'NAME' liefert die Tile-Bezeichnung  |  Shape wird nach EPSG:2056 referenziert",
                        font=("", 8))
         h.grid(row=row, column=1, sticky="w", padx=(8, 0))
         self._dim_labels.append(h)
@@ -793,6 +1140,8 @@ class DMCConverterApp(tk.Tk):
                 return getattr(self, "_canvas", None)
             if w in (getattr(self, "_canvas_las", None), getattr(self, "_sf_las", None)):
                 return getattr(self, "_canvas_las", None)
+            if w in (getattr(self, "_canvas_ln02", None), getattr(self, "_sf_ln02", None)):
+                return getattr(self, "_canvas_ln02", None)
             w = w.master
         return None
 
@@ -889,6 +1238,44 @@ class DMCConverterApp(tk.Tk):
         path = filedialog.askdirectory(**kwargs)
         if path:
             self._las_staging_var.set(path.replace("/", "\\"))
+
+    # ── Datei-/Ordner-Dialoge (LN02-Tab) ───────────────────────────────────────
+    def _browse_ln02_input(self):
+        path = filedialog.askdirectory(title="Input-Ordner (LN02-Tiles) auswaehlen")
+        if path:
+            self._ln02_in_var.set(path.replace("/", "\\"))
+            self._refresh_ln02_info()
+
+    def _browse_ln02_output_las(self):
+        path = filedialog.askdirectory(title="Output-Ordner (Punktwolken-Tiles) auswaehlen")
+        if path:
+            self._ln02_out_las_var.set(path.replace("/", "\\"))
+
+    def _browse_ln02_output_raster(self):
+        path = filedialog.askdirectory(title="Output-Ordner (DSM-Raster) auswaehlen")
+        if path:
+            self._ln02_out_raster_var.set(path.replace("/", "\\"))
+
+    def _browse_ln02_clip_shape(self):
+        current   = self._ln02_clip_var.get().strip()
+        start_dir = os.path.dirname(current) if current and os.path.isfile(current) \
+                    else self._ln02_in_var.get().strip()
+        kwargs = {"title": "Footprint / AOI-Shape auswaehlen",
+                  "filetypes": [("Shapefile", "*.shp"), ("Alle Dateien", "*.*")]}
+        if start_dir and os.path.isdir(start_dir):
+            kwargs["initialdir"] = start_dir
+        path = filedialog.askopenfilename(**kwargs)
+        if path:
+            self._ln02_clip_var.set(path.replace("/", "\\"))
+
+    def _browse_ln02_staging(self):
+        current = self._ln02_staging_var.get().strip()
+        kwargs = {"title": "Staging-Ordner auswaehlen"}
+        if current and os.path.isdir(current):
+            kwargs["initialdir"] = current
+        path = filedialog.askdirectory(**kwargs)
+        if path:
+            self._ln02_staging_var.set(path.replace("/", "\\"))
 
     # ── OSGeo4W Python Verwaltung ──────────────────────────────────────────────
     def _update_osgeo_label(self):
@@ -1007,14 +1394,38 @@ class DMCConverterApp(tk.Tk):
 
         threading.Thread(target=worker, daemon=True).start()
 
-    # ── Datei-Info via pdal (LAS-Tab) ────────────────────────────────────────────
+    # ── Datei-Info via pdal (beide LAS-Tabs) ───────────────────────────────────
     def _refresh_las_info(self):
-        src_dir = self._las_in_var.get().strip()
-        info_attrs = ("_las_info_count", "_las_info_extent", "_las_info_zrange",
-                      "_las_info_crs", "_las_info_compressed", "_las_info_size")
+        self._refresh_pointcloud_info(self._las_in_var.get().strip(), (
+            ("_las_info_count",      _pc_count),
+            ("_las_info_extent",     _pc_extent),
+            ("_las_info_zrange",     _pc_zrange),
+            ("_las_info_crs",        _pc_crs),
+            ("_las_info_compressed", _pc_compressed),
+            ("_las_info_size",       _pc_size),
+        ))
 
+    def _refresh_ln02_info(self):
+        self._refresh_pointcloud_info(self._ln02_in_var.get().strip(), (
+            ("_ln02_info_count",      _pc_count),
+            ("_ln02_info_extent",     _pc_extent),
+            ("_ln02_info_zrange",     _pc_zrange),
+            ("_ln02_info_crs",        _pc_crs),
+            ("_ln02_info_version",    _pc_version),
+            ("_ln02_info_globalenc",  _pc_globalenc),
+            ("_ln02_info_compressed", _pc_compressed),
+            ("_ln02_info_size",       _pc_size),
+        ))
+
+    def _refresh_pointcloud_info(self, src_dir: str, fields: tuple):
+        """Liest die Metadaten des ersten gefundenen Punktwolken-Tiles im Ordner
+        ('pdal info --metadata', headerbasiert - kein Decompress der Punktdaten) und
+        fuellt damit die uebergebenen Label-Felder. Gemeinsam genutzt von beiden
+        LAS-Tabs, die sich nur in den angezeigten Feldern unterscheiden.
+
+        fields = ((Label-Attributname, Formatierungsfunktion(meta, pfad)), ...)"""
         def _reset():
-            for attr in info_attrs:
+            for attr, _fn in fields:
                 getattr(self, attr).config(text="–")
 
         if not src_dir or not os.path.isdir(src_dir):
@@ -1026,13 +1437,14 @@ class DMCConverterApp(tk.Tk):
         )
         if not tiles:
             _reset()
-            self._las_info_count.config(text="(keine .laz/.las Tiles gefunden)")
+            getattr(self, fields[0][0]).config(text="(keine .laz/.las Tiles gefunden)")
             return
         sample = tiles[0]
 
         if not self._pdal_exe or not os.path.isfile(self._pdal_exe):
             _reset()
-            self._las_info_count.config(text="pdal.exe nicht gefunden – bitte zum PATH hinzufuegen")
+            getattr(self, fields[0][0]).config(
+                text="pdal.exe nicht gefunden – bitte zum PATH hinzufuegen")
             return
 
         def ui_error(msg):
@@ -1044,30 +1456,13 @@ class DMCConverterApp(tk.Tk):
             _reset()
 
         def ui_info(meta):
-            try:
-                count = meta.get("count")
-                self._las_info_count.config(text=f"{count:,}".replace(",", "'") if count is not None else "–")
-                self._las_info_extent.config(
-                    text="{:.1f} – {:.1f}  /  {:.1f} – {:.1f}".format(
-                        meta.get("minx", 0), meta.get("maxx", 0),
-                        meta.get("miny", 0), meta.get("maxy", 0)))
-                self._las_info_zrange.config(
-                    text="{:.2f} – {:.2f} m".format(meta.get("minz", 0), meta.get("maxz", 0)))
-                srs = meta.get("srs", {}) or {}
-                crs_name = srs.get("compoundwkt", "") or srs.get("wkt", "") or "–"
-                if crs_name and crs_name != "–":
-                    import re
-                    m1 = re.search(r'COMPD_CS\["([^"]+)"', crs_name)
-                    crs_name = m1.group(1) if m1 else crs_name[:60]
-                self._las_info_crs.config(text=crs_name)
-                self._las_info_compressed.config(text="Ja (LAZ)" if meta.get("compressed") else "Nein (LAS)")
+            # Jedes Feld einzeln absichern - ein fehlender Metadaten-Eintrag soll
+            # nicht die ganze Anzeige leeren.
+            for attr, fn in fields:
                 try:
-                    size_mb = Path(sample).stat().st_size / (1024 ** 2)
-                    self._las_info_size.config(text=f"{size_mb:.1f} MB")
+                    getattr(self, attr).config(text=fn(meta, sample))
                 except Exception:
-                    pass
-            except Exception:
-                ui_error("Fehler beim Darstellen der Datei-Info")
+                    getattr(self, attr).config(text="–")
 
         def worker():
             try:
@@ -1075,7 +1470,8 @@ class DMCConverterApp(tk.Tk):
                                          stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                          universal_newlines=True)
                 if result.returncode != 0:
-                    self.after(0, ui_error, (result.stderr or result.stdout or "unbekannter Fehler").strip())
+                    self.after(0, ui_error,
+                                (result.stderr or result.stdout or "unbekannter Fehler").strip())
                     return
                 data = json.loads(result.stdout)
                 self.after(0, ui_info, data.get("metadata", {}))
@@ -1162,6 +1558,8 @@ class DMCConverterApp(tk.Tk):
         self._canvas.configure(bg=T["panel"], highlightbackground=T["sep"])
         if getattr(self, "_canvas_las", None) is not None:
             self._canvas_las.configure(bg=T["panel"], highlightbackground=T["sep"])
+        if getattr(self, "_canvas_ln02", None) is not None:
+            self._canvas_ln02.configure(bg=T["panel"], highlightbackground=T["sep"])
 
         self._hdr.configure(bg=T["hdr_bg"])
         self._hdr_lbl.configure(bg=T["hdr_bg"], fg=T["hdr_fg"])
@@ -1501,6 +1899,118 @@ class DMCConverterApp(tk.Tk):
         log_stem = f"{cfg['jahr']}_{cfg['area']}_TIN"
         threading.Thread(
             target=self._run_thread, args=(cfg, log_stem, "DMC LAS-Konvertierung"), daemon=True
+        ).start()
+
+    # ── Validierung (LN02-Tab) ────────────────────────────────────────────────
+    def _validate_ln02(self):
+        errors = []
+
+        if not self._osgeo_python or not os.path.isfile(self._osgeo_python):
+            errors.append(
+                "OSGeo4W Python nicht gefunden.\n"
+                "Bitte Pfad via 'Aendern…' festlegen  (z.B. C:\\OSGeo4W\\bin\\python3.exe)."
+            )
+
+        if not self._pdal_exe or not os.path.isfile(self._pdal_exe):
+            errors.append(
+                "pdal.exe wurde nicht gefunden.\n"
+                "Bitte pdal (Teil von OSGeo4W/QGIS) zum System-PATH hinzufuegen."
+            )
+
+        jahr = self._ln02_jahr_var.get().strip()
+        if not jahr or not jahr.isdigit():
+            errors.append("Jahr fehlt oder ist ungueltig (numerisch erwartet, z.B. 2026).")
+
+        area = self._ln02_area_var.get().strip()
+        if not area:
+            errors.append("AREA / AOI - Name fehlt.")
+
+        in_dir = self._ln02_in_var.get().strip()
+        if not in_dir:
+            errors.append("Input-Ordner fehlt.")
+        elif not os.path.isdir(in_dir):
+            errors.append(f"Input-Ordner nicht gefunden:\n  {in_dir}")
+
+        out_dir = self._ln02_out_las_var.get().strip()
+        if not out_dir:
+            errors.append("Output-Ordner (Punktwolken-Tile) fehlt.")
+        elif in_dir and os.path.isdir(in_dir) and os.path.isdir(out_dir) and \
+                os.path.normcase(os.path.abspath(in_dir)) == os.path.normcase(os.path.abspath(out_dir)):
+            # Sonst wuerde die Ausgabe je nach Benennung die Quelle ueberschreiben.
+            errors.append("Input- und Output-Ordner sind identisch - bitte ein separates "
+                           "Zielverzeichnis waehlen (die Quelldateien bleiben so unangetastet).")
+
+        if self._ln02_create_raster_var.get():
+            try:
+                gsd = float(self._ln02_gsd_var.get().strip().replace("m", ""))
+                if gsd <= 0:
+                    raise ValueError
+            except Exception:
+                errors.append("Raster-Aufloesung (GSD) ungueltig (Zahl in Metern erwartet, z.B. 0.5).")
+
+            if not self._ln02_out_raster_var.get().strip():
+                errors.append("Output-Ordner (DSM-Raster) fehlt (da 'Create DSM-Raster' aktiviert ist).")
+
+            clip = self._ln02_clip_var.get().strip()
+            if not clip:
+                errors.append("Footprint / AOI-Shape fehlt (wird fuer die Raster-Maskierung gebraucht).")
+            elif not os.path.isfile(clip):
+                errors.append(f"Footprint / AOI-Shape nicht gefunden:\n  {clip}")
+
+        if not self._ln02_staging_var.get().strip():
+            errors.append("Staging-Ordner fehlt.")
+
+        try:
+            if int(self._ln02_workers_var.get()) < 1:
+                raise ValueError
+        except Exception:
+            errors.append("CPU-Kerne ungueltig.")
+
+        if errors:
+            from tkinter import messagebox
+            messagebox.showerror("Eingabe-Fehler",
+                                  "\n\n".join(f"• {e}" for e in errors), parent=self)
+            return False
+        return True
+
+    # ── Konvertierung starten (LN02-Tab) ──────────────────────────────────────
+    def _start_ln02(self):
+        if self._running:
+            return
+        if not self._validate_ln02():
+            return
+
+        create_raster = bool(self._ln02_create_raster_var.get())
+        cfg = {
+            "action":             "process_las_ln02",
+            "jahr":                self._ln02_jahr_var.get().strip(),
+            "area":                self._ln02_area_var.get().strip(),
+            "create_raster":       create_raster,
+            "gsd":                 float(self._ln02_gsd_var.get().strip().replace("m", ""))
+                                   if create_raster else None,
+            "input_dir":           self._ln02_in_var.get().strip(),
+            "output_dir_las":      self._ln02_out_las_var.get().strip(),
+            "output_dir_raster":   self._ln02_out_raster_var.get().strip() if create_raster else None,
+            "out_format":          self._ln02_out_format_var.get(),
+            "clip_shape_path":     self._ln02_clip_var.get().strip() if create_raster else None,
+            "staging_dir":         self._ln02_staging_var.get().strip(),
+            "num_workers":         int(self._ln02_workers_var.get()),
+            "keep_staging":        bool(self._ln02_keep_staging_var.get()),
+            "pdal_exe":            self._pdal_exe,
+        }
+
+        self._running = True
+        self._active_start_btn = self._start_btn_ln02
+        self._start_btn_ln02.config(state="disabled")
+        self._progress_frame.pack(fill="x", padx=12, pady=(0, 4), before=self._btn_row)
+        self._progress_bar.start(10)
+        self._clear_log()
+        self._log("=== DMC LAS-Konvertierung [LN02] gestartet ===\n\n")
+
+        log_stem = f"{cfg['jahr']}_{cfg['area']}_TIN_LN02"
+        threading.Thread(
+            target=self._run_thread, args=(cfg, log_stem, "DMC LAS-Konvertierung [LN02]"),
+            daemon=True
         ).start()
 
     # ── Subprocess-Ausfuehrung ─────────────────────────────────────────────────

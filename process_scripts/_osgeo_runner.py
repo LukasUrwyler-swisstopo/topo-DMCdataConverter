@@ -14,32 +14,132 @@ Aktionen:
                      Staging-Ordner (z.B. Y:\\02_DMC_tempProcessingFolder)
     process_las - DMC-LAS-Pipeline (Tab "DMC - LASconverter [LHN95]"), siehe
                   Kommentarblock direkt ueber _process_las() weiter unten.
+    process_las_ln02 - DMC-LAS-Pipeline LN02 (Tab "DMC - LASconverter [LN02]"),
+                  siehe Kommentarblock direkt ueber _process_las_ln02() weiter unten.
 """
 
 import sys
 import os
+import base64
 import glob
 import json
-import shutil
-import subprocess
-import traceback
-import time
 import math
+import re
+import shutil
+import struct
+import subprocess
+import tempfile
+import time
+import traceback
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
-# NoData-Sentinel fuer Float32-DSM-Raster, analog GDWH-Konvention bei SB_DSM (Raster, nicht Hillshade).
-# WICHTIG: exakt -FLT_MAX als double angeben. Die uebliche 7-stellige Anzeigeform
-# -3.4028235e+38 (so zeigen GDAL/QGIS den Wert an) ist als double betragsmaessig
-# GROESSER als -FLT_MAX und damit in Float32 nicht darstellbar; PDAL prueft das
-# strikt und bricht writers.gdal ab ("Invalid nodata value ... for output
-# data_type 'float'"). Der Wert unten rundet in Float32 auf denselben Sentinel.
+# NoData-Sentinel des FERTIGEN Float32-DSM, analog GDWH-Konvention bei SB_DSM
+# (Raster, nicht Hillshade). Exakt -FLT_MAX; gesetzt wird er ausschliesslich von
+# GDAL (gdal.Warp dstNodata, siehe _mosaic_las_raster) - GDAL nimmt ihn anstandslos.
 LAS_RASTER_NODATA = -3.4028234663852886e+38
+
+# NoData-Sentinel der ZWISCHEN-Zellraster aus writers.gdal (Staging-Ordner, Wegwerf-
+# produkte). Bewusst NICHT -FLT_MAX: PDALs writers.gdal prueft den nodata-Wert gegen
+# den Float32-Wertebereich und lehnt die Bereichsgrenze selbst ab -
+#   "Invalid nodata value -3.402823466e+38 for output data_type 'float'"
+# - und zwar deterministisch fuer jede Zelle, unabhaengig von Parallelisierung oder
+# Speicher (empirisch: PDAL 2.x aus QGIS 3.42.1; der uebergebene Wert ist nachweislich
+# bitgenau -FLT_MAX, die Pruefung ist an der Grenze exklusiv). Deshalb schreibt PDAL
+# einen unverfaenglichen Sentinel, den gdal.Warp beim Mosaikieren auf
+# LAS_RASTER_NODATA umsetzt. -9999 ist in Float32 exakt darstellbar und kann als
+# Hoehenwert in der Schweiz nicht vorkommen.
+LAS_CELL_NODATA = -9999.0
+
+# Ausgabeformat der Punktwolken-Tiles im Tab [LHN95]. Diese Dateien sind die EINGABE
+# fuer den GeoSuite/REFRAME-Batch (LHN95 -> LN02), deshalb wird der Header hier
+# explizit gesetzt statt PDALs Defaults zu uebernehmen.
+#
+# Ohne Angabe schreibt PDAL 2.8.3 naemlich LAS 1.4 / Point Data Record Format 7
+# (an einer erzeugten Kachel nachgemessen: minor_version 4, dataformat_id 7,
+# point_length 36, global_encoding 16, zwei OGC-WKT-VLRs record_id 2112 statt
+# GeoTIFF-Keys). GeoSuite liest klassisches LAS (1.0-1.2, PF0-PF3) und lehnt das
+# mit "ERROR: File format incorrect ... unknown or unsupported format" ab.
+#
+# LAS 1.2 / PF1 ist exakt das Format, in dem die etablierte SB_DSM_PUNKTWOLKE-
+# Lieferkette ihre Tiles fuehrt (siehe topo-importDATAtoGDWH-STAC,
+# 4_SB_DSM_PUNKTWOLKE_LAS14upgrade.py: "LAS 1.2, Point Data Record Format 1, keine
+# CRS-Angabe im Header") und das dort seit je durch GeoSuite laeuft.
+#
+# PF1 fuehrt keine Farbe - PF7 haette welche. Was im GDWH ankommt, verliert dadurch
+# nichts: das Zielformat PF6 traegt ebenfalls keine RGB-Werte. Auf RGB in der Quelle
+# wird trotzdem im Log hingewiesen.
+LAS_OUT_MINOR_VERSION = 2
+LAS_OUT_POINT_FORMAT  = 1
+
+# CRS-Tag der Zwischenausgabe: NUR horizontal (LV95). Der Hoehenbezug wird bewusst
+# NICHT getaggt - REFRAME bekommt Ein- und Ausgangsrahmen ohnehin aus der Batch-
+# Konfiguration, und ein VerticalCSTypeGeoKey (5729) in den GeoTIFF-Keys ist genau die
+# Art Header-Zusatz, die die etablierten Quell-Tiles nicht haben. Den autoritativen
+# LV95/LN02-Tag setzt erst der Tab [LN02] per byte-exakter VLR-Injektion.
+LAS_OUT_SRS = "EPSG:2056"
 
 # Erwartetes SRS der Input-.laz-Kacheln (LV95 + LHN95). Wird den Readern explizit
 # aufgezwungen (override_srs), damit eine Kachel mit fehlendem/falschem SRS-Tag
 # nicht still mit einer abweichenden Referenz in den Merge einfliesst.
 LAS_INPUT_SRS = "EPSG:2056+5729"
+
+# ─── Zielwerte fuer die GDWH-taugliche LAS-1.4-Ausgabe (Tab "DMC - LASconverter [LN02]") ──
+# Identisch zu SB_DSM_PUNKTWOLKE (Projekt topo-importDATAtoGDWH-STAC, Skript
+# 4_SB_DSM_PUNKTWOLKE_LAS14upgrade.py), damit die DMC-Punktwolken strukturell
+# kongruent zu swissSURFACE3D sind und in den GDWH importiert werden koennen.
+LN02_MINOR_VERSION    = 4
+LN02_POINT_FORMAT     = 6      # Point Data Record Format 6
+LN02_POINT_LENGTH     = 30
+LN02_HEADER_SIZE      = 375
+LN02_GLOBAL_ENCODING  = 17     # Bit 0 (Adjusted Standard GPS Time) + Bit 4 (WKT)
+LN02_SCALE            = 0.01   # Schweizer Konvention (keine uebertriebene Praezision)
+LN02_BBOX_TOLERANCE_M = 0.01   # zulaessige BBox-Abweichung Quelle vs. Ziel nach Requantisierung
+
+# SRS der LN02-Kacheln (LV95 + LN02). Wird NUR den Readern der Raster-Pipeline
+# aufgezwungen; die CRS-Tags der Punktwolken-Ausgabe kommen ausschliesslich aus den
+# byte-exakten Referenz-VLRs (siehe _inject_reference_vlrs).
+LAS_LN02_SRS = "EPSG:2056+5728"
+
+# Kachelname-Muster fuer die deterministische Bestimmung des Kachelursprungs
+# (Offset), z.B. "2026_GUPPENFIRN_TIN_raw_2713_1206_LV95_LHN95.las" -> (2713, 1206).
+# Der Ursprung wird bewusst aus dem NAMEN geparst, nicht aus dem Datenminimum -
+# eine AOI-gecroppte Kachel faengt sonst irgendwo mitten in der Zelle an.
+LN02_TILE_NAME_PATTERN = re.compile(
+    r"(?:^|_)(\d{4})_(\d{4})_LV95_(?:LHN95|LN02)\.(?:las|laz)$", re.IGNORECASE)
+
+# Thinning-Token im Quell-Dateinamen, z.B. "..._TIN_thinnedout04_raw_2713_1206_...".
+# Ausgeduennt wird ausschliesslich im Tab [LHN95]; der Token gehoert damit zur Kachel und
+# wird fuer die LN02-Benennung aus dem Quellnamen uebernommen, nicht neu erfragt.
+LN02_THIN_TOKEN_PATTERN = re.compile(r"_(thinnedout\d+)_", re.IGNORECASE)
+
+# Plausibilitaet der Kachelkoordinaten: Schweizer Landesgrenzen in km, LV95
+LV95_EASTING_KM_RANGE  = (2480, 2840)
+LV95_NORTHING_KM_RANGE = (1070, 1300)
+
+# Byte-exakte VLR-Payloads aus der verifizierten swissSURFACE3D-Referenzkachel
+# 2655_1272.laz (LV95/LN02, EPSG:2056 horizontal + EPSG:5728 vertikal).
+# NICHT aus GeoTIFF-Keys/EPSG-Code neu berechnen (siehe _inject_reference_vlrs) -
+# sondern unveraendert aus der Referenz uebernehmen.
+REFERENCE_VLR_DESCRIPTION = "by LAStools of rapidlasso GmbH"
+REFERENCE_VLR_34735_B64 = (
+    "AQABAAAABQAABAAAAQABAAAMAAABAAgIBAwAAAEAKSMDEAAAAQApIwAQAAABAGAW"
+)
+REFERENCE_VLR_2112_B64 = (
+    "Q09NUE9VTkRDUlNbIlByb2plY3RlZCBjb29yZGluYXRlIHN5c3RlbSB3aXRoIGVsZXZhdGlvbiIsUFJPSkNTWyJDSDE5MDMrIC8gTFY5"
+    "NSIsR0VPR0NTWyJDSDE5MDMrIixEQVRVTVsiQ0gxOTAzKyIsU1BIRVJPSURbIkJlc3NlbCAxODQxIiw2Mzc3Mzk3LjE1NSwyOTkuMTUy"
+    "ODEyOCxBVVRIT1JJVFlbIkVQU0ciLCI3MDA0Il1dLEFVVEhPUklUWVsiRVBTRyIsIjYxNTAiXV0sUFJJTUVNWyJHcmVlbndpY2giLDAs"
+    "QVVUSE9SSVRZWyJFUFNHIiwiODkwMSJdXSxVTklUWyJkZWdyZWUiLDAuMDE3NDUzMjkyNTE5OTQzMyxBVVRIT1JJVFlbIkVQU0ciLCI5"
+    "MTIyIl1dLEFVVEhPUklUWVsiRVBTRyIsIjQxNTAiXV0sUFJPSkVDVElPTlsiSG90aW5lX09ibGlxdWVfTWVyY2F0b3JfQXppbXV0aF9D"
+    "ZW50ZXIiXSxQQVJBTUVURVJbImxhdGl0dWRlX29mX2NlbnRlciIsNDYuOTUyNDA1NTU1NTU1Nl0sUEFSQU1FVEVSWyJsb25naXR1ZGVf"
+    "b2ZfY2VudGVyIiw3LjQzOTU4MzMzMzMzMzMzXSxQQVJBTUVURVJbImF6aW11dGgiLDkwXSxQQVJBTUVURVJbInJlY3RpZmllZF9ncmlk"
+    "X2FuZ2xlIiw5MF0sUEFSQU1FVEVSWyJzY2FsZV9mYWN0b3IiLDFdLFBBUkFNRVRFUlsiZmFsc2VfZWFzdGluZyIsMjYwMDAwMF0sUEFS"
+    "QU1FVEVSWyJmYWxzZV9ub3J0aGluZyIsMTIwMDAwMF0sVU5JVFsibWV0cmUiLDEsQVVUSE9SSVRZWyJFUFNHIiwiOTAwMSJdXSxBWElT"
+    "WyJFYXN0aW5nIixFQVNUXSxBWElTWyJOb3J0aGluZyIsTk9SVEhdLEFVVEhPUklUWVsiRVBTRyIsIjIwNTYiXV0sVkVSVF9DU1siTE4w"
+    "MiBoZWlnaHQiLFZFUlRfREFUVU1bIkxhbmRlc25pdmVsbGVtZW50IDE5MDIiLDIwMDUsQVVUSE9SSVRZWyJFUFNHIiwiNTEyNyJdXSxV"
+    "TklUWyJtZXRyZSIsMSxBVVRIT1JJVFlbIkVQU0ciLCI5MDAxIl1dLEFYSVNbIkdyYXZpdHktcmVsYXRlZCBoZWlnaHQiLFVQXSxBVVRI"
+    "T1JJVFlbIkVQU0ciLCI1NzI4Il1dXQA="
+)
 
 
 def _info(cfg: dict) -> None:
@@ -505,17 +605,47 @@ def _pdal_info_metadata(pdal_exe: str, path: str) -> dict:
     return json.loads(result.stdout)["metadata"]
 
 
+def _pdal_dimension_names(pdal_exe: str, path: str) -> set:
+    """Namen aller Dimensionen einer Punktwolken-Datei ('pdal info --schema')."""
+    result = subprocess.run([pdal_exe, "info", "--schema", path],
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             universal_newlines=True)
+    if result.returncode != 0:
+        msg = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(f"pdal info --schema beendet mit Exit-Code "
+                            f"{result.returncode}" + (f": {msg}" if msg else ""))
+    schema = json.loads(result.stdout).get("schema", {}) or {}
+    return {d.get("name") for d in (schema.get("dimensions") or [])}
+
+
 def _tile_bbox_worker(args) -> tuple:
+    """Bounding Box UND global_encoding einer Quell-Kachel (headerbasiert).
+
+    Das global_encoding wird mitgelesen, weil Bit 0 (GPS-Time-Typ) eine Eigenschaft der
+    DATEN ist: es sagt, wie die GpsTime-Werte zu lesen sind (0 = GPS Week Time,
+    1 = Adjusted Standard GPS Time). Ohne Uebernahme ginge die Angabe beim Schreiben der
+    Zwischen-Tiles verloren (PDAL-Default 0), und im Tab [LN02] liesse sich nicht mehr
+    feststellen, was die Quelle deklariert hatte."""
     pdal_exe, path = args
     try:
         meta = _pdal_info_metadata(pdal_exe, path)
-        return (path, meta["minx"], meta["miny"], meta["maxx"], meta["maxy"], None)
+        return (path, meta["minx"], meta["miny"], meta["maxx"], meta["maxy"],
+                int(meta.get("global_encoding", 0) or 0), None)
     except Exception as e:
-        return (path, None, None, None, None, str(e))
+        return (path, None, None, None, None, None, str(e))
 
 
-def _run_pdal_pipeline(pdal_exe: str, pipeline_path: Path) -> None:
-    result = subprocess.run([pdal_exe, "pipeline", str(pipeline_path)],
+def _run_pdal_pipeline(pdal_exe: str, pipeline_path: Path, metadata_path=None):
+    """Fuehrt eine PDAL-Pipeline aus.
+
+    Mit metadata_path wird zusaetzlich '--metadata <pfad>' uebergeben und die
+    geparste Pipeline-Metadata als Dict zurueckgegeben (sonst None). Damit lassen
+    sich Ergebnisse einer angehaengten 'filters.stats'-Stage auslesen, OHNE die
+    Datei ein zweites Mal komplett einzulesen."""
+    cmd = [pdal_exe, "pipeline", str(pipeline_path)]
+    if metadata_path is not None:
+        cmd += ["--metadata", str(metadata_path)]
+    result = subprocess.run(cmd,
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                              universal_newlines=True)
     if result.returncode != 0:
@@ -529,6 +659,13 @@ def _run_pdal_pipeline(pdal_exe: str, pipeline_path: Path) -> None:
                     "pdal.exe-Prozessen), nicht auf einen regulaeren PDAL-Fehler.")
         raise RuntimeError(f"pdal pipeline beendet mit Exit-Code {rc}{rc_hex}{hint}"
                             + (f": {msg}" if msg else ""))
+    if metadata_path is None:
+        return None
+    try:
+        with open(str(metadata_path), encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
 
 
 def _discard_partial(path: str) -> None:
@@ -547,7 +684,8 @@ def _las_cell_worker(args) -> tuple:
     """Wird in einem eigenen Prozess ausgefuehrt - mergt die Input-Kacheln einer
     1km-Grid-Zelle, croppt/thinnt optional, schreibt eine Punktwolken-Kachel
     (.las oder .laz, siehe out_format)."""
-    (job, run_dir_str, output_dir_laz, pdal_exe, clip_wkt, thin_m, out_format) = args
+    (job, run_dir_str, output_dir_laz, pdal_exe, clip_wkt, thin_m, out_format,
+     gps_time_bit) = args
 
     stem = job["stem"]
     cminx, cminy, cmaxx, cmaxy = job["cell_bounds"]
@@ -574,6 +712,12 @@ def _las_cell_worker(args) -> tuple:
         stages.append({"type": "filters.sample", "radius": float(thin_m)})
 
     stages.append({"type": "writers.las", "filename": laz_out,
+                    "minor_version": LAS_OUT_MINOR_VERSION,
+                    "dataformat_id": LAS_OUT_POINT_FORMAT,
+                    "a_srs": LAS_OUT_SRS,
+                    # Nur Bit 0 (GPS-Time-Typ), aus der Quelle uebernommen. Bit 4 (WKT)
+                    # gibt es erst ab LAS 1.4 und waere hier unzulaessig.
+                    "global_encoding": int(gps_time_bit),
                     "scale_x": 0.01, "scale_y": 0.01, "scale_z": 0.01})
 
     try:
@@ -589,6 +733,18 @@ def _las_cell_worker(args) -> tuple:
             _discard_partial(laz_out)
             return ("empty", stem, None)
 
+        # Kontrolle statt Annahme: die Metadaten sind hier ohnehin schon gelesen.
+        # Stimmt der Header nicht, ist die Kachel fuer den GeoSuite-Reframe unbrauchbar
+        # und soll gar nicht erst im Output-Ordner liegen bleiben.
+        if (meta.get("minor_version") != LAS_OUT_MINOR_VERSION or
+                meta.get("dataformat_id") != LAS_OUT_POINT_FORMAT):
+            _discard_partial(laz_out)
+            return ("error", stem,
+                    f"Header ist LAS 1.{meta.get('minor_version')}/"
+                    f"PF{meta.get('dataformat_id')}, erwartet LAS "
+                    f"1.{LAS_OUT_MINOR_VERSION}/PF{LAS_OUT_POINT_FORMAT} - sonst kann "
+                    f"GeoSuite/REFRAME die Datei nicht lesen.")
+
         return ("written", stem, None)
     except Exception as e:
         _discard_partial(laz_out)
@@ -598,6 +754,14 @@ def _las_cell_worker(args) -> tuple:
             pipeline_path.unlink(missing_ok=True)
         except Exception:
             pass
+
+
+def _raster_cell_buffer(gsd: float, thin_m) -> float:
+    """Puffer um eine DSM-Zelle, damit die IDW-Nachbarschaft am Zellrand vollstaendig
+    ist (writers.gdal-Default-Radius = resolution * sqrt(2)) bzw. das Thinning
+    randunabhaengig bleibt. Wird sowohl beim Crop im Worker als auch beim Auswaehlen
+    der beitragenden Input-Kacheln gebraucht - deshalb nur EINE Definition."""
+    return max(3.0 * float(gsd), 5.0 * float(thin_m) if thin_m else 0.0, 2.0)
 
 
 def _raster_cell_worker(args) -> tuple:
@@ -625,17 +789,17 @@ def _raster_cell_worker(args) -> tuple:
     pipeline_path = run_dir / f"pipeline_dsm_{cell}.json"
     tif_out = str(Path(cells_dir) / f"dsm_{cell}.tif")
 
-    # Puffer fuer eine vollstaendige IDW-Nachbarschaft am Zellrand
-    # (writers.gdal-Default-Radius = resolution * sqrt(2)) bzw. fuer ein
-    # randunabhaengiges Thinning.
-    buf = max(3.0 * gsd, 5.0 * float(thin_m) if thin_m else 0.0, 2.0)
+    buf = _raster_cell_buffer(gsd, thin_m)
+    # SRS der Input-Kacheln: LHN95 (Tab "LASconverter [LHN95]") bzw. LN02, wenn der
+    # Job-Aufbau es explizit setzt (Tab "LASconverter [LN02]").
+    srs = job.get("srs", LAS_INPUT_SRS)
 
     stages = []
     tags = []
     for i, t in enumerate(tiles):
         tag = f"r{i}"
         stages.append({"type": "readers.las", "filename": t, "tag": tag,
-                        "override_srs": LAS_INPUT_SRS})
+                        "override_srs": srs})
         tags.append(tag)
     stages.append({"type": "filters.merge", "inputs": tags})
     stages.append({"type": "filters.crop",
@@ -653,7 +817,7 @@ def _raster_cell_worker(args) -> tuple:
         "gdaldriver": "GTiff",
         "data_type": "float32",
         "bounds": f"([{r_minx:.3f},{r_maxx:.3f}],[{r_miny:.3f},{r_maxy:.3f}])",
-        "nodata": LAS_RASTER_NODATA,
+        "nodata": LAS_CELL_NODATA,
     })
 
     try:
@@ -705,8 +869,8 @@ def _mosaic_las_raster(cell_rasters, run_dir: Path, output_path: str,
     log(f"\nSetze {len(cell_rasters)} Zell-Raster zum Gesamt-Mosaik zusammen: {vrt_path}")
     vrt_ds = gdal.BuildVRT(
         str(vrt_path), cell_rasters,
-        options=gdal.BuildVRTOptions(srcNodata=LAS_RASTER_NODATA,
-                                      VRTNodata=LAS_RASTER_NODATA),
+        options=gdal.BuildVRTOptions(srcNodata=LAS_CELL_NODATA,
+                                      VRTNodata=LAS_CELL_NODATA),
     )
     if vrt_ds is None:
         raise RuntimeError("gdal.BuildVRT hat None zurueckgegeben - Raster-Mosaik fehlgeschlagen.")
@@ -715,6 +879,7 @@ def _mosaic_las_raster(cell_rasters, run_dir: Path, output_path: str,
 
     log(f"\nClippe Raster auf AOI (Cutline): {clip_shape_path}")
     log(f"  Ausserhalb -> NoData = {LAS_RASTER_NODATA:g}")
+    log(f"  Zellraster-NoData {LAS_CELL_NODATA:g} (PDAL) -> {LAS_RASTER_NODATA:g} (GDWH-Sentinel)")
     log(f"  Ziel-Grid (auf {gsd:g}m gesnapped): {snap_minx:.2f}, {snap_miny:.2f} - "
         f"{snap_maxx:.2f}, {snap_maxy:.2f}")
     warp_options = gdal.WarpOptions(
@@ -723,7 +888,13 @@ def _mosaic_las_raster(cell_rasters, run_dir: Path, output_path: str,
         cropToCutline=False,
         outputBounds=(snap_minx, snap_miny, snap_maxx, snap_maxy),
         xRes=gsd, yRes=gsd,  # Raster-Grid exakt beibehalten (kein implizites Resampling)
-        srcNodata=LAS_RASTER_NODATA,
+        # QUELLE dieses Warps sind NICHT die Input-Punktwolken, sondern die Zell-Raster
+        # im Staging-Ordner (Wegwerfprodukte, von PDAL geschrieben) - die tragen
+        # LAS_CELL_NODATA. Explizit angegeben statt GDAL die Band-Metadaten der
+        # Zell-Raster raten zu lassen: wuerde der Sentinel dort nicht erkannt, kaemen
+        # die NoData-Pixel als ECHTE Hoehenwerte (-9999) ins DSM.
+        srcNodata=LAS_CELL_NODATA,
+        # ZIEL ist das Endprodukt - hier steht der GDWH-Sentinel, den 'gdalinfo' meldet.
         dstNodata=LAS_RASTER_NODATA,
         multithread=True,
         warpOptions=[f"NUM_THREADS={num_threads}"],
@@ -740,6 +911,21 @@ def _mosaic_las_raster(cell_rasters, run_dir: Path, output_path: str,
     out_ds.FlushCache()
     out_ds = None
     log(f"  Gesamt-Raster (DSM) geschrieben: {output_path}")
+
+    # Kontrolle statt Annahme: der GDWH-Sentinel MUSS bitgenau im Header stehen (das,
+    # was 'gdalinfo' meldet). Verglichen wird der in Float32 gespeicherte Wert - GTiff
+    # legt NoData als ASCII-Tag ab, die Textform darf also abweichen, der Zahlenwert
+    # nicht. Stimmt er nicht, ist das DSM nicht auslieferbar -> harter Abbruch.
+    check_ds = gdal.Open(output_path, gdal.GA_ReadOnly)
+    written_nd = check_ds.GetRasterBand(1).GetNoDataValue()
+    check_ds = None
+    as_float32 = (struct.unpack("<f", struct.pack("<f", written_nd))[0]
+                  if written_nd is not None else None)
+    if as_float32 != LAS_RASTER_NODATA:
+        raise RuntimeError(
+            f"NoData im DSM-Header ist {written_nd!r}, erwartet {LAS_RASTER_NODATA!r} "
+            f"(GDWH-Konvention SB_DSM) - Raster nicht auslieferbar.")
+    log(f"  NoData-Kontrolle OK: Header traegt {written_nd!r}")
 
     # --- Hillshade aus dem fertigen (bereits geclippten) DSM rechnen ---
     log("\nErzeuge Hillshade aus dem DSM...")
@@ -839,15 +1025,17 @@ def _process_las(cfg: dict) -> None:
 
     _log("Lese Metadaten (Bounding Box) aller Kacheln...")
     tile_bboxes = []
+    tile_gps_bits = []
     meta_errors = []
     with ProcessPoolExecutor(max_workers=num_workers) as executor:
         futures = [executor.submit(_tile_bbox_worker, (pdal_exe, t)) for t in tiles]
         for i, fut in enumerate(as_completed(futures), 1):
-            path, minx, miny, maxx, maxy, err = fut.result()
+            path, minx, miny, maxx, maxy, genc, err = fut.result()
             if err:
                 meta_errors.append((path, err))
             else:
                 tile_bboxes.append((path, minx, miny, maxx, maxy))
+                tile_gps_bits.append(genc & 0x01)
             if i == len(tiles) or i % max(1, len(tiles) // 100) == 0:
                 print(f"PROGRESS:{(i / len(tiles)) * 0.10:.6f}", flush=True)
 
@@ -865,8 +1053,36 @@ def _process_las(cfg: dict) -> None:
     thin_token = f"thinnedout{round(thin_m * 10):02d}_" if thin_m else ""
     _log(f"\nThinning            : {(str(thin_m) + ' m') if thin_m else 'inaktiv'}")
     _log(f"Raster erstellen    : {'AKTIV (GSD ' + format(gsd_raster, 'g') + ' m)' if create_raster else 'inaktiv'}")
-    _log(f"Punktwolken-Format  : .{out_format}")
+    # GPS-Time-Typ (global_encoding Bit 0) aus der Quelle uebernehmen statt ihn zu
+    # erfinden. Nur wenn ALLE Quell-Tiles ihn setzen, wird er auch gesetzt - eine Kachel
+    # ohne die Angabe darf nicht dazu fuehren, dass die Ausgabe etwas behauptet, was in
+    # der Quelle nicht belegt ist.
+    src_gps_bit = 1 if (tile_gps_bits and all(tile_gps_bits)) else 0
+    if any(tile_gps_bits) and not src_gps_bit:
+        _log(f"  WARNUNG: GPS-Time-Typ in der Quelle uneinheitlich "
+             f"({sum(tile_gps_bits)} von {len(tile_gps_bits)} Tiles mit global_encoding "
+             f"Bit 0) - die Ausgabe wird konservativ mit Bit 0 = 0 geschrieben.")
+
+    _log(f"Punktwolken-Format  : .{out_format}  (LAS 1.{LAS_OUT_MINOR_VERSION} / "
+         f"PF{LAS_OUT_POINT_FORMAT}, CRS-Tag {LAS_OUT_SRS}, global_encoding "
+         f"{src_gps_bit} - von GeoSuite/REFRAME lesbar)")
     _log(f"Benennung           : {jahr}_{area}_TIN_{thin_token}raw_<NAME>_LV95_LHN95.{out_format}")
+
+    # PF1 fuehrt keine Farbe. Nur hinweisen, nicht abbrechen: das GDWH-Zielformat (PF6,
+    # siehe Tab [LN02]) fuehrt ebenfalls keine RGB-Werte - verloren geht also nichts,
+    # was spaeter noch ankaeme. Eine Stichprobe auf der ersten Kachel genuegt.
+    try:
+        dims = _pdal_dimension_names(pdal_exe, tile_bboxes[0][0])
+        if {"Red", "Green", "Blue"} & dims:
+            _log(f"  HINWEIS: Die Quell-Tiles fuehren Farbwerte (RGB). Das Ausgabeformat "
+                 f"PF{LAS_OUT_POINT_FORMAT} traegt keine Farbe - sie faellt hier weg. Das ist "
+                 f"bewusst so: PF1 ist das Format, das GeoSuite/REFRAME nachweislich liest, "
+                 f"und das GDWH-Zielformat PF6 (Tab [LN02]) traegt ohnehin keine Farbe - sie "
+                 f"kaeme also nirgends an. Wird sie im Zwischenschritt doch gebraucht: "
+                 f"LAS_OUT_POINT_FORMAT auf 3 setzen (LAS 1.2 mit RGB), ob GeoSuite PF3 liest "
+                 f"ist allerdings nicht verifiziert.")
+    except Exception as e:
+        _log(f"  WARNUNG: Dimensionen der Quelle nicht lesbar ({e}) - RGB-Hinweis uebersprungen.")
 
     # --- Schritt 2: Zielnamen + Zielraster fuer DSM/Hillshade, nur falls aktiviert ---
     # Das Raster wird NICHT mehr in einem einzigen PDAL-Lauf ueber alle Input-
@@ -1013,7 +1229,8 @@ def _process_las(cfg: dict) -> None:
     # mehr pdal.exe-Prozesse gleichzeitig aktiv als unter "CPU-Kerne" eingestellt.
     cell_workers = {"las": _las_cell_worker, "dsm": _raster_cell_worker}
     cell_tasks = [("las", job["stem"],
-                   (job, str(run_dir), output_dir_laz, pdal_exe, clip_wkt, thin_m, out_format))
+                   (job, str(run_dir), output_dir_laz, pdal_exe, clip_wkt, thin_m,
+                    out_format, src_gps_bit))
                   for job in jobs]
     if create_raster:
         cell_tasks += [("dsm", job["cell"],
@@ -1125,6 +1342,763 @@ def _process_las(cfg: dict) -> None:
                             f"verarbeitet werden - siehe Log.")
 
 
+# ─── DMC LASconverter [LN02] (GDWH-Metadaten, LAS 1.4) ─────────────────────────
+#
+# Nachgelagerter Schritt zum Tab "DMC - LASconverter [LHN95]": dessen .las-Kacheln
+# werden extern mit GeoSuite/REFRAME von LHN95 nach LN02 reframt (nur die Hoehe,
+# X/Y bleiben LV95) - dieser Tab bringt das Ergebnis anschliessend in die
+# GDWH-taugliche Form.
+#
+# Ablauf:
+#   1) Dateinamen aller Input-Kacheln pruefen (Kachelursprung), Metadaten
+#      (Bounding Box) parallel einlesen
+#   2) Pro Kachel: Requantisierung auf LAS 1.4 / Point Data Record Format 6,
+#      scale 0.01, Offset = Kachelursprung (aus dem DATEINAMEN geparst),
+#      global_encoding 17; danach Byte-Injektion der zwei LV95/LN02-Referenz-VLRs
+#      (34735 GeoTIFF-KeyDirectory + 2112 OGC-WKT) und vollstaendige Validierung.
+#      Geschrieben wird als .las oder .laz (out_format).
+#   3) DSM-Zellen (nur falls "Create Raster" aktiv): dieselbe Zellgeometrie, mit
+#      Puffer gecroppt und als Float32-IDW-Raster gerastert (wie im LHN95-Tab)
+#   4) Gesamt-Raster: Zell-Raster als VRT mosaikieren, per AOI-/Footprint-Shape
+#      maskieren (NoData = LAS_RASTER_NODATA), daraus den Hillshade rechnen und
+#      ebenfalls maskieren (NoData = 255)
+#
+# KEIN Reframe, KEIN Re-Tiling, KEIN Crop der Punktwolke - der Input ist bereits
+# das fertige, AOI-gecroppte 1km-Grid aus dem LHN95-Tab. Das AOI-/Footprint-Shape
+# wird ausschliesslich fuer die Raster-Maskierung gebraucht.
+#
+# Warum die CRS-Tags per Byte-Injektion und nicht ueber PDAL/las2las gesetzt werden,
+# siehe Docstring von _inject_reference_vlrs().
+
+
+def _build_vlr_record(user_id: str, record_id: int, description: str, payload: bytes) -> bytes:
+    """Baut einen kompletten LAS-VLR (54-Byte-Header + Payload)."""
+    header = struct.pack(
+        "<H16sHH32s",
+        0,
+        user_id.encode("ascii").ljust(16, b"\x00"),
+        record_id,
+        len(payload),
+        description.encode("ascii").ljust(32, b"\x00"),
+    )
+    return header + payload
+
+
+def _inject_reference_vlrs(las_path: str) -> int:
+    """Fuegt die zwei byte-exakten LV95/LN02-Referenz-VLRs (GeoTIFF-KeyDirectory
+    34735 + OGC-WKT 2112) in eine LAS/LAZ-Datei ein, OHNE eine CRS-Bibliothek den
+    WKT neu berechnen zu lassen. Uebernommen aus dem verifizierten Skript
+    4_SB_DSM_PUNKTWOLKE_LAS14upgrade.py (Projekt topo-importDATAtoGDWH-STAC).
+
+    Begruendung (dort empirisch getestet, nicht angenommen):
+      - PDAL erzeugt bei a_srs="EPSG:2056+5728" einen semantisch korrekten, aber
+        NICHT byte-identischen WKT (COMPD_CS statt COMPOUNDCRS, anderer CRS-Name)
+        und schreibt den GeoTIFF-VLR (34735) gar nicht.
+      - las2las -epsg 2056 -vertical_epsg 5728 -set_ogc_wkt lieferte in der
+        getesteten Version geodaetisch FALSCHE Oblique-Mercator-Parameter und liess
+        die Vertikalkomponente (LN02/5728) ganz weg.
+      - PDALs eigene writers.las-Option 'vlrs' verwirft VLRs mit user_id
+        "LASF_Projection" still - deshalb Byte-Patch statt PDAL-Option.
+
+    Funktioniert auch bei komprimierten (LAZ) Punktdaten: dafuer muss zusaetzlich
+    zum Header ('offset_to_point_data') auch die 'chunk table start position' der
+    LASzip-Kompression korrigiert werden (int64 am Anfang des Punkt-Bereichs,
+    absoluter Datei-Offset auf die Chunk-Tabelle). Ohne diese Korrektur bleibt die
+    Datei zwar fuer 'pdal info --metadata' lesbar (die Punktzahl kommt aus dem
+    Header), jeder echte Dekompressions-Durchlauf bricht aber mit 'Invalid version
+    ... found in LAZ chunk table' ab.
+
+    Ein bereits vorhandener VLR mit user_id 'LASF_Projection' wird ENTFERNT, nicht
+    als Fehler behandelt: PDAL uebernimmt eine in der Quelle vorgefundene (hier:
+    LHN95-)SRS-VLR beim Schreiben automatisch. Autoritativ fuer die Ziel-CRS ist
+    ausschliesslich die Referenz unten.
+
+    Arbeitet in-place - nur auf einer Temp-Datei aufrufen (siehe _ln02_tile_worker).
+    Gibt die Anzahl entfernter 'LASF_Projection'-VLRs zurueck.
+    """
+    with open(las_path, "rb") as f:
+        data = f.read()
+
+    header_size, offset_to_point_data, n_vlr = struct.unpack_from("<HII", data, 94)
+    existing_vlr_block = data[header_size:offset_to_point_data]
+
+    is_laszip = False
+    n_stripped = 0
+    kept_vlr_chunks = []
+    pos = 0
+    for _ in range(n_vlr):
+        _, user_id_raw, record_id, record_len, _ = struct.unpack_from(
+            "<H16sHH32s", existing_vlr_block, pos)
+        user_id = user_id_raw.split(b"\x00")[0].decode("ascii", "replace")
+        vlr_len = 54 + record_len
+        if user_id == "LASF_Projection":
+            n_stripped += 1
+        else:
+            kept_vlr_chunks.append(existing_vlr_block[pos:pos + vlr_len])
+        if user_id == "laszip encoded" and record_id == 22204:
+            is_laszip = True
+        pos += vlr_len
+
+    existing_vlr_block = b"".join(kept_vlr_chunks)
+    n_vlr -= n_stripped
+
+    vlr1 = _build_vlr_record("LASF_Projection", 34735, REFERENCE_VLR_DESCRIPTION,
+                              base64.b64decode(REFERENCE_VLR_34735_B64))
+    vlr2 = _build_vlr_record("LASF_Projection", 2112, REFERENCE_VLR_DESCRIPTION,
+                              base64.b64decode(REFERENCE_VLR_2112_B64))
+    new_vlr_block = bytes(existing_vlr_block) + vlr1 + vlr2
+    new_offset_to_point_data = header_size + len(new_vlr_block)
+    # Tatsaechliche Verschiebung der Punktdaten - NICHT einfach len(vlr1)+len(vlr2):
+    # wurden oben VLRs entfernt, ist die Nettoverschiebung kleiner.
+    shift = new_offset_to_point_data - offset_to_point_data
+
+    point_data = bytearray(data[offset_to_point_data:])
+    if is_laszip:
+        chunk_table_pos, = struct.unpack_from("<q", point_data, 0)
+        if chunk_table_pos != -1:  # -1 = LASzip-Platzhalter, nicht bei fertigen Dateien
+            struct.pack_into("<q", point_data, 0, chunk_table_pos + shift)
+
+    new_data = bytearray(data[:header_size]) + new_vlr_block + point_data
+    struct.pack_into("<I", new_data, 96, new_offset_to_point_data)
+    struct.pack_into("<I", new_data, 100, n_vlr + 2)
+
+    global_encoding, = struct.unpack_from("<H", new_data, 6)
+    struct.pack_into("<H", new_data, 6, global_encoding | 0x10)  # WKT-Bit setzen
+
+    with open(las_path, "wb") as f:
+        f.write(new_data)
+
+    return n_stripped
+
+
+def _parse_tile_origin(filename: str) -> tuple:
+    """Parst Easting/Northing (in km) deterministisch aus dem Dateinamen
+    (Muster '..._<E>_<N>_LV95_<LHN95|LN02>.<las|laz>'), NICHT aus dem Datenminimum:
+    eine AOI-gecroppte Kachel faengt sonst irgendwo mitten in der Zelle an und der
+    Offset waere nicht mehr der Kachelursprung.
+
+    Wirft ValueError bei fehlendem Muster oder unplausiblen Werten (ausserhalb der
+    Schweizer Landesgrenzen LV95, in km)."""
+    match = LN02_TILE_NAME_PATTERN.search(filename)
+    if not match:
+        raise ValueError(
+            f"Kachelmuster '..._<Easting>_<Northing>_LV95_<LHN95|LN02>.<las|laz>' nicht "
+            f"gefunden in '{filename}' - Kachelursprung (Offset) nicht bestimmbar.")
+    easting_km, northing_km = int(match.group(1)), int(match.group(2))
+
+    e_min, e_max = LV95_EASTING_KM_RANGE
+    n_min, n_max = LV95_NORTHING_KM_RANGE
+    if not (e_min <= easting_km <= e_max):
+        raise ValueError(f"Kachel-Easting {easting_km} km aus '{filename}' liegt ausserhalb "
+                          f"der plausiblen LV95-Ausdehnung ({e_min}-{e_max} km).")
+    if not (n_min <= northing_km <= n_max):
+        raise ValueError(f"Kachel-Northing {northing_km} km aus '{filename}' liegt ausserhalb "
+                          f"der plausiblen LV95-Ausdehnung ({n_min}-{n_max} km).")
+    return easting_km, northing_km
+
+
+def _parse_thin_token(filename: str) -> str:
+    """Uebernimmt den Thinning-Token (z.B. 'thinnedout04_') aus dem Quell-Dateinamen.
+    Ohne Token im Namen (= nicht ausgeduennt) ein leerer String."""
+    match = LN02_THIN_TOKEN_PATTERN.search(filename)
+    return f"{match.group(1).lower()}_" if match else ""
+
+
+def _check_ln02_tile_frame(md: dict, origin_x: float, origin_y: float, filename: str) -> None:
+    """Prueft, ob die Quell-BBox innerhalb des nominalen 1km-Kachelrahmens liegt.
+
+    Punkte AUSSERHALB des Rahmens sind ein harter Fehler (falsch geparste
+    Kachelkoordinaten oder fehlplatzierte Datei). Luecken zum Rand werden bewusst
+    NICHT gemeldet: die Kacheln sind AOI-gecroppt, unvollstaendig gefuellte
+    Randkacheln sind hier der Normalfall - anders als bei swissSURFACE3D."""
+    try:
+        minx, maxx = float(md["minx"]), float(md["maxx"])
+        miny, maxy = float(md["miny"]), float(md["maxy"])
+    except (KeyError, TypeError, ValueError):
+        return
+    eps = 0.02  # Toleranz gegen Rundungsrauschen am Rand
+    if minx < origin_x - eps or maxx > origin_x + 1000.0 + eps or \
+       miny < origin_y - eps or maxy > origin_y + 1000.0 + eps:
+        raise ValueError(
+            f"Punkte ausserhalb des Kachelrahmens: BBox (X {minx:.2f}-{maxx:.2f}, "
+            f"Y {miny:.2f}-{maxy:.2f}) vs. erwarteter Rahmen "
+            f"(X {origin_x:.2f}-{origin_x + 1000.0:.2f}, "
+            f"Y {origin_y:.2f}-{origin_y + 1000.0:.2f}).")
+
+
+def _resolve_crs_epsg(md: dict) -> tuple:
+    """Liest horizontalen und vertikalen EPSG-Code aus der von PDAL/PROJ bereits
+    aufbereiteten 'srs.json'-Struktur (CompoundCRS mit Bestandteilen
+    'ProjectedCRS'/'GeographicCRS' und 'VerticalCRS') - keine pyproj-Abhaengigkeit
+    noetig, PDAL nutzt intern ohnehin PROJ dafuer.
+    Gibt (horizontal, vertikal) zurueck, je None falls nicht aufloesbar."""
+    j = ((md.get("srs") or {}).get("json")) or {}
+    components = j.get("components") or []
+    horizontal_epsg = vertical_epsg = None
+    for comp in components:
+        ident = comp.get("id") or {}
+        epsg = ident.get("code") if ident.get("authority") == "EPSG" else None
+        if comp.get("type") == "VerticalCRS":
+            vertical_epsg = epsg
+        elif comp.get("type") in ("ProjectedCRS", "GeographicCRS", "GeodeticCRS"):
+            horizontal_epsg = epsg
+    if not components:
+        ident = j.get("id") or {}
+        if ident.get("authority") == "EPSG":
+            horizontal_epsg = ident.get("code")
+    return horizontal_epsg, vertical_epsg
+
+
+def _ln02_is_already_migrated(md: dict) -> bool:
+    """True, wenn die Datei bereits LAS 1.4/PF6 mit global_encoding 17 und CRS
+    2056+5728 ist - dann ist keine Konversion noetig, die Kachel wird nur kopiert."""
+    if md.get("minor_version") != LN02_MINOR_VERSION:
+        return False
+    if md.get("dataformat_id") != LN02_POINT_FORMAT:
+        return False
+    if md.get("global_encoding") != LN02_GLOBAL_ENCODING:
+        return False
+    h_epsg, v_epsg = _resolve_crs_epsg(md)
+    return h_epsg == 2056 and v_epsg == 5728
+
+
+def _pdal_classification_range(pdal_exe: str, path: str) -> tuple:
+    """Minimum/Maximum der Dimension 'Classification' (gezielter Einzelscan, nicht
+    'pdal info --stats' ueber alle Dimensionen)."""
+    result = subprocess.run(
+        [pdal_exe, "info", "--dimensions", "Classification", "--stats", path],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+    if result.returncode != 0:
+        msg = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(f"pdal info (Classification) beendet mit Exit-Code "
+                            f"{result.returncode}" + (f": {msg}" if msg else ""))
+    data = json.loads(result.stdout)
+    for stat in data.get("stats", {}).get("statistic", []):
+        if stat.get("name") == "Classification":
+            return stat.get("minimum"), stat.get("maximum")
+    return (None, None)
+
+
+def _stat_range_from_pipeline_metadata(pipeline_metadata, dimension: str) -> tuple:
+    """Liest Min/Max einer Dimension aus der Metadata einer Pipeline-Ausfuehrung mit
+    'filters.stats'-Stage - so muss die Quelle nicht ein zweites Mal komplett eingelesen
+    werden. Gibt (None, None) zurueck, falls Stage oder Dimension fehlen."""
+    stats = ((pipeline_metadata or {}).get("stages") or {}).get("filters.stats") or {}
+    for stat in stats.get("statistic", []):
+        if stat.get("name") == dimension:
+            return stat.get("minimum"), stat.get("maximum")
+    return (None, None)
+
+
+def _validate_ln02_target(src_md: dict, dst_md: dict) -> list:
+    """Nachkonversions-Validierung. Gibt eine Liste von Fehler-Strings zurueck
+    (leer = alles OK). Prueft NUR, repariert nichts:
+      - Punktanzahl identisch
+      - BBox identisch innerhalb LN02_BBOX_TOLERANCE_M
+      - minor_version / dataformat_id / point_length / header_size / global_encoding
+      - beide CRS-VLRs vorhanden (34735 + 2112), VLR 2112 endet auf Nullbyte
+      - CRS aufloesbar: horizontal 2056, vertikal 5728
+      - '5729' bzw. 'LHN95' kommen im Ziel-WKT NICHT vor (Kontrolle, dass wirklich
+        LN02-Daten getaggt werden und nicht versehentlich LHN95-Kacheln)
+    """
+    problems = []
+
+    if src_md.get("count") != dst_md.get("count"):
+        problems.append(f"Punktanzahl weicht ab: Quelle {src_md.get('count')} vs. "
+                         f"Ziel {dst_md.get('count')}")
+
+    for key in ("minx", "maxx", "miny", "maxy", "minz", "maxz"):
+        try:
+            d = abs(float(src_md[key]) - float(dst_md[key]))
+        except (KeyError, TypeError, ValueError):
+            problems.append(f"BBox-Feld '{key}' fehlt in Quelle oder Ziel.")
+            continue
+        if d > LN02_BBOX_TOLERANCE_M:
+            problems.append(f"BBox-Feld '{key}' weicht {d:.4f} m ab "
+                             f"(Toleranz {LN02_BBOX_TOLERANCE_M} m).")
+
+    for field, expected in (("minor_version",   LN02_MINOR_VERSION),
+                            ("dataformat_id",   LN02_POINT_FORMAT),
+                            ("point_length",    LN02_POINT_LENGTH),
+                            ("header_size",     LN02_HEADER_SIZE),
+                            ("global_encoding", LN02_GLOBAL_ENCODING)):
+        if dst_md.get(field) != expected:
+            problems.append(f"{field}={dst_md.get(field)}, erwartet {expected}")
+
+    found_34735 = found_2112 = vlr2112_ok = False
+    i = 0
+    while f"vlr_{i}" in dst_md:
+        vlr = dst_md[f"vlr_{i}"]
+        if vlr.get("user_id") == "LASF_Projection":
+            if vlr.get("record_id") == 34735:
+                found_34735 = True
+            elif vlr.get("record_id") == 2112:
+                found_2112 = True
+                vlr2112_ok = base64.b64decode(vlr.get("data", "")).endswith(b"\x00")
+        i += 1
+    if not found_34735:
+        problems.append("VLR record_id 34735 (GeoTIFF KeyDirectory) fehlt im Ziel.")
+    if not found_2112:
+        problems.append("VLR record_id 2112 (OGC WKT) fehlt im Ziel.")
+    elif not vlr2112_ok:
+        problems.append("VLR record_id 2112 (OGC WKT) endet nicht auf Nullbyte.")
+
+    h_epsg, v_epsg = _resolve_crs_epsg(dst_md)
+    if h_epsg != 2056:
+        problems.append(f"Horizontales CRS = EPSG:{h_epsg}, erwartet EPSG:2056")
+    if v_epsg != 5728:
+        problems.append(f"Vertikales CRS = EPSG:{v_epsg}, erwartet EPSG:5728 (LN02)")
+    wkt_text = dst_md.get("spatialreference", "") or ""
+    if "5729" in wkt_text or "LHN95" in wkt_text:
+        problems.append("Ziel-WKT enthaelt '5729' bzw. 'LHN95' statt LN02 - FACHLICHER FEHLER.")
+
+    return problems
+
+
+def _ln02_tile_worker(args) -> tuple:
+    """Konvertiert EINE bereits nach LN02 reframte 1km-Kachel in die GDWH-taugliche
+    LAS-1.4-Form. Laeuft in einem eigenen Prozess (Gegenstueck zu _raster_cell_worker).
+
+    Die Zieldatei wird erst nach vollstaendiger Validierung atomar (os.replace)
+    geschrieben: schlaegt irgendetwas fehl, bleibt eine evtl. schon vorhandene
+    Zieldatei unangetastet und die Temp-Datei wird verworfen. Die Quelle wird NIE
+    veraendert.
+
+    Rueckgabe: (status, name, fehler, warnungen) mit status in
+    'written' | 'copied' | 'error'."""
+    (src_path, dst_path, pdal_exe, run_dir_str, origin_x, origin_y) = args
+
+    src_name = os.path.basename(src_path)
+    dst_name = os.path.basename(dst_path)
+    warnings = []
+    run_dir = Path(run_dir_str)
+    stem = os.path.splitext(dst_name)[0]
+    pipeline_path = run_dir / f"pipeline_ln02_{stem}.json"
+    meta_path = run_dir / f"pipemeta_ln02_{stem}.json"
+    tmp_path = None
+
+    try:
+        try:
+            src_md = _pdal_info_metadata(pdal_exe, src_path)
+        except Exception as e:
+            return ("error", dst_name, f"Quelldatei nicht lesbar (pdal info): {e}", warnings)
+
+        _check_ln02_tile_frame(src_md, origin_x, origin_y, src_name)
+
+        # Bit 0 sagt, wie die GpsTime-Werte zu lesen sind (0 = GPS Week Time,
+        # 1 = Adjusted Standard GPS Time). Das Zielformat verlangt 17, also Bit 0
+        # gesetzt. Ob das eine echte Falschaussage waere, haengt davon ab, ob ueberhaupt
+        # GpsTime-Werte vorliegen - das wird unten an den Daten gemessen, statt hier
+        # pauschal zu warnen.
+        src_gps_bit = int(src_md.get("global_encoding", 0) or 0) & 0x01
+
+        same_ext = os.path.splitext(src_path)[1].lower() == os.path.splitext(dst_path)[1].lower()
+        if same_ext and _ln02_is_already_migrated(src_md):
+            shutil.copy2(src_path, dst_path)
+            return ("copied", dst_name, None, warnings)
+
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix=os.path.splitext(dst_name)[1],
+                                             dir=os.path.dirname(dst_path))
+        os.close(tmp_fd)
+        os.remove(tmp_path)  # writers.las soll die Datei selbst anlegen
+
+        writer = {
+            "type": "writers.las",
+            "filename": tmp_path,
+            "minor_version": LN02_MINOR_VERSION,
+            "dataformat_id": LN02_POINT_FORMAT,
+            "scale_x": LN02_SCALE, "scale_y": LN02_SCALE, "scale_z": LN02_SCALE,
+            "offset_x": origin_x, "offset_y": origin_y, "offset_z": 0,
+            "global_encoding": LN02_GLOBAL_ENCODING,
+        }
+        if dst_name.lower().endswith(".laz"):
+            writer["compression"] = "laszip"
+
+        # 'filters.stats' haengt sich als reiner Durchlauf-Filter (veraendert keine
+        # Punkte) an den ohnehin noetigen Lesedurchlauf und liefert die
+        # Classification-Spanne der QUELLE gratis mit - ohne sie ein zweites Mal
+        # komplett einzulesen.
+        stages = [
+            {"type": "readers.las", "filename": src_path},
+            # GpsTime kostet hier nichts extra und entscheidet unten, ob der
+            # GPS-Time-Typ ueberhaupt eine Aussage ueber die Daten macht.
+            {"type": "filters.stats", "dimensions": "Classification,GpsTime"},
+            writer,
+        ]
+        with open(pipeline_path, "w", encoding="utf-8") as f:
+            json.dump({"pipeline": stages}, f)
+        pipe_md = _run_pdal_pipeline(pdal_exe, pipeline_path, meta_path)
+
+        src_class = _stat_range_from_pipeline_metadata(pipe_md, "Classification")
+        if src_class == (None, None):
+            src_class = _pdal_classification_range(pdal_exe, src_path)
+
+        # GPS-Time-Typ: nur melden, wenn es die Daten wirklich betrifft.
+        if not src_gps_bit:
+            gps_min, gps_max = _stat_range_from_pipeline_metadata(pipe_md, "GpsTime")
+            if gps_min is None:
+                warnings.append(
+                    f"{src_name}: global_encoding-Bit 0 (GPS-Time-Typ) ist in der Quelle "
+                    f"nicht gesetzt und GpsTime war nicht messbar - die Zieldatei "
+                    f"deklariert Adjusted Standard GPS Time (global_encoding "
+                    f"{LN02_GLOBAL_ENCODING}, vom Zielformat verlangt).")
+            elif gps_min == 0 and gps_max == 0:
+                pass  # GpsTime durchgehend 0 - der Typ beschreibt nichts, kein Hinweis noetig
+            else:
+                warnings.append(
+                    f"{src_name}: Die Quelle fuehrt GpsTime-Werte ({gps_min} bis {gps_max}), "
+                    f"deklariert per global_encoding-Bit 0 aber GPS Week Time. Die Zieldatei "
+                    f"deklariert Adjusted Standard GPS Time (global_encoding "
+                    f"{LN02_GLOBAL_ENCODING}, vom Zielformat verlangt) - die WERTE bleiben "
+                    f"unveraendert, nur ihre Typ-Angabe aendert sich. Bitte pruefen, welcher "
+                    f"Typ fachlich zutrifft.")
+
+        n_stripped = _inject_reference_vlrs(tmp_path)
+        if n_stripped:
+            warnings.append(f"{src_name}: {n_stripped} von PDAL aus der Quelle uebernommene(r) "
+                             f"'LASF_Projection'-VLR(s) entfernt (nicht autoritativ) - durch die "
+                             f"LV95/LN02-Referenz-VLRs ersetzt.")
+
+        dst_md = _pdal_info_metadata(pdal_exe, tmp_path)
+        problems = _validate_ln02_target(src_md, dst_md)
+
+        # Classification-Kontrolle: PF1/PF3 packen die Klasse als 5-Bit-Wert zusammen
+        # mit Flag-Bits in ein Byte, PF6 trennt beides - genau hier koennte die
+        # Punktformat-Umwandlung die Klasse still veraendern.
+        try:
+            dst_class = _pdal_classification_range(pdal_exe, tmp_path)
+            if dst_class != src_class:
+                problems.append(f"Classification veraendert: Quelle min/max="
+                                 f"{src_class[0]}/{src_class[1]}, Ziel min/max="
+                                 f"{dst_class[0]}/{dst_class[1]}")
+        except Exception as e:
+            problems.append(f"Classification-Pruefung fehlgeschlagen: {e}")
+
+        if problems:
+            return ("error", dst_name, "; ".join(problems), warnings)
+
+        os.replace(tmp_path, dst_path)
+        tmp_path = None
+        return ("written", dst_name, None, warnings)
+
+    except Exception as e:
+        return ("error", dst_name, str(e), warnings)
+    finally:
+        if tmp_path and os.path.isfile(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        for p in (pipeline_path, meta_path):
+            try:
+                p.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _process_las_ln02(cfg: dict) -> None:
+    from osgeo import gdal, ogr
+
+    jahr              = str(cfg["jahr"]).strip()
+    area              = str(cfg["area"]).strip()
+    create_raster     = bool(cfg.get("create_raster", False))
+    gsd_raster        = float(cfg["gsd"]) if create_raster else None
+    input_dir         = cfg["input_dir"]
+    output_dir_las    = cfg["output_dir_las"]
+    output_dir_raster = cfg.get("output_dir_raster")
+    out_format        = cfg.get("out_format", "laz")
+    clip_shape_path   = cfg.get("clip_shape_path")
+    staging_dir       = cfg["staging_dir"]
+    num_workers       = int(cfg.get("num_workers", 6))
+    keep_staging      = bool(cfg.get("keep_staging", False))
+    pdal_exe          = cfg["pdal_exe"]
+
+    def _log(msg: str) -> None:
+        print(msg, flush=True)
+
+    if not pdal_exe or not os.path.isfile(pdal_exe):
+        raise FileNotFoundError(
+            "pdal.exe wurde nicht gefunden. Bitte pdal (Teil von OSGeo4W/QGIS) "
+            "zum System-PATH hinzufuegen.")
+
+    if create_raster and (not clip_shape_path or not os.path.isfile(clip_shape_path)):
+        # Frueh pruefen: sonst faellt das erst nach dem kompletten Metadaten-Scan auf.
+        raise FileNotFoundError(
+            f"AOI/Footprint-Shape fuer die Raster-Maskierung nicht gefunden: {clip_shape_path}")
+
+    gdal.UseExceptions()
+    ogr.UseExceptions()
+
+    Path(output_dir_las).mkdir(parents=True, exist_ok=True)
+    if create_raster:
+        Path(output_dir_raster).mkdir(parents=True, exist_ok=True)
+    run_dir = Path(staging_dir) / f"{area}_{jahr}_LN02"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    _log(f"Staging-Ordner: {run_dir}")
+    _log(f"PDAL           : {pdal_exe}")
+
+    last_emit = {"t": 0.0, "p": -1.0}
+
+    def _progress(complete, message, unknown=None):
+        try:
+            if complete is None:
+                return 1
+            pct = float(complete)
+            now = time.time()
+            if (now - last_emit["t"]) >= 1.0 or (pct - last_emit["p"]) >= 0.005:
+                print(f"PROGRESS:{0.90 + pct * 0.10:.6f}", flush=True)
+                last_emit["t"] = now
+                last_emit["p"] = pct
+        except Exception:
+            pass
+        return 1
+
+    # --- Schritt 1: Input-Kacheln finden, Kachelursprung aus dem Namen parsen ---
+    tiles = sorted(glob.glob(os.path.join(input_dir, "*.las")) +
+                   glob.glob(os.path.join(input_dir, "*.laz")))
+    if not tiles:
+        raise FileNotFoundError(f"Keine .las/.laz Kacheln gefunden in: {input_dir}")
+    _log(f"\nGefundene Input-Kacheln: {len(tiles)}")
+
+    # Alle Namen VOR der eigentlichen Arbeit pruefen: ein nicht parsbarer Name ist ein
+    # harter Fehler (der Offset muesste sonst geraten werden) und soll nicht erst nach
+    # der halben Verarbeitung auffallen.
+    origins = {}
+    name_errors = []
+    for t in tiles:
+        try:
+            origins[t] = _parse_tile_origin(os.path.basename(t))
+        except ValueError as e:
+            name_errors.append(str(e))
+    if name_errors:
+        raise ValueError("Dateinamen nicht auswertbar:\n  - " + "\n  - ".join(name_errors))
+
+    seen = {}
+    duplicates = []
+    for t in tiles:
+        cell = origins[t]
+        if cell in seen:
+            duplicates.append(f"{cell[0]}_{cell[1]}: {os.path.basename(seen[cell])} / "
+                               f"{os.path.basename(t)}")
+        else:
+            seen[cell] = t
+    if duplicates:
+        raise ValueError("Mehrere Input-Kacheln zeigen auf dieselbe Gitterzelle - die "
+                          "Ausgabedateien wuerden sich gegenseitig ueberschreiben:\n  - "
+                          + "\n  - ".join(duplicates))
+
+    # --- Schritt 2: Bounding Boxes parallel einlesen (Gesamt-Extent + Raster-Zellen) ---
+    _log("Lese Metadaten (Bounding Box) aller Kacheln...")
+    tile_bboxes = []
+    meta_errors = []
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        futures = [executor.submit(_tile_bbox_worker, (pdal_exe, t)) for t in tiles]
+        for i, fut in enumerate(as_completed(futures), 1):
+            path, minx, miny, maxx, maxy, _genc, err = fut.result()
+            if err:
+                meta_errors.append((path, err))
+            else:
+                tile_bboxes.append((path, minx, miny, maxx, maxy))
+            if i == len(tiles) or i % max(1, len(tiles) // 100) == 0:
+                print(f"PROGRESS:{(i / len(tiles)) * 0.10:.6f}", flush=True)
+
+    for p, e in meta_errors:
+        _log(f"  WARNUNG: Metadaten von {Path(p).name} nicht lesbar: {e}")
+    if not tile_bboxes:
+        raise RuntimeError("Keine gueltigen Kachel-Metadaten gefunden.")
+
+    all_minx = min(b[1] for b in tile_bboxes)
+    all_miny = min(b[2] for b in tile_bboxes)
+    all_maxx = max(b[3] for b in tile_bboxes)
+    all_maxy = max(b[4] for b in tile_bboxes)
+    _log(f"  Gesamt-Extent Input: {all_minx:.1f}, {all_miny:.1f} - {all_maxx:.1f}, {all_maxy:.1f}")
+
+    _log(f"\nZielformat          : LAS 1.4 / PF{LN02_POINT_FORMAT}, global_encoding "
+         f"{LN02_GLOBAL_ENCODING}, scale {LN02_SCALE}, Offset = Kachelursprung")
+    _log(f"CRS-Tag             : LV95 + LN02 (EPSG:2056+5728), byte-exakte "
+         f"Referenz-VLRs 34735 + 2112")
+    _log(f"Punktwolken-Format  : .{out_format}")
+    _log(f"Raster erstellen    : "
+         f"{'AKTIV (GSD ' + format(gsd_raster, 'g') + ' m)' if create_raster else 'inaktiv'}")
+    _log(f"Benennung           : {jahr}_{area}_TIN_[thinnedout<NN>_]raw_<E>_<N>_LV95_LN02."
+         f"{out_format}")
+    _log(f"                      ([thinnedout<NN>_] und <E>_<N> aus dem Quell-Dateinamen)")
+
+    # --- Schritt 3: Zielnamen fuer DSM/Hillshade, nur falls aktiviert ---
+    raster_name = hillshade_name = None
+    raster_out_path = hillshade_out_path = None
+    cells_dir = None
+    snap_bounds = None
+    if create_raster:
+        gsd_label = f"{round(gsd_raster * 100)}cm"
+        raster_name = f"{jahr}_{area}_DSM_{gsd_label}_LV95_LN02.tif"
+        hillshade_name = f"{jahr}_{area}_hillshade_{gsd_label}_LV95_LN02.tif"
+        raster_out_path = str(Path(output_dir_raster) / raster_name)
+        hillshade_out_path = str(Path(output_dir_raster) / hillshade_name)
+        # Pixelursprung auf ein sauberes GSD-Vielfaches snappen (keine AOI-Kante im Grid)
+        snap_bounds = ((all_minx // gsd_raster) * gsd_raster,
+                       (all_miny // gsd_raster) * gsd_raster,
+                       math.ceil(all_maxx / gsd_raster) * gsd_raster,
+                       math.ceil(all_maxy / gsd_raster) * gsd_raster)
+        cells_dir = run_dir / "03_raster_cells"
+        cells_dir.mkdir(parents=True, exist_ok=True)
+        _log(f"Raster-Benennung    : {raster_name}  (+ .tfw)")
+        _log(f"Hillshade-Benennung : {hillshade_name}  (+ .tfw)")
+        _log(f"AOI/Footprint-Shape : {clip_shape_path}")
+
+    # --- Schritt 4: Jobs aufbauen (Punktwolken-Kachel + optional DSM-Zelle) ---
+    jobs = []
+    for t in tiles:
+        easting_km, northing_km = origins[t]
+        cell = f"{easting_km}_{northing_km}"
+        thin_token = _parse_thin_token(os.path.basename(t))
+        stem = f"{jahr}_{area}_TIN_{thin_token}raw_{cell}_LV95_LN02"
+        job = {"src": t, "cell": cell, "stem": stem,
+               "origin": (easting_km * 1000.0, northing_km * 1000.0)}
+        if create_raster:
+            # Nominalen 1km-Rahmen auf das globale, gesnappte GSD-Raster legen, damit
+            # sich die Zell-Raster luecken- und ueberlappungsfrei mosaikieren lassen.
+            ox, oy = snap_bounds[0], snap_bounds[1]
+            cminx, cminy = easting_km * 1000.0, northing_km * 1000.0
+            cmaxx, cmaxy = cminx + 1000.0, cminy + 1000.0
+            job["raster_bounds"] = (
+                ox + math.floor((cminx - ox) / gsd_raster + 1e-6) * gsd_raster,
+                oy + math.floor((cminy - oy) / gsd_raster + 1e-6) * gsd_raster,
+                ox + math.ceil((cmaxx - ox) / gsd_raster - 1e-6) * gsd_raster,
+                oy + math.ceil((cmaxy - oy) / gsd_raster - 1e-6) * gsd_raster,
+            )
+            # Beitragende Kacheln: alles, was den GEPUFFERTEN Zellausschnitt beruehrt.
+            # Ohne den Puffer waere das genau eine Kachel (der Input ist ja bereits
+            # exakt 1km-gekachelt) und die IDW-Nachbarschaft am Zellrand bliebe
+            # einseitig - sichtbare Naht an jeder Kilometergrenze.
+            rb = job["raster_bounds"]
+            buf = _raster_cell_buffer(gsd_raster, None)
+            job["tiles"] = [b[0] for b in tile_bboxes
+                            if not (b[3] <= rb[0] - buf or b[1] >= rb[2] + buf or
+                                    b[4] <= rb[1] - buf or b[2] >= rb[3] + buf)]
+            job["srs"] = LAS_LN02_SRS
+        jobs.append(job)
+
+    # --- Schritt 5: Kacheln (+ DSM-Zellen) parallel verarbeiten ---
+    # Beide Job-Arten laufen im selben Pool - so sind nie mehr pdal.exe-Prozesse
+    # gleichzeitig aktiv als unter "CPU-Kerne" eingestellt.
+    cell_workers = {"ln02": _ln02_tile_worker, "dsm": _raster_cell_worker}
+    cell_tasks = [("ln02", job["stem"],
+                   (job["src"], str(Path(output_dir_las) / f"{job['stem']}.{out_format}"),
+                    pdal_exe, str(run_dir), job["origin"][0], job["origin"][1]))
+                  for job in jobs]
+    if create_raster:
+        cell_tasks += [("dsm", job["cell"],
+                        (job, str(run_dir), str(cells_dir), pdal_exe, None, gsd_raster))
+                       for job in jobs]
+
+    total_tasks = len(cell_tasks)
+    _log(f"\nStarte parallele Verarbeitung: {total_tasks} Job(s) auf {num_workers} Prozess(en)"
+         + (f" ({len(jobs)} Punktwolken-Kachel(n) + {len(jobs)} DSM-Zelle(n))"
+            if create_raster else "")
+         + "\n")
+
+    def _job_label(kind: str, name: str) -> str:
+        return f"{name}.{out_format}" if kind == "ln02" else f"DSM-Zelle {name}"
+
+    written = copied = errors = 0
+    dsm_written = dsm_empty = 0
+    done = 0
+    failed = []
+    errors_by_kind = {"ln02": 0, "dsm": 0}
+    progress_start = 0.10
+    progress_span = (0.90 if create_raster else 1.0) - progress_start
+
+    def _handle(kind: str, name: str, res: tuple, prefix: str) -> bool:
+        """Ergebnis eines Jobs auswerten, Warnungen und Status loggen. Gibt True
+        zurueck, wenn der Job erledigt ist (auch 'leer'), False bei Fehler."""
+        nonlocal written, copied, dsm_written, dsm_empty
+        status = res[0]
+        for w in (res[3] if len(res) > 3 else []):
+            _log(f"      WARNUNG: {w}")
+        label = _job_label(kind, name)
+        if status == "written":
+            if kind == "ln02":
+                written += 1
+            else:
+                dsm_written += 1
+            _log(f"  {prefix} {label}")
+            return True
+        if status == "copied":
+            copied += 1
+            _log(f"  {prefix} {label}  (war bereits LAS 1.4/LN02 - unveraendert kopiert)")
+            return True
+        if status == "empty":
+            dsm_empty += 1
+            _log(f"  {prefix} {label} - uebersprungen (keine Punkte)")
+            return True
+        return False
+
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        futures = {executor.submit(cell_workers[kind], args): (kind, name, args)
+                   for kind, name, args in cell_tasks}
+        for future in as_completed(futures):
+            kind, name, args = futures[future]
+            res = future.result()
+            done += 1
+            prefix = f"[{done}/{total_tasks}]"
+            if not _handle(kind, name, res, prefix):
+                # Noch nicht als Fehler zaehlen: ein abgestuerzter pdal-Prozess ist
+                # meist Speicherdruck durch die parallelen Jobs - wird unten seriell
+                # wiederholt.
+                failed.append((kind, name, args))
+                _log(f"  {prefix} FEHLER bei {_job_label(kind, name)} "
+                     f"(Wiederholung folgt): {res[2]}")
+            print(f"PROGRESS:{progress_start + (done / total_tasks) * progress_span:.6f}",
+                  flush=True)
+
+    # --- Fehlgeschlagene Jobs seriell wiederholen (voller RAM pro pdal-Prozess) ---
+    if failed:
+        _log(f"\nWiederhole {len(failed)} fehlgeschlagene(n) Job(s) seriell "
+             f"(ein pdal-Prozess nach dem anderen)...")
+        for i, (kind, name, args) in enumerate(failed, 1):
+            res = cell_workers[kind](args)
+            if not _handle(kind, name, res, f"[Retry {i}/{len(failed)}]"):
+                errors += 1
+                errors_by_kind[kind] += 1
+                _log(f"  [Retry {i}/{len(failed)}] FEHLER bleibt bei "
+                     f"{_job_label(kind, name)}: {res[2]}")
+
+    # --- Schritt 6: Zell-Raster zum Gesamt-DSM mosaikieren, dann Hillshade ---
+    if create_raster:
+        if errors_by_kind["dsm"]:
+            _log(f"\nWARNUNG: {errors_by_kind['dsm']} DSM-Zelle(n) fehlgeschlagen - das "
+                 f"Gesamt-Raster erhaelt dort Loecher (NoData). Siehe Fehler oben.")
+        cell_rasters = sorted(str(p) for p in cells_dir.glob("dsm_*.tif"))
+        if not cell_rasters:
+            raise RuntimeError("Keine DSM-Zelle wurde erzeugt - Gesamt-Raster nicht moeglich.")
+        _mosaic_las_raster(cell_rasters, run_dir, raster_out_path, hillshade_out_path,
+                            gsd_raster, clip_shape_path, snap_bounds, str(num_workers),
+                            _log, _progress)
+
+    if not keep_staging:
+        _log(f"\nRaeume Staging-Ordner auf: {run_dir}")
+        try:
+            shutil.rmtree(run_dir, ignore_errors=True)
+        except Exception:
+            pass
+    else:
+        _log(f"\nStaging-Dateien bleiben erhalten: {run_dir}")
+
+    raster_line = (f"Raster: {raster_name}, Hillshade: {hillshade_name}\n"
+                   f"DSM-Zellen: {dsm_written} gerastert, {dsm_empty} leer (0 Punkte).\n"
+                   if raster_name else "Raster: nicht erstellt (Option deaktiviert)\n")
+    _log(f"\nFertig. {raster_line}"
+         f".{out_format}: {written} Kachel(n) konvertiert, {copied} unveraendert kopiert "
+         f"(waren bereits LAS 1.4/LN02).\n"
+         f"Fehler gesamt: {errors}.")
+    if (written + copied) == 0:
+        raise RuntimeError("Keine Punktwolken-Kachel wurde geschrieben.")
+    if errors:
+        raise RuntimeError(f"{errors} Job(s) konnten auch beim seriellen Wiederholen nicht "
+                            f"verarbeitet werden - siehe Log.")
+
+
 def main() -> None:
     if len(sys.argv) < 2:
         print("[FEHLER] Kein Konfigurationspfad uebergeben.", flush=True)
@@ -1145,6 +2119,8 @@ def main() -> None:
             _process(cfg)
         elif action == "process_las":
             _process_las(cfg)
+        elif action == "process_las_ln02":
+            _process_las_ln02(cfg)
         else:
             print(f"[FEHLER] Unbekannte Aktion: '{action}'", flush=True)
             sys.exit(1)
