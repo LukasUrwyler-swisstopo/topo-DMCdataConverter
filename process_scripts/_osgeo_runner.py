@@ -28,8 +28,13 @@ import math
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
-# NoData-Sentinel fuer Float32-DSM-Raster, analog GDWH-Konvention bei SB_DSM (Raster, nicht Hillshade)
-LAS_RASTER_NODATA = -3.4028235e+38
+# NoData-Sentinel fuer Float32-DSM-Raster, analog GDWH-Konvention bei SB_DSM (Raster, nicht Hillshade).
+# WICHTIG: exakt -FLT_MAX als double angeben. Die uebliche 7-stellige Anzeigeform
+# -3.4028235e+38 (so zeigen GDAL/QGIS den Wert an) ist als double betragsmaessig
+# GROESSER als -FLT_MAX und damit in Float32 nicht darstellbar; PDAL prueft das
+# strikt und bricht writers.gdal ab ("Invalid nodata value ... for output
+# data_type 'float'"). Der Wert unten rundet in Float32 auf denselben Sentinel.
+LAS_RASTER_NODATA = -3.4028234663852886e+38
 
 # Erwartetes SRS der Input-.laz-Kacheln (LV95 + LHN95). Wird den Readern explizit
 # aufgezwungen (override_srs), damit eine Kachel mit fehlendem/falschem SRS-Tag
@@ -526,6 +531,18 @@ def _run_pdal_pipeline(pdal_exe: str, pipeline_path: Path) -> None:
                             + (f": {msg}" if msg else ""))
 
 
+def _discard_partial(path: str) -> None:
+    """Loescht eine angefangene Ausgabedatei nach einem Fehler.
+
+    Ein abgestuerzter pdal.exe (z.B. Speichermangel) hinterlaesst sonst eine
+    abgeschnittene Datei mit unbrauchbarem Header, die im Output-Ordner nicht von
+    einer vollstaendigen Kachel zu unterscheiden ist."""
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
 def _las_cell_worker(args) -> tuple:
     """Wird in einem eigenen Prozess ausgefuehrt - mergt die Input-Kacheln einer
     1km-Grid-Zelle, croppt/thinnt optional, schreibt eine Punktwolken-Kachel
@@ -569,14 +586,12 @@ def _las_cell_worker(args) -> tuple:
 
         meta = _pdal_info_metadata(pdal_exe, laz_out)
         if int(meta.get("count", 0)) == 0:
-            try:
-                os.remove(laz_out)
-            except OSError:
-                pass
+            _discard_partial(laz_out)
             return ("empty", stem, None)
 
         return ("written", stem, None)
     except Exception as e:
+        _discard_partial(laz_out)
         return ("error", stem, str(e))
     finally:
         try:
@@ -650,6 +665,7 @@ def _raster_cell_worker(args) -> tuple:
             return ("empty", cell, None)
         return ("written", cell, None)
     except Exception as e:
+        _discard_partial(tif_out)
         return ("error", cell, str(e))
     finally:
         try:
