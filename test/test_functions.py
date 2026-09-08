@@ -272,6 +272,49 @@ def test_ln02_validate_target():
     assert any("34735" in p for p in runner_mod._validate_ln02_target(src, md))
 
 
+def test_ln02_validate_bbox_uses_measured_source_extent():
+    """Referenz fuer den BBox-Vergleich sind die gemessenen Quellpunkte, nicht der
+    Quell-Header: eine nicht nachgefuehrte Header-BBox (kommt bei GeoSuite-reframten
+    Kacheln vor) darf die Kachel nicht aus der Lieferung werfen, sondern nur warnen."""
+    runner_mod = _runner()
+    src = _ln02_target_metadata(minor_version=2, dataformat_id=3, global_encoding=1,
+                                 maxz=1100.0101)          # Header 1 cm zu hoch
+    measured = {"minx": 2713000.0, "maxx": 2713999.99,
+                "miny": 1206000.0, "maxy": 1206999.99,
+                "minz": 1000.0, "maxz": 1100.0}           # tatsaechliche Punkte
+
+    warnings = []
+    assert runner_mod._validate_ln02_target(
+        src, _ln02_target_metadata(), measured, warnings) == []
+    assert any("Quell-Header-BBox" in w and "maxz" in w for w in warnings)
+
+    # Ohne gemessene Werte bleibt der Header die Referenz - und schlaegt an
+    assert any("maxz" in p for p in runner_mod._validate_ln02_target(
+        src, _ln02_target_metadata()))
+
+    # Eine echte Abweichung Ziel vs. gemessene Quelle bleibt ein harter Fehler
+    problems = runner_mod._validate_ln02_target(
+        src, _ln02_target_metadata(maxz=1099.0), measured, [])
+    assert any("maxz" in p and "gemessene Quellpunkte" in p for p in problems)
+
+
+def test_ln02_stats_bbox_from_pipeline_metadata():
+    """Die gemessene BBox kommt aus der ohnehin laufenden 'filters.stats'-Stage;
+    fehlt eine der sechs Groessen, gibt es keine halbe Referenz."""
+    runner_mod = _runner()
+    meta = {"stages": {"filters.stats": {"statistic": [
+        {"name": "X", "minimum": 2713000.0, "maximum": 2713999.99},
+        {"name": "Y", "minimum": 1206000.0, "maximum": 1206999.99},
+        {"name": "Z", "minimum": 1000.0, "maximum": 1100.0}]}}}
+    assert runner_mod._stats_bbox_from_pipeline_metadata(meta) == {
+        "minx": 2713000.0, "maxx": 2713999.99, "miny": 1206000.0,
+        "maxy": 1206999.99, "minz": 1000.0, "maxz": 1100.0}
+
+    del meta["stages"]["filters.stats"]["statistic"][2]      # Z fehlt
+    assert runner_mod._stats_bbox_from_pipeline_metadata(meta) is None
+    assert runner_mod._stats_bbox_from_pipeline_metadata(None) is None
+
+
 def test_ln02_tile_worker_writer_options(tmp_path, monkeypatch):
     """Die Schreib-Pipeline muss exakt die GDWH-Zielwerte setzen: LAS 1.4/PF6,
     scale 0.01, Offset = Kachelursprung, global_encoding 17 - und bei .laz
@@ -441,8 +484,13 @@ def test_raster_nodata_sentinels():
     assert "srcNodata=LAS_CELL_NODATA" in src
     assert "dstNodata=LAS_RASTER_NODATA" in src
     assert "VRTNodata=LAS_CELL_NODATA" in src
-    # Der Hillshade bleibt bei NoData 255 (Byte)
-    assert "dstNodata=255" in src
+    # Der Hillshade bleibt bei NoData 255 (Byte) - Werte werden vorher aufbereitet
+    assert (runner_mod.LAS_HILLSHADE_NODATA,
+            runner_mod.LAS_HILLSHADE_VALID_MAX) == (255, 254)
+    assert "dstNodata=LAS_HILLSHADE_NODATA" in src
+    assert "_prepare_hillshade_values" in src
+    # Reihenfolge ist entscheidend: erst aufbereiten, dann clippen
+    assert src.index("_prepare_hillshade_values(") < src.index("hs_warp_options")
 
     # writers.gdal darf den GDWH-Sentinel nirgends direkt gesetzt bekommen
     assert "LAS_RASTER_NODATA" not in inspect.getsource(runner_mod._raster_cell_worker)
@@ -450,6 +498,102 @@ def test_raster_nodata_sentinels():
     # Der geschriebene Header wird zurueckgelesen und geprueft (Kontrolle statt Annahme)
     assert "GetNoDataValue()" in src
     assert "nicht auslieferbar" in src
+
+
+def test_dsm_small_holes_filled_large_holes_kept():
+    """Kleine DSM-Loecher werden interpoliert, grosse bleiben echtes NoData - und
+    gefuellt wird VOR dem AOI-Clip. Danach ist ausserhalb des AOI ebenfalls NoData;
+    die Interpolation kennt die AOI-Grenze nicht und liesse sich nicht mehr aufs
+    Innere beschraenken."""
+    import inspect
+    runner_mod = _runner()
+
+    assert runner_mod.LAS_FILL_NODATA_HOLES is True
+    # Schwelle als FLAECHE definiert, damit sie von der GSD unabhaengig ist
+    assert runner_mod.LAS_FILL_MAX_HOLE_AREA_M2 == 900.0
+    assert runner_mod.LAS_FILL_HOLE_CONNECTEDNESS == 8
+
+    src = inspect.getsource(runner_mod._mosaic_las_raster)
+    assert "warp_source, hillshade_source = _fill_raster_nodata(" in src
+    assert src.index("_fill_raster_nodata(") < src.index("cutlineDSName=clip_shape_path")
+    # Geclippt wird das gefuellte Raster, nicht mehr das rohe VRT
+    assert "gdal.Warp(output_path, warp_source" in src
+
+    fill = inspect.getsource(runner_mod._fill_raster_nodata)
+    # Zwei Varianten: DSM mit ehrlichen Luecken, Hillshade-Quelle vollstaendig gefuellt
+    assert "return (str(filled_path), str(hs_src_path))" in fill
+    # Die vollgefuellte Kopie muss VOR dem Ruecksetzen der grossen Loecher entstehen
+    assert fill.index("CreateCopy(") < fill.index("arr[big] = LAS_CELL_NODATA")
+    # Flaechenschwelle -> Pixelschwelle ueber die GSD, +1 damit "bis zu" inklusiv ist
+    assert "LAS_FILL_MAX_HOLE_AREA_M2 / (gsd * gsd)" in fill
+    assert "max_hole_px + 1" in fill
+    # Grosse Loecher werden per SieveFilter identifiziert und danach zurueckgesetzt
+    assert "gdal.SieveFilter(" in fill
+    assert "arr[big] = LAS_CELL_NODATA" in fill
+    # Erst fuellen, dann die grossen Loecher zuruecksetzen
+    assert fill.index("gdal.FillNodata(") < fill.index("arr[big] = LAS_CELL_NODATA")
+    # Das UND mit der Originalmaske schuetzt gemessene Inseln in grossen Loechern
+    assert "(mask_band.ReadAsArray(0, y0, xs, rows) != 0)" in fill
+    # Keine Glaettung -> kein Filter kann gemessene Werte antasten
+    assert runner_mod.LAS_FILL_SMOOTHING_ITERATIONS == 0
+    # Die GDAL-Hilfsraster in Originalgroesse gehoeren ins Staging
+    assert 'SetConfigOption("CPL_TMPDIR", str(run_dir))' in fill
+    # Kontrolle statt Annahme
+    assert "remaining != kept" in fill and "WARNUNG" in fill
+
+
+def test_hillshade_comes_from_fully_filled_mosaic():
+    """Der Hillshade wird aus dem vollstaendig gefuellten, ungeclippten Mosaik
+    gerechnet - nicht aus dem geclippten DSM. Sonst erschienen die grossen DSM-Loecher
+    als weisse Flaechen und am AOI-Rand entstuende ein NoData-Saum. Beide Produkte
+    muessen trotzdem exakt deckungsgleich sein."""
+    import inspect
+    runner_mod = _runner()
+    src = inspect.getsource(runner_mod._mosaic_las_raster)
+
+    # Quelle des Hillshade ist die gefuellte Variante, nicht output_path
+    assert 'gdal.DEMProcessing(\n        str(raw_hillshade_path), hillshade_source,' in src
+    assert 'str(raw_hillshade_path), output_path' not in src
+
+    # Weil die Quelle jetzt das Mosaik ist, muss das Zielgitter erzwungen werden
+    hs_opts = src[src.index("hs_warp_options = gdal.WarpOptions("):]
+    assert "outputBounds=(snap_minx, snap_miny, snap_maxx, snap_maxy)" in hs_opts
+    assert "xRes=gsd, yRes=gsd" in hs_opts
+
+    # Kontrolle statt Annahme: Deckungsgleichheit wird geprueft, nicht angenommen
+    assert "nicht auf demselben Gitter" in src
+
+
+def test_prepare_hillshade_values(tmp_path):
+    """Im Hillshade darf innerhalb des AOI kein 255 uebrig bleiben: voll beleuchtete
+    Pixel (255) UND die NoData-Pixel ueber den DSM-Loechern (gdaldem schreibt dort 0)
+    werden beide auf 254 gezogen. Alle uebrigen Werte bleiben unangetastet."""
+    import pytest
+    gdal = pytest.importorskip("osgeo.gdal", reason="GDAL nur unter OSGeo4W verfuegbar")
+    np = pytest.importorskip("numpy")
+    runner_mod = _runner()
+
+    path = str(tmp_path / "hs.tif")
+    ds = gdal.GetDriverByName("GTiff").Create(path, 4, 3, 1, gdal.GDT_Byte)
+    band = ds.GetRasterBand(1)
+    band.SetNoDataValue(0)                      # so schreibt es gdaldem hillshade
+    band.WriteArray(np.array([[0, 1, 254, 255],
+                              [255, 255, 128, 0],
+                              [7, 254, 255, 200]], dtype="uint8"))
+    ds = None
+
+    assert runner_mod._prepare_hillshade_values(path) == (5, 2)   # 5x255, 2x NoData
+
+    ds = gdal.Open(path)
+    out = ds.GetRasterBand(1).ReadAsArray()
+    ds = None
+    assert not (out == 255).any()
+    assert not (out == 0).any()
+    assert out.tolist() == [[254, 1, 254, 254], [254, 254, 128, 254],
+                            [7, 254, 254, 200]]
+
+    # Idempotent: ein zweiter Lauf findet nichts mehr
+    assert runner_mod._prepare_hillshade_values(path) == (0, 0)
 
 
 def test_las_tile_writer_is_geosuite_readable(tmp_path):
@@ -541,7 +685,7 @@ def test_ln02_gps_time_notice_is_measured_not_assumed():
 
     src = inspect.getsource(runner_mod._ln02_tile_worker)
     # GpsTime wird im ohnehin noetigen Lesedurchlauf mitgemessen (kein zweiter Scan)
-    assert '"dimensions": "Classification,GpsTime"' in src
+    assert '"dimensions": "Classification,GpsTime,X,Y,Z"' in src
     assert 'gps_min == 0 and gps_max == 0' in src
     # Die WERTE werden nie angefasst - es gibt keine GpsTime-Umrechnung
     assert "filters.assign" not in src

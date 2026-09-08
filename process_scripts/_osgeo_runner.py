@@ -39,6 +39,27 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 # GDAL (gdal.Warp dstNodata, siehe _mosaic_las_raster) - GDAL nimmt ihn anstandslos.
 LAS_RASTER_NODATA = -3.4028234663852886e+38
 
+# DSM: KLEINE NoData-Loecher werden interpoliert, GROSSE bleiben echtes NoData.
+# Fachliche Trennung: Loecher bis LAS_FILL_MAX_HOLE_AREA_M2 sind Rauschen der
+# Autokorrelation, dort liegt die Interpolation im Genauigkeitsbudget. Groessere
+# Fehlstellen (Felswaende ohne Korrelation) bleiben als NoData stehen, damit im
+# Endprodukt erkennbar bleibt, wo nicht gemessen werden konnte.
+LAS_FILL_NODATA_HOLES       = True
+LAS_FILL_MAX_HOLE_AREA_M2   = 900.0  # Flaechenschwelle, GSD-unabhaengig definiert
+LAS_FILL_HOLE_CONNECTEDNESS = 8      # 8 = diagonal beruehrende Pixel sind EIN Loch
+# Glaettungsdurchgaenge nach der Interpolation. 0 = keine: so ist ausgeschlossen, dass
+# ein Glaettungsfilter GEMESSENE Werte antastet. Bei sichtbaren Scanline-Artefakten in
+# gefuellten Flaechen auf 2-3 erhoehen (GDAL glaettet dabei laut Doku nur die
+# interpolierten Pixel).
+LAS_FILL_SMOOTHING_ITERATIONS = 0
+
+# Hillshade (Byte): 255 bedeutet ausschliesslich "ausserhalb des AOI". Innerhalb des
+# AOI traegt kein einziges Pixel 255 - weder ein voll beleuchtetes (gdaldem liefert
+# 1..255) noch eines ueber einem NoData-Loch des DSM. Beide werden auf 254 gezogen,
+# siehe _prepare_hillshade_values.
+LAS_HILLSHADE_NODATA    = 255
+LAS_HILLSHADE_VALID_MAX = 254
+
 # NoData-Sentinel der ZWISCHEN-Zellraster aus writers.gdal (Staging-Ordner, Wegwerf-
 # produkte). Bewusst NICHT -FLT_MAX: PDALs writers.gdal prueft den nodata-Wert gegen
 # den Float32-Wertebereich und lehnt die Bereichsgrenze selbst ab -
@@ -587,7 +608,7 @@ def _process(cfg: dict) -> None:
 #      Projekten den Arbeitsspeicher sprengt (pdal.exe-Absturz, Code 0xC0000409)
 #   4) Gesamt-Raster: Zell-Raster als VRT mosaikieren, per AOI-Shape maskieren
 #      (gdal.Warp Cutline, NoData ausserhalb), daraus den Hillshade rechnen und
-#      ebenfalls maskieren (NoData=255)
+#      ebenfalls maskieren (NoData=255 nur ausserhalb des AOI)
 #
 # Hoehensystem: Input-Kacheln sind LHN95, Output bleibt LHN95 (kein Reframe
 # nach LN02 - swisstopo selbst beschreibt diese Transformation als Naeherung
@@ -838,12 +859,231 @@ def _raster_cell_worker(args) -> tuple:
             pass
 
 
+def _fill_raster_nodata(vrt_path: Path, run_dir: Path, gsd: float, num_threads: str,
+                         log) -> tuple:
+    """Interpoliert die NoData-Loecher des DSM-Mosaiks und liefert ZWEI Varianten:
+
+      (dsm_pfad, hillshade_pfad)
+
+    - dsm_pfad: nur die KLEINEN Loecher sind interpoliert, die grossen stehen wieder
+      als echtes NoData drin. Das ist das auszuliefernde Hoehenmodell - dort bleibt
+      erkennbar, wo die Autokorrelation nichts messen konnte.
+    - hillshade_pfad: ALLE erreichbaren Loecher sind gefuellt. Der Hillshade ist ein
+      reines Visualisierungsprodukt; aus dieser Variante gerechnet bekommen die
+      Felswaende eine plausible Schattierung statt einer weissen Flaeche, ohne dass
+      das ausgelieferte DSM seine ehrlichen Luecken verliert.
+
+    Ablauf:
+      1. VRT materialisieren (gdal.FillNodata braucht ein beschreibbares Band)
+      2. Maske aller NoData-Loecher sichern - VOR dem Fuellen
+      3. gdal.SieveFilter entfernt aus dieser Maske alle Loecher unterhalb der
+         Flaechenschwelle; uebrig bleiben die GROSSEN Loecher
+      4. gdal.FillNodata fuellt zunaechst alles (IDW aus den naechstgelegenen
+         gueltigen Nachbarn je Quadrant)
+      5. dieser Stand wird als Hillshade-Quelle weggeschrieben
+      6. im DSM werden die grossen Loecher wieder auf NoData gesetzt
+
+    Schritt 4 vor 6 und nicht umgekehrt: gdal.FillNodata kennt keine Moeglichkeit,
+    Pixel gleichzeitig ungefuellt zu lassen UND von der Interpolation auszunehmen -
+    die grossen Loecher wuerden sonst mit ihrem NoData-Wert in die Nachbarschaft der
+    kleinen einfliessen.
+
+    Gefuellt wird VOR dem AOI-Clip: danach ist ausserhalb des AOI ebenfalls NoData und
+    die Interpolation liesse sich nicht mehr aufs Innere beschraenken. Die Flaeche
+    ausserhalb der Daten ist ein einziges riesiges Loch, liegt damit weit ueber der
+    Schwelle und bleibt unangetastet."""
+    from osgeo import gdal
+    import numpy as np
+
+    filled_path = run_dir / "04_raster_dsm.tif"          # kleine Loecher gefuellt
+    hs_src_path = run_dir / "04_raster_filled_all.tif"   # alle Loecher gefuellt
+    mask_path   = run_dir / "04_holes_mask.tif"
+    sieve_path  = run_dir / "04_holes_large.tif"
+
+    max_hole_px = max(1, int(round(LAS_FILL_MAX_HOLE_AREA_M2 / (gsd * gsd))))
+    log("")
+    log(f"Fuelle kleine NoData-Loecher im Mosaik (vor dem AOI-Clip): {filled_path}")
+    log(f"  Schwelle: {LAS_FILL_MAX_HOLE_AREA_M2:g} m2 = {max_hole_px} Pixel bei "
+        f"{gsd:g} m GSD - groessere Loecher bleiben echtes NoData")
+
+    base_co = ["TILED=YES", "BLOCKXSIZE=512", "BLOCKYSIZE=512",
+               "COMPRESS=LZW", "BIGTIFF=YES", f"NUM_THREADS={num_threads}"]
+
+    trans_ds = gdal.Translate(
+        str(filled_path), str(vrt_path),
+        options=gdal.TranslateOptions(format="GTiff", noData=LAS_CELL_NODATA,
+                                       creationOptions=base_co + ["PREDICTOR=3"]),
+    )
+    if trans_ds is None:
+        raise RuntimeError("gdal.Translate hat None zurueckgegeben - Mosaik nicht "
+                            "materialisierbar, NoData-Fuellung nicht moeglich.")
+    trans_ds.FlushCache()
+    trans_ds = None
+
+    ds = mask_ds = sieve_ds = None
+    try:
+        ds = gdal.Open(str(filled_path), gdal.GA_Update)
+        if ds is None:
+            raise RuntimeError(f"Mosaik nicht zum Schreiben zu oeffnen: {filled_path}")
+        band = ds.GetRasterBand(1)
+        xs, ys = band.XSize, band.YSize
+        rows_per_chunk = max(1, (64 * 1024 * 1024) // max(1, xs * 4))
+
+        def _byte_raster(path):
+            out = gdal.GetDriverByName("GTiff").Create(
+                str(path), xs, ys, 1, gdal.GDT_Byte, options=base_co + ["PREDICTOR=2"])
+            if out is None:
+                raise RuntimeError(f"Hilfsraster nicht anzulegen: {path}")
+            out.SetGeoTransform(ds.GetGeoTransform())
+            out.SetProjection(ds.GetProjection())
+            return out
+
+        # --- Loch-Maske sichern, solange die Loecher noch da sind ---
+        mask_ds = _byte_raster(mask_path)
+        mask_band = mask_ds.GetRasterBand(1)
+        holes_total = 0
+        for y0 in range(0, ys, rows_per_chunk):
+            rows = min(rows_per_chunk, ys - y0)
+            hole = (band.ReadAsArray(0, y0, xs, rows) == LAS_CELL_NODATA)
+            holes_total += int(np.count_nonzero(hole))
+            mask_band.WriteArray(hole.astype("uint8"), 0, y0)
+        mask_band.FlushCache()
+
+        # --- Kleine Loecher aus der Maske sieben -> uebrig bleiben die grossen ---
+        # SieveFilter entfernt Polygone KLEINER als die Schwelle. Deshalb +1, damit ein
+        # Loch von exakt max_hole_px noch gefuellt wird ("bis zu" inklusive).
+        sieve_ds = _byte_raster(sieve_path)
+        sieve_band = sieve_ds.GetRasterBand(1)
+        gdal.SieveFilter(mask_band, None, sieve_band, max_hole_px + 1,
+                          LAS_FILL_HOLE_CONNECTEDNESS)
+        sieve_band.FlushCache()
+
+        # --- Fuellen ---
+        # Suchdistanz max_hole_px ist eine harte obere Schranke: ein Loch von A Pixeln
+        # kann kein Pixel enthalten, das weiter als A Pixel von gueltigen Daten entfernt
+        # liegt. Alle zu fuellenden Loecher sind damit sicher erreicht, ohne dass die
+        # Interpolation ueber die riesige Flaeche ausserhalb der Daten laeuft.
+        old_tmpdir = gdal.GetConfigOption("CPL_TMPDIR")
+        gdal.SetConfigOption("CPL_TMPDIR", str(run_dir))
+        try:
+            gdal.FillNodata(band, None, float(max_hole_px),
+                             LAS_FILL_SMOOTHING_ITERATIONS)
+        finally:
+            gdal.SetConfigOption("CPL_TMPDIR", old_tmpdir)
+        band.FlushCache()
+
+        # --- Diesen Stand (alles gefuellt) als Hillshade-Quelle sichern ---
+        # Muss VOR dem Ruecksetzen passieren - danach ist er nicht mehr rekonstruierbar,
+        # ohne die ganze Interpolation zu wiederholen.
+        ds.FlushCache()
+        hs_copy = gdal.GetDriverByName("GTiff").CreateCopy(
+            str(hs_src_path), ds, options=base_co + ["PREDICTOR=3"])
+        if hs_copy is None:
+            raise RuntimeError(f"Hillshade-Quelle nicht zu schreiben: {hs_src_path}")
+        hs_copy.FlushCache()
+        hs_copy = None
+
+        # --- Grosse Loecher wieder auf NoData (nur im DSM) ---
+        # Das UND mit der Originalmaske sichert dagegen ab, dass SieveFilter kleine
+        # GUELTIGE Inseln inmitten eines grossen Lochs mitverschluckt: zurueckgesetzt
+        # wird nur, was vorher schon NoData war.
+        kept = 0
+        for y0 in range(0, ys, rows_per_chunk):
+            rows = min(rows_per_chunk, ys - y0)
+            big = ((sieve_band.ReadAsArray(0, y0, xs, rows) != 0) &
+                   (mask_band.ReadAsArray(0, y0, xs, rows) != 0))
+            n = int(np.count_nonzero(big))
+            if n:
+                arr = band.ReadAsArray(0, y0, xs, rows)
+                arr[big] = LAS_CELL_NODATA
+                band.WriteArray(arr, 0, y0)
+                kept += n
+        band.FlushCache()
+
+        # --- Kontrolle statt Annahme: uebrig sein duerfen nur die grossen Loecher ---
+        remaining = 0
+        for y0 in range(0, ys, rows_per_chunk):
+            rows = min(rows_per_chunk, ys - y0)
+            arr = band.ReadAsArray(0, y0, xs, rows)
+            remaining += int(np.count_nonzero(arr == LAS_CELL_NODATA))
+    finally:
+        ds = mask_ds = sieve_ds = None
+
+    log(f"  Interpoliert (Loecher bis {LAS_FILL_MAX_HOLE_AREA_M2:g} m2): "
+        f"{holes_total - kept} Pixel")
+    log(f"  Als NoData belassen (groessere Loecher, inkl. Flaeche ausserhalb der "
+        f"Daten): {kept} Pixel")
+    if remaining != kept:
+        log(f"  WARNUNG: {remaining - kept} Pixel blieben NoData, obwohl ihr Loch unter "
+            f"der Schwelle liegt - kein gueltiger Nachbar in Reichweite.")
+    else:
+        log("  Kontrolle OK: es ist genau das NoData uebrig, das stehen bleiben soll.")
+    log(f"  Hillshade-Quelle (alle Loecher gefuellt): {hs_src_path}")
+    return (str(filled_path), str(hs_src_path))
+
+
+def _prepare_hillshade_values(path: str) -> tuple:
+    """Bereitet den rohen Hillshade so vor, dass 255 im Endprodukt ausschliesslich
+    "ausserhalb des AOI" bedeutet (in-place). Gibt (gedeckelt, gefuellt) zurueck.
+
+    Zwei Quellen fuer ein 255 innerhalb des AOI, beide werden auf 254 gezogen:
+      - gdaldem liefert 1..255; ein voll beleuchtetes Pixel erreicht legitim 255 und
+        waere nach dem Clip nicht mehr von der NoData-Maske zu unterscheiden.
+      - Wo die Quelle NoData traegt, schreibt gdaldem seinen eigenen NoData-Wert (0).
+        Weil der Hillshade aus dem VOLLSTAENDIG gefuellten Mosaik gerechnet wird,
+        betrifft das nur noch Flaechen ausserhalb der Daten - die setzt der folgende
+        Warp ohnehin wieder auf 255. Das Umsetzen ist dort wirkungslos, nicht falsch,
+        und bleibt als Netz fuer den Fall, dass doch eine Fehlstelle durchkommt.
+
+    Der NoData-Eintrag des Bandes bleibt stehen: nach dem Umsetzen traegt ihn kein
+    Pixel mehr, der Warp findet also nichts zu maskieren und setzt 255 nur noch
+    ausserhalb der Cutline. Ein Grauwert von 255 weniger ist visuell nicht wahrnehmbar.
+
+    Laeuft blockweise (Zeilenpakete von rund 64 MB), damit auch grosse Mosaike nicht
+    komplett in den Arbeitsspeicher muessen."""
+    from osgeo import gdal
+    import numpy as np
+
+    ds = gdal.Open(path, gdal.GA_Update)
+    if ds is None:
+        raise RuntimeError(f"Hillshade nicht zum Schreiben zu oeffnen: {path}")
+    try:
+        band = ds.GetRasterBand(1)
+        nd = band.GetNoDataValue()
+        nd = None if nd is None else int(nd)
+        rows_per_chunk = max(1, (64 * 1024 * 1024) // max(1, band.XSize))
+        clamped = filled = 0
+        for y0 in range(0, band.YSize, rows_per_chunk):
+            rows = min(rows_per_chunk, band.YSize - y0)
+            arr = band.ReadAsArray(0, y0, band.XSize, rows)
+            hit_max = (arr == LAS_HILLSHADE_NODATA)
+            hit_nd = ((arr == nd) if nd is not None and nd != LAS_HILLSHADE_NODATA
+                      else np.zeros_like(hit_max))
+            n_max, n_nd = int(np.count_nonzero(hit_max)), int(np.count_nonzero(hit_nd))
+            if n_max or n_nd:
+                arr[hit_max | hit_nd] = LAS_HILLSHADE_VALID_MAX
+                band.WriteArray(arr, 0, y0)
+                clamped += n_max
+                filled += n_nd
+        band.FlushCache()
+    finally:
+        ds = None
+    return (clamped, filled)
+
+
 def _mosaic_las_raster(cell_rasters, run_dir: Path, output_path: str,
                         hillshade_output_path: str, gsd: float, clip_shape_path: str,
                         snap_bounds: tuple, num_threads: str, log, progress) -> None:
-    """Setzt die Zell-Raster zum Gesamt-DSM zusammen (VRT-Mosaik), maskiert per
-    AOI-Shape (gdal.Warp Cutline, NoData ausserhalb) und rechnet daraus den
-    Hillshade (ebenfalls per AOI-Shape maskiert, NoData=255)."""
+    """Setzt die Zell-Raster zum Gesamt-DSM zusammen (VRT-Mosaik), interpoliert kleine
+    NoData-Loecher (LAS_FILL_NODATA_HOLES, grosse bleiben NoData), maskiert per
+    AOI-Shape (gdal.Warp Cutline, NoData ausserhalb) und rechnet den Hillshade.
+
+    Der Hillshade kommt NICHT aus dem geclippten DSM, sondern aus dem vollstaendig
+    gefuellten, ungeclippten Mosaik: so bekommen die grossen DSM-Loecher eine
+    plausible Schattierung statt einer weissen Flaeche, und am AOI-Rand entsteht kein
+    NoData-Saum (gdaldem sieht dort sonst die Cutline-Kante als Datenrand). Innerhalb
+    des AOI ist der Hillshade damit lochfrei - 255 steht dort ausschliesslich fuer
+    "ausserhalb des AOI". Beide Raster liegen auf demselben Gitter."""
     from osgeo import gdal
     gdal.UseExceptions()
 
@@ -877,6 +1117,11 @@ def _mosaic_las_raster(cell_rasters, run_dir: Path, output_path: str,
     vrt_ds.FlushCache()
     vrt_ds = None
 
+    warp_source = hillshade_source = str(vrt_path)
+    if LAS_FILL_NODATA_HOLES:
+        warp_source, hillshade_source = _fill_raster_nodata(
+            vrt_path, run_dir, gsd, num_threads, log)
+
     log(f"\nClippe Raster auf AOI (Cutline): {clip_shape_path}")
     log(f"  Ausserhalb -> NoData = {LAS_RASTER_NODATA:g}")
     log(f"  Zellraster-NoData {LAS_CELL_NODATA:g} (PDAL) -> {LAS_RASTER_NODATA:g} (GDWH-Sentinel)")
@@ -909,7 +1154,7 @@ def _mosaic_las_raster(cell_rasters, run_dir: Path, output_path: str,
         ],
         callback=progress,
     )
-    out_ds = gdal.Warp(output_path, str(vrt_path), options=warp_options)
+    out_ds = gdal.Warp(output_path, warp_source, options=warp_options)
     if out_ds is None:
         raise RuntimeError("gdal.Warp hat None zurueckgegeben - Raster-Clip fehlgeschlagen.")
     out_ds.FlushCache()
@@ -931,11 +1176,12 @@ def _mosaic_las_raster(cell_rasters, run_dir: Path, output_path: str,
             f"(GDWH-Konvention SB_DSM) - Raster nicht auslieferbar.")
     log(f"  NoData-Kontrolle OK: Header traegt {written_nd!r}")
 
-    # --- Hillshade aus dem fertigen (bereits geclippten) DSM rechnen ---
-    log("\nErzeuge Hillshade aus dem DSM...")
+    # --- Hillshade aus dem vollstaendig gefuellten, ungeclippten Mosaik rechnen ---
+    log("\nErzeuge Hillshade...")
+    log(f"  Quelle: {hillshade_source}")
     raw_hillshade_path = run_dir / "05_hillshade_raw.tif"
     hs_ds = gdal.DEMProcessing(
-        str(raw_hillshade_path), output_path, "hillshade",
+        str(raw_hillshade_path), hillshade_source, "hillshade",
         options=gdal.DEMProcessingOptions(computeEdges=True),
     )
     if hs_ds is None:
@@ -943,12 +1189,27 @@ def _mosaic_las_raster(cell_rasters, run_dir: Path, output_path: str,
     hs_ds.FlushCache()
     hs_ds = None
 
-    log(f"  Clippe Hillshade auf AOI (Cutline): {clip_shape_path}  (NoData ausserhalb = 255)")
+    # Muss VOR dem Clip passieren: danach ist 255 die NoData-Maske und weder ein
+    # gueltiges 255er-Pixel noch ein Loch waere davon noch zu trennen.
+    n_clamped, n_filled = _prepare_hillshade_values(str(raw_hillshade_path))
+    log(f"  Voll beleuchtete Pixel {LAS_HILLSHADE_NODATA} -> "
+        f"{LAS_HILLSHADE_VALID_MAX}: {n_clamped}")
+    log(f"  NoData-Pixel -> {LAS_HILLSHADE_VALID_MAX}: {n_filled} (Flaeche ausserhalb "
+        f"der Daten - der Clip setzt sie gleich wieder auf {LAS_HILLSHADE_NODATA})")
+    log(f"  Innerhalb des AOI bleibt damit kein Pixel mit {LAS_HILLSHADE_NODATA}.")
+
+    log(f"  Clippe Hillshade auf AOI (Cutline): {clip_shape_path}  "
+        f"(NoData ausserhalb = {LAS_HILLSHADE_NODATA})")
     hs_warp_options = gdal.WarpOptions(
         format="GTiff",
         cutlineDSName=clip_shape_path,
         cropToCutline=False,
-        dstNodata=255,
+        # Quelle ist jetzt das Mosaik, nicht mehr das fertige DSM - Ausschnitt und
+        # Aufloesung muessen deshalb explizit auf das Zielgitter gezwungen werden,
+        # damit DSM und Hillshade pixelgenau uebereinanderliegen.
+        outputBounds=(snap_minx, snap_miny, snap_maxx, snap_maxy),
+        xRes=gsd, yRes=gsd,
+        dstNodata=LAS_HILLSHADE_NODATA,
         multithread=True,
         warpOptions=[f"NUM_THREADS={num_threads}"],
         srcSRS="EPSG:2056",
@@ -963,6 +1224,18 @@ def _mosaic_las_raster(cell_rasters, run_dir: Path, output_path: str,
         raise RuntimeError("gdal.Warp hat None zurueckgegeben - Hillshade-Clip fehlgeschlagen.")
     hs_out_ds.FlushCache()
     hs_out_ds = None
+
+    # Kontrolle statt Annahme: DSM und Hillshade muessen deckungsgleich sein, sonst
+    # passen sie im GIS nicht uebereinander.
+    dsm_chk = gdal.Open(output_path, gdal.GA_ReadOnly)
+    hs_chk = gdal.Open(hillshade_output_path, gdal.GA_ReadOnly)
+    dsm_geom = (dsm_chk.RasterXSize, dsm_chk.RasterYSize, dsm_chk.GetGeoTransform())
+    hs_geom = (hs_chk.RasterXSize, hs_chk.RasterYSize, hs_chk.GetGeoTransform())
+    dsm_chk = hs_chk = None
+    if dsm_geom != hs_geom:
+        raise RuntimeError(f"DSM und Hillshade liegen nicht auf demselben Gitter: "
+                            f"{dsm_geom} vs. {hs_geom}")
+    log("  Gitter-Kontrolle OK: DSM und Hillshade sind deckungsgleich.")
     log(f"  Hillshade geschrieben: {hillshade_output_path}")
 
 
@@ -1366,7 +1639,7 @@ def _process_las(cfg: dict) -> None:
 #      Puffer gecroppt und als Float32-IDW-Raster gerastert (wie im LHN95-Tab)
 #   4) Gesamt-Raster: Zell-Raster als VRT mosaikieren, per AOI-/Footprint-Shape
 #      maskieren (NoData = LAS_RASTER_NODATA), daraus den Hillshade rechnen und
-#      ebenfalls maskieren (NoData = 255)
+#      ebenfalls maskieren (NoData = 255 nur ausserhalb des AOI)
 #
 # KEIN Reframe, KEIN Re-Tiling, KEIN Crop der Punktwolke - der Input ist bereits
 # das fertige, AOI-gecroppte 1km-Grid aus dem LHN95-Tab. Das AOI-/Footprint-Shape
@@ -1595,11 +1868,36 @@ def _stat_range_from_pipeline_metadata(pipeline_metadata, dimension: str) -> tup
     return (None, None)
 
 
-def _validate_ln02_target(src_md: dict, dst_md: dict) -> list:
+def _stats_bbox_from_pipeline_metadata(pipeline_metadata) -> dict:
+    """BBox aus den GEMESSENEN X/Y/Z-Statistiken einer 'filters.stats'-Stage.
+
+    Das sind die tatsaechlichen Extents der gelesenen Punkte - im Gegensatz zur
+    Header-BBox, die in reframten Fremddaten veraltet sein kann. Gibt None
+    zurueck, wenn eine der sechs Groessen fehlt (dann bleibt der Header die
+    einzige Referenz)."""
+    bbox = {}
+    for dim, lo, hi in (("X", "minx", "maxx"),
+                        ("Y", "miny", "maxy"),
+                        ("Z", "minz", "maxz")):
+        vmin, vmax = _stat_range_from_pipeline_metadata(pipeline_metadata, dim)
+        if vmin is None or vmax is None:
+            return None
+        bbox[lo], bbox[hi] = vmin, vmax
+    return bbox
+
+
+def _validate_ln02_target(src_md: dict, dst_md: dict, src_measured: dict = None,
+                          warnings: list = None) -> list:
     """Nachkonversions-Validierung. Gibt eine Liste von Fehler-Strings zurueck
     (leer = alles OK). Prueft NUR, repariert nichts:
       - Punktanzahl identisch
-      - BBox identisch innerhalb LN02_BBOX_TOLERANCE_M
+      - BBox identisch innerhalb LN02_BBOX_TOLERANCE_M. Referenz sind, wenn
+        uebergeben, die GEMESSENEN Quell-Extents aus 'filters.stats'
+        (src_measured), nicht die Quell-Header-BBox: reframte Fremddaten
+        (GeoSuite/LAStools) fuehren im Header gelegentlich Werte, die nicht mehr
+        zu den Punkten passen, und ein solcher Quell-Header darf eine korrekte
+        Konversion nicht zu Fall bringen. Header-Abweichungen werden stattdessen
+        nach 'warnings' gemeldet.
       - minor_version / dataformat_id / point_length / header_size / global_encoding
       - beide CRS-VLRs vorhanden (34735 + 2112), VLR 2112 endet auf Nullbyte
       - CRS aufloesbar: horizontal 2056, vertikal 5728
@@ -1612,15 +1910,38 @@ def _validate_ln02_target(src_md: dict, dst_md: dict) -> list:
         problems.append(f"Punktanzahl weicht ab: Quelle {src_md.get('count')} vs. "
                          f"Ziel {dst_md.get('count')}")
 
-    for key in ("minx", "maxx", "miny", "maxy", "minz", "maxz"):
+    bbox_keys = ("minx", "maxx", "miny", "maxy", "minz", "maxz")
+    reference = src_measured or src_md
+    ref_label = "gemessene Quellpunkte" if src_measured else "Quell-Header"
+    for key in bbox_keys:
         try:
-            d = abs(float(src_md[key]) - float(dst_md[key]))
+            d = abs(float(reference[key]) - float(dst_md[key]))
         except (KeyError, TypeError, ValueError):
             problems.append(f"BBox-Feld '{key}' fehlt in Quelle oder Ziel.")
             continue
         if d > LN02_BBOX_TOLERANCE_M:
             problems.append(f"BBox-Feld '{key}' weicht {d:.4f} m ab "
-                             f"(Toleranz {LN02_BBOX_TOLERANCE_M} m).")
+                             f"(Toleranz {LN02_BBOX_TOLERANCE_M} m, "
+                             f"Referenz: {ref_label}).")
+
+    # Quell-Header gegen die gemessenen Quellpunkte: eine Abweichung ist ein Mangel
+    # der QUELLE (nicht nachgefuehrte Header-BBox), nicht der Konversion. Das Ziel
+    # traegt die von PDAL neu berechneten, korrekten Werte - deshalb Warnung statt
+    # Fehler, damit die Kachel nicht grundlos aus der Lieferung faellt.
+    if src_measured is not None and warnings is not None:
+        stale = []
+        for key in bbox_keys:
+            try:
+                d = abs(float(src_md[key]) - float(src_measured[key]))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if d > LN02_BBOX_TOLERANCE_M:
+                stale.append(f"{key} {d:.4f} m")
+        if stale:
+            warnings.append(
+                "Quell-Header-BBox passt nicht zu den tatsaechlichen Punkten ("
+                + ", ".join(stale) + "). Die Zieldatei traegt die gemessenen Werte "
+                "(fachlich korrekt); die Quelle sollte geprueft werden.")
 
     for field, expected in (("minor_version",   LN02_MINOR_VERSION),
                             ("dataformat_id",   LN02_POINT_FORMAT),
@@ -1727,7 +2048,10 @@ def _ln02_tile_worker(args) -> tuple:
             {"type": "readers.las", "filename": src_path},
             # GpsTime kostet hier nichts extra und entscheidet unten, ob der
             # GPS-Time-Typ ueberhaupt eine Aussage ueber die Daten macht.
-            {"type": "filters.stats", "dimensions": "Classification,GpsTime"},
+            # X/Y/Z liefern im selben Durchlauf die tatsaechlichen Extents der
+            # Quellpunkte - Referenz fuer die BBox-Validierung, weil die
+            # Header-BBox der Quelle dafuer nicht immer verlaesslich ist.
+            {"type": "filters.stats", "dimensions": "Classification,GpsTime,X,Y,Z"},
             writer,
         ]
         with open(pipeline_path, "w", encoding="utf-8") as f:
@@ -1765,7 +2089,11 @@ def _ln02_tile_worker(args) -> tuple:
                              f"LV95/LN02-Referenz-VLRs ersetzt.")
 
         dst_md = _pdal_info_metadata(pdal_exe, tmp_path)
-        problems = _validate_ln02_target(src_md, dst_md)
+        val_warnings = []
+        problems = _validate_ln02_target(src_md, dst_md,
+                                          _stats_bbox_from_pipeline_metadata(pipe_md),
+                                          val_warnings)
+        warnings.extend(f"{src_name}: {w}" for w in val_warnings)
 
         # Classification-Kontrolle: PF1/PF3 packen die Klasse als 5-Bit-Wert zusammen
         # mit Flag-Bits in ein Byte, PF6 trennt beides - genau hier koennte die

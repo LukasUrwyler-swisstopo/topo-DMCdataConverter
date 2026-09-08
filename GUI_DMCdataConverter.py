@@ -431,8 +431,10 @@ class DMCConverterApp(tk.Tk):
                          variable=self._las_create_raster_var,
                          command=self._on_las_create_raster_toggle
                          ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(10, 0))
-        h_rast = ttk.Label(sec, text="Alle Tiles mergen -> IDW-Raster (DSM) -> per AOI NoData-maskiert -> "
-                                      "zusaetzlich automatisch Hillshade daraus gerechnet (NoData=255)", font=("", 8))
+        h_rast = ttk.Label(sec, text="Alle Tiles mergen -> IDW-Raster (DSM) -> Loecher bis 900 m2 interpoliert, "
+                                      "groessere bleiben NoData\n-> per AOI maskiert -> Hillshade daraus "
+                                      "(im AOI lochfrei, NoData=255 nur ausserhalb)",
+                            font=("", 8), justify="left")
         h_rast.grid(row=5, column=0, columnspan=3, sticky="w", padx=(20, 0))
         self._dim_labels.append(h_rast)
 
@@ -708,9 +710,10 @@ class DMCConverterApp(tk.Tk):
                          variable=self._ln02_create_raster_var,
                          command=self._on_ln02_create_raster_toggle
                          ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(10, 0))
-        h_rast = ttk.Label(sec, text="Alle Tiles -> IDW-Raster (DSM) -> per AOI NoData-maskiert -> "
-                                      "zusaetzlich automatisch Hillshade daraus gerechnet (NoData=255)",
-                            font=("", 8))
+        h_rast = ttk.Label(sec, text="Alle Tiles -> IDW-Raster (DSM) -> Loecher bis 900 m2 interpoliert, "
+                                      "groessere bleiben NoData\n-> per AOI maskiert -> Hillshade daraus "
+                                      "(im AOI lochfrei, NoData=255 nur ausserhalb)",
+                            font=("", 8), justify="left")
         h_rast.grid(row=4, column=0, columnspan=3, sticky="w", padx=(20, 0))
         self._dim_labels.append(h_rast)
 
