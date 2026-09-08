@@ -2481,8 +2481,15 @@ def _ln02_tile_worker(args) -> tuple:
 
             joined_path = str(run_dir / f"joined_{stem}.las")
             side_temps.append(joined_path)
-            join_stats = _ln02_join_master(master_las, src_las, joined_path,
-                                            origin_x, origin_y)
+            try:
+                join_stats = _ln02_join_master(master_las, src_las, joined_path,
+                                                origin_x, origin_y)
+            except ValueError as e:
+                # Die Pruefungen im Join (Punktanzahl, Reihenfolge, Gitter, Punktformat)
+                # sind deterministisch - ein zweiter Anlauf liefert garantiert dasselbe.
+                # Deshalb 'error_final': der serielle Wiederholungslauf ueberspringt das
+                # und verschwendet keinen weiteren vollen Durchlauf pro Kachel.
+                return ("error_final", dst_name, f"Farb-Join: {e}", warnings)
             src_class = (join_stats["class_min"], join_stats["class_max"])
             src_measured = join_stats.get("measured") or None
             gps_min, gps_max = join_stats.get("gps_min"), join_stats.get("gps_max")
@@ -2943,12 +2950,28 @@ def _process_las_ln02(cfg: dict) -> None:
             done += 1
             prefix = f"[{done}/{total_tasks}]"
             if not _handle(kind, name, res, prefix):
-                # Noch nicht als Fehler zaehlen: ein abgestuerzter pdal-Prozess ist
-                # meist Speicherdruck durch die parallelen Jobs - wird unten seriell
-                # wiederholt.
-                failed.append((kind, name, args))
-                _log(f"  {prefix} FEHLER bei {_job_label(kind, name)} "
-                     f"(Wiederholung folgt): {res[2]}")
+                if res[0] == "error_final":
+                    # Deterministische Pruefung des Farb-Joins - eine Wiederholung
+                    # laeuft in denselben Fehler und kostet nur einen weiteren
+                    # kompletten Durchlauf ueber die Kachel.
+                    errors += 1
+                    errors_by_kind[kind] += 1
+                    _log(f"  {prefix} FEHLER bei {_job_label(kind, name)} "
+                         f"(keine Wiederholung sinnvoll): {res[2]}")
+                    if "Punktreihenfolge" in (res[2] or ""):
+                        _log(f"      ACHTUNG: Das betrifft aller Voraussicht nach ALLE "
+                             f"Kacheln - GeoSuite haelt die Punktreihenfolge dann "
+                             f"grundsaetzlich nicht ein und der Index-Join ist fuer "
+                             f"diese Lieferung nicht verwendbar. Lauf abbrechen und "
+                             f"Ruecksprache halten, statt die restlichen Kacheln "
+                             f"durchlaufen zu lassen.")
+                else:
+                    # Noch nicht als Fehler zaehlen: ein abgestuerzter pdal-Prozess ist
+                    # meist Speicherdruck durch die parallelen Jobs - wird unten seriell
+                    # wiederholt.
+                    failed.append((kind, name, args))
+                    _log(f"  {prefix} FEHLER bei {_job_label(kind, name)} "
+                         f"(Wiederholung folgt): {res[2]}")
             print(f"PROGRESS:{progress_start + (done / total_tasks) * progress_span:.6f}",
                   flush=True)
 
