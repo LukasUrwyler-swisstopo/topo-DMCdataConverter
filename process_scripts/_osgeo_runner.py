@@ -898,7 +898,11 @@ def _mosaic_las_raster(cell_rasters, run_dir: Path, output_path: str,
         dstNodata=LAS_RASTER_NODATA,
         multithread=True,
         warpOptions=[f"NUM_THREADS={num_threads}"],
-        outputSRS="EPSG:2056",
+        # gdal.Warp kennt kein "outputSRS" (das gehoert zu gdal.Translate) - hier srcSRS/dstSRS.
+        # srcSRS explizit, damit der Clip auch dann laeuft, wenn das VRT/PDAL-Zellraster
+        # kein CRS-Tag traegt; da Quelle == Ziel wird nichts reprojiziert.
+        srcSRS="EPSG:2056",
+        dstSRS="EPSG:2056",
         creationOptions=[
             "TILED=YES", "BLOCKXSIZE=512", "BLOCKYSIZE=512",
             "COMPRESS=LZW", "PREDICTOR=3", "BIGTIFF=YES", "TFW=YES",
@@ -947,7 +951,8 @@ def _mosaic_las_raster(cell_rasters, run_dir: Path, output_path: str,
         dstNodata=255,
         multithread=True,
         warpOptions=[f"NUM_THREADS={num_threads}"],
-        outputSRS="EPSG:2056",
+        srcSRS="EPSG:2056",
+        dstSRS="EPSG:2056",
         creationOptions=[
             "TILED=YES", "BLOCKXSIZE=512", "BLOCKYSIZE=512",
             "COMPRESS=LZW", "PREDICTOR=2", "BIGTIFF=YES", "TFW=YES",
