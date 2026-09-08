@@ -192,9 +192,20 @@ als `.las` oder `.laz` geschrieben wird, entscheidet sich rein an der Dateiendun
   Punktzahl-Check ohnehin gelesen) — stimmt er nicht, wird die Kachel verworfen statt eine fuer
   REFRAME unbrauchbare Datei im Output-Ordner zu hinterlassen.
 
-  **Farbe:** PF7 fuehrt RGB, PF1 nicht. Fuehrt die Quelle Farbe, erscheint ein Hinweis im Log.
-  Was im GDWH ankommt, verliert dadurch nichts — das Zielformat `SB_DSM_PUNKTWOLKE` ist PF6 und
-  traegt ebenfalls keine RGB-Werte.
+  **Farbe (PF7-Master):** PF1 fuehrt keine RGB-Werte, die DMC-Quelldaten aus Reality Studio
+  aber schon (PF2: RGB vorhanden, `GpsTime` nicht). Damit die Farbe nicht am GeoSuite-Schritt
+  verloren geht, schreibt derselbe Pipeline-Lauf eine **zweite** vollstaendige Ausgabe: den
+  **PF7-Master** im Unterordner `_master_PF7` des Output-Ordners — gleiche Punkte, gleiches
+  `scale`, gleiches `offset` (Kachelursprung), nur eben mit Farbe.
+
+  Bewusst **ein** Pipeline-Lauf mit zwei `writers.las` an derselben letzten Filterstufe: ueber
+  die Punktauswahl entscheidet `filters.sample`, und bei zwei getrennten Laeufen waere die
+  Identitaet der beiden Punktmengen nur eine Annahme. So ist sie eine Konstruktionseigenschaft —
+  und die teure KD-Baum-Auswahl laeuft nur einmal.
+
+  Der Tab [LN02] fuegt Master und GeoSuite-Ausgabe wieder zusammen (siehe dort). Wird der
+  Master dort nicht angegeben, entsteht wie bisher PF6 ohne Farbe; der Master kann dann
+  geloescht werden. Fuehrt die Quelle gar keine Farbe, steht das als Warnung im Log.
 
   **GPS-Time-Typ:** `global_encoding` Bit 0 sagt, wie die `GpsTime`-Werte zu lesen sind
   (0 = GPS Week Time, 1 = Adjusted Standard GPS Time). Das ist eine Eigenschaft der Daten, keine
@@ -270,7 +281,8 @@ Raster-Maskierung gebraucht und ist nur sichtbar, wenn die Raster-Option aktiv i
 | Eigenschaft | Wert |
 |---|---|
 | LAS-Version | 1.4 |
-| Point Data Record Format | 6 (`point_length` 30, `header_size` 375) |
+| Point Data Record Format | **6** (`point_length` 30) ohne Master · **7** (`point_length` 36, mit RGB) mit Master |
+| `header_size` | 375 (unabhängig vom Punktformat) |
 | `global_encoding` | 17 — Bit 0 (Adjusted Standard GPS Time) + Bit 4 (WKT) |
 | `scale_x/y/z` | 0.01 |
 | `offset_x/y/z` | Kachelursprung `<E>*1000 / <N>*1000 / 0` |
@@ -280,6 +292,69 @@ Der **Offset kommt aus dem Dateinamen**, nicht aus dem Datenminimum: eine AOI-ge
 fängt sonst irgendwo mitten in der Zelle an. Die geparsten Kilometerwerte werden gegen die
 Schweizer Landesgrenzen (LV95) plausibilisiert; zeigen zwei Input-Kacheln auf dieselbe Zelle
 (die Ausgaben würden sich überschreiben), bricht der Lauf vorher ab.
+
+### Farbe zurückholen — der Index-Join mit dem PF7-Master
+
+GeoSuite/REFRAME liest nur klassisches LAS und gibt darum farblose Kacheln zurück. Ist im Feld
+**„Master-Ordner (PF7 mit RGB)"** der Ordner `_master_PF7` aus dem Tab [LHN95] angegeben, werden
+beide Dateien wieder zusammengeführt:
+
+- **X/Y und alle Attribute** (RGB, Classification, Intensity, …) kommen aus dem **Master**,
+- **Z kommt verbatim aus der GeoSuite-Ausgabe** — Punkt für Punkt, ohne Umrechnung.
+
+Die amtliche Transformation bleibt damit unangetastet: es wird nichts interpoliert und kein
+Ersatzmodell gerechnet. (Der Umweg über `filters.reprojection` von `EPSG:2056+5729` nach `+5728`
+wäre **keine** Alternative — PROJ kennt kein HTRANS, sondern nur den Umweg über zwei
+CHGeo2004-Gitter mit *unknown accuracy*, und fällt bei fehlenden Gittern still auf `+proj=noop`
+zurück: LHN95-Höhen mit LN02-Etikett. Deshalb gibt es in diesem Projekt bewusst kein
+`filters.reprojection`.)
+
+**Zugeordnet wird über den Index** (Punkt *n* ↔ Punkt *n*), nicht über die Koordinate: bei einer
+2.5D-Oberfläche gibt es an Felswänden mehrere Punkte mit fast gleichem X/Y, und Z taugt als
+Schlüssel nicht, weil genau Z transformiert wurde. Der Index ist exakt, solange GeoSuite
+Reihenfolge und Anzahl erhält — beides wird **geprüft, nicht angenommen**:
+
+| Kontrolle | Wirkung bei Abweichung |
+|---|---|
+| Punktanzahl Master vs. GeoSuite-Ausgabe | harter Fehler, Kachel wird nicht geschrieben |
+| X/Y punktweise (Toleranz 1 mm) | harter Fehler — eine verschobene Zuordnung liegt um Zehnerpotenzen darüber |
+| RGB-Spanne Master vs. Zieldatei | harter Fehler — ohne diese Kontrolle würde ein fehlgeschlagener Join grün validieren |
+| Classification-Spanne | harter Fehler (wie bisher) |
+
+Gepaart werden die Dateien über die **Kachelkoordinaten** aus dem Namen, nicht über den Stem —
+die GeoSuite-Ausgabe heisst `…_LV95_LN02`, der Master `…_LV95_LHN95`. Fehlt zu einer Input-Kachel
+der Master, bricht der Lauf **vor** der Verarbeitung ab; eine still farblos gebliebene Kachel
+würde sonst erst in der GDWH-Lieferung auffallen.
+
+**Keine neue Abhängigkeit:** der Join arbeitet mit `numpy` und `struct` direkt auf den LAS-Bytes.
+`laspy` ist im OSGeo4W-Python **nicht** vorhanden (nachgeprüft) und wird auch nicht gebraucht —
+numpy nutzt der Runner für die Rasterpfade ohnehin schon.
+
+Möglich wird das durch eine Eigenschaft der Konstruktion: der Master ist bereits LAS 1.4/PF7 mit
+dem Ziel-`scale` und dem Ziel-`offset`. Das Ergebnis ist damit schlicht **der Master mit
+ersetzten Z-Werten** — keine Punktformat-Umwandlung, keine Dimensions-Zuordnung. Header und
+VLR-Block werden verbatim übernommen, nur `min_z`/`max_z` werden nachgeführt. Gelesen wird per
+`numpy.memmap` in Blöcken zu 1 Mio. Punkten, der Speicherbedarf wächst also nicht mit der
+Kachelgrösse. Die GeoSuite-Ausgabe wird formatunabhängig gelesen: X/Y/Z liegen bei **jedem**
+Point Data Record Format in den ersten 12 Byte.
+
+Die autoritative Ausgabe schreibt weiterhin **PDAL** (Kompression, `global_encoding`,
+`scale`/`offset`) — dieselbe Writer-Konfiguration wie ohne Farbe, nur mit `dataformat_id 7`. Der
+Join liefert dafür eine unkomprimierte Zwischendatei im Staging, die danach wieder gelöscht wird.
+
+Beide Eingaben müssen dafür unkomprimiert vorliegen. Ist der Master `.laz`, wird er pro Kachel
+einmal ins Staging entpackt (ein Durchlauf mehr); mit `.las` im Tab [LHN95] entfällt das, kostet
+dafür rund das Vierfache an Plattenplatz für den Master. Das Log sagt, welcher Fall vorliegt.
+
+> **GpsTime:** PF7 verlangt das Feld, die DMC-Quelle (PF2) führt aber gar keine GPS-Zeit — es
+> bleibt durchgehend 0. `global_encoding` 17 deklariert darüber trotzdem *Adjusted Standard GPS
+> Time*, weil die Kachel strukturkongruent zu swissSURFACE3D bleiben soll. Der Typ beschreibt
+> damit ein leeres Feld; das ist bewusst so und im Code an der Warnlogik dokumentiert.
+
+> **Flussabwärts beachten:** `4_SB_DSM_PUNKTWOLKE_LAS14upgrade.py` im Projekt
+> `topo-importDATAtoGDWH-STAC` validiert auf `dataformat_id == 6` und würde eine PF7-Kachel
+> **still auf PF6 zurückdrehen** — die Farbe wäre dann doch wieder weg. Dort braucht es ein
+> zweites Zielprofil, sonst endet die Kette wieder farblos.
 
 ### Warum die CRS-Tags byte-exakt injiziert werden
 

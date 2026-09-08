@@ -87,9 +87,10 @@ LAS_CELL_NODATA = -9999.0
 # 4_SB_DSM_PUNKTWOLKE_LAS14upgrade.py: "LAS 1.2, Point Data Record Format 1, keine
 # CRS-Angabe im Header") und das dort seit je durch GeoSuite laeuft.
 #
-# PF1 fuehrt keine Farbe - PF7 haette welche. Was im GDWH ankommt, verliert dadurch
-# nichts: das Zielformat PF6 traegt ebenfalls keine RGB-Werte. Auf RGB in der Quelle
-# wird trotzdem im Log hingewiesen.
+# PF1 fuehrt keine Farbe. Damit sie trotzdem nicht verloren geht, schreibt derselbe
+# Pipeline-Lauf zusaetzlich den PF7-Master (siehe MASTER_SUBDIR und _las_cell_worker);
+# der Tab [LN02] holt die RGB-Werte von dort zurueck. Die Farbe fehlt also nur in der
+# GeoSuite-Zwischenstufe, nicht im Endprodukt.
 LAS_OUT_MINOR_VERSION = 2
 LAS_OUT_POINT_FORMAT  = 1
 
@@ -116,6 +117,35 @@ LN02_HEADER_SIZE      = 375
 LN02_GLOBAL_ENCODING  = 17     # Bit 0 (Adjusted Standard GPS Time) + Bit 4 (WKT)
 LN02_SCALE            = 0.01   # Schweizer Konvention (keine uebertriebene Praezision)
 LN02_BBOX_TOLERANCE_M = 0.01   # zulaessige BBox-Abweichung Quelle vs. Ziel nach Requantisierung
+
+# ─── Farbvariante: PF7 statt PF6 (nur mit PF7-Master, siehe _ln02_join_master) ───
+# Die DMC-Quelldaten (Reality Studio) fuehren RGB. Der Umweg ueber GeoSuite/REFRAME
+# verliert die Farbe zwangslaeufig, weil GeoSuite nur klassisches LAS (PF0-PF3) liest
+# und der Zwischenschritt deshalb PF1 sein muss. Statt die Farbe aufzugeben, schreibt
+# der Tab [LHN95] aus DEMSELBEN Pipeline-Lauf eine zweite, vollstaendige Ausgabe mit
+# Farbe (den "Master") und der Tab [LN02] fuegt beide wieder zusammen:
+#   X/Y/RGB/Classification/... aus dem Master, Z verbatim aus der GeoSuite-Ausgabe.
+# Damit bleibt die amtliche Transformation unangetastet - jeder Z-Wert kommt Punkt fuer
+# Punkt aus REFRAME, es wird nichts interpoliert und kein Ersatzmodell gerechnet.
+#
+# PF7 ist PF6 + RGB (36 statt 30 Byte). Die von PF7 verlangte GpsTime bleibt leer:
+# die Quelle ist PF2 und fuehrt gar keine GPS-Zeit (photogrammetrisch abgeleitete
+# Punkte haben keinen Zeitstempel). global_encoding bleibt trotzdem 17 - siehe die
+# Begruendung bei den GpsTime-Warnungen in _ln02_tile_worker.
+LN02_POINT_FORMAT_RGB = 7
+LN02_POINT_LENGTH_RGB = 36
+
+# Unterordner des LHN95-Output-Ordners, in den der Master geschrieben wird. Bewusst
+# KEIN eigenes GUI-Feld: ein Feld weniger ist ein Feld weniger, das man falsch setzen
+# kann. Im Tab [LN02] muss der Ordner dagegen explizit angegeben werden, weil der
+# GeoSuite-Schritt dazwischen die Pfadkette zerreisst.
+MASTER_SUBDIR         = "_master_PF7"
+MASTER_MINOR_VERSION  = 4
+MASTER_POINT_FORMAT   = 7
+
+# Join-Parameter (siehe _ln02_join_master)
+LN02_JOIN_CHUNK       = 1000000  # Punkte pro Chunk - begrenzt den Speicherbedarf
+LN02_XY_TOLERANCE_M   = 0.001    # zulaessige X/Y-Abweichung Master vs. GeoSuite-Ausgabe
 
 # SRS der LN02-Kacheln (LV95 + LN02). Wird NUR den Readern der Raster-Pipeline
 # aufgezwungen; die CRS-Tags der Punktwolken-Ausgabe kommen ausschliesslich aus den
@@ -694,7 +724,12 @@ def _discard_partial(path: str) -> None:
 
     Ein abgestuerzter pdal.exe (z.B. Speichermangel) hinterlaesst sonst eine
     abgeschnittene Datei mit unbrauchbarem Header, die im Output-Ordner nicht von
-    einer vollstaendigen Kachel zu unterscheiden ist."""
+    einer vollstaendigen Kachel zu unterscheiden ist.
+
+    'path' darf None sein (Aufruf fuer eine optionale Ausgabe, z.B. den PF7-Master,
+    die gar nicht angefordert wurde)."""
+    if not path:
+        return
     try:
         os.remove(path)
     except OSError:
@@ -704,9 +739,20 @@ def _discard_partial(path: str) -> None:
 def _las_cell_worker(args) -> tuple:
     """Wird in einem eigenen Prozess ausgefuehrt - mergt die Input-Kacheln einer
     1km-Grid-Zelle, croppt/thinnt optional, schreibt eine Punktwolken-Kachel
-    (.las oder .laz, siehe out_format)."""
+    (.las oder .laz, siehe out_format) UND den farbfuehrenden PF7-Master.
+
+    Beide Ausgaben entstehen bewusst in EINEM Pipeline-Lauf (zwei writers.las an
+    derselben letzten Filterstufe): 'filters.sample' entscheidet ueber die
+    Punktauswahl, und bei zwei getrennten Laeufen waere die Identitaet der beiden
+    Punktmengen nur eine Annahme. So ist sie eine Konstruktionseigenschaft - und die
+    teure KD-Baum-Auswahl laeuft nur einmal.
+
+    Beide Writer bekommen dasselbe scale UND dasselbe offset (den Kachelursprung,
+    aus dem Dateinamen geparst wie im Tab [LN02]). Nur dadurch liegen Master und
+    Endprodukt auf demselben Ganzzahl-Gitter und die X/Y-Kontrolle beim Join
+    (_ln02_join_master) ist exakt statt toleranzbehaftet."""
     (job, run_dir_str, output_dir_laz, pdal_exe, clip_wkt, thin_m, out_format,
-     gps_time_bit) = args
+     gps_time_bit, master_dir) = args
 
     stem = job["stem"]
     cminx, cminy, cmaxx, cmaxy = job["cell_bounds"]
@@ -715,6 +761,13 @@ def _las_cell_worker(args) -> tuple:
     run_dir = Path(run_dir_str)
     pipeline_path = run_dir / f"pipeline_{stem}.json"
     laz_out = str(Path(output_dir_laz) / f"{stem}.{out_format}")
+    master_out = str(Path(master_dir) / f"{stem}.{out_format}") if master_dir else None
+
+    # Offset aus dem NAMEN, nicht aus 'cell_bounds': der Tab [LN02] bestimmt den
+    # Kachelursprung ebenfalls aus dem Namen. Nur wenn beide dieselbe Quelle nutzen,
+    # ist das Ganzzahl-Gitter von Master und Endprodukt garantiert identisch.
+    origin_e_km, origin_n_km = _parse_tile_origin(f"{stem}.{out_format}")
+    origin_x, origin_y = origin_e_km * 1000.0, origin_n_km * 1000.0
 
     stages = []
     tags = []
@@ -723,23 +776,43 @@ def _las_cell_worker(args) -> tuple:
         stages.append({"type": "readers.las", "filename": t, "tag": tag,
                         "override_srs": LAS_INPUT_SRS})
         tags.append(tag)
-    stages.append({"type": "filters.merge", "inputs": tags})
+    stages.append({"type": "filters.merge", "inputs": tags, "tag": "merged"})
 
     bounds_str = f"([{cminx:.3f},{cmaxx:.3f}],[{cminy:.3f},{cmaxy:.3f}])"
-    stages.append({"type": "filters.crop", "bounds": bounds_str})
-    stages.append({"type": "filters.crop", "polygon": clip_wkt})
+    stages.append({"type": "filters.crop", "bounds": bounds_str,
+                    "inputs": ["merged"], "tag": "cropped_cell"})
+    stages.append({"type": "filters.crop", "polygon": clip_wkt,
+                    "inputs": ["cropped_cell"], "tag": "cropped_aoi"})
+    last_tag = "cropped_aoi"
 
     if thin_m:
-        stages.append({"type": "filters.sample", "radius": float(thin_m)})
+        stages.append({"type": "filters.sample", "radius": float(thin_m),
+                        "inputs": [last_tag], "tag": "thinned"})
+        last_tag = "thinned"
 
     stages.append({"type": "writers.las", "filename": laz_out,
+                    "inputs": [last_tag],
                     "minor_version": LAS_OUT_MINOR_VERSION,
                     "dataformat_id": LAS_OUT_POINT_FORMAT,
                     "a_srs": LAS_OUT_SRS,
                     # Nur Bit 0 (GPS-Time-Typ), aus der Quelle uebernommen. Bit 4 (WKT)
                     # gibt es erst ab LAS 1.4 und waere hier unzulaessig.
                     "global_encoding": int(gps_time_bit),
-                    "scale_x": 0.01, "scale_y": 0.01, "scale_z": 0.01})
+                    "scale_x": 0.01, "scale_y": 0.01, "scale_z": 0.01,
+                    "offset_x": origin_x, "offset_y": origin_y, "offset_z": 0})
+
+    if master_out:
+        stages.append({"type": "writers.las", "filename": master_out,
+                        "inputs": [last_tag],
+                        "minor_version": MASTER_MINOR_VERSION,
+                        "dataformat_id": MASTER_POINT_FORMAT,
+                        "a_srs": LAS_OUT_SRS,
+                        # LAS 1.4: Bit 4 (WKT) gehoert gesetzt, Bit 0 wie oben.
+                        "global_encoding": 0x10 | int(gps_time_bit),
+                        "scale_x": 0.01, "scale_y": 0.01, "scale_z": 0.01,
+                        "offset_x": origin_x, "offset_y": origin_y, "offset_z": 0})
+        if out_format.lower() == "laz":
+            stages[-1]["compression"] = "laszip"
 
     try:
         with open(pipeline_path, "w", encoding="utf-8") as f:
@@ -747,11 +820,13 @@ def _las_cell_worker(args) -> tuple:
         _run_pdal_pipeline(pdal_exe, pipeline_path)
 
         if not os.path.isfile(laz_out):
+            _discard_partial(master_out)
             return ("empty", stem, None)
 
         meta = _pdal_info_metadata(pdal_exe, laz_out)
         if int(meta.get("count", 0)) == 0:
             _discard_partial(laz_out)
+            _discard_partial(master_out)
             return ("empty", stem, None)
 
         # Kontrolle statt Annahme: die Metadaten sind hier ohnehin schon gelesen.
@@ -760,15 +835,39 @@ def _las_cell_worker(args) -> tuple:
         if (meta.get("minor_version") != LAS_OUT_MINOR_VERSION or
                 meta.get("dataformat_id") != LAS_OUT_POINT_FORMAT):
             _discard_partial(laz_out)
+            _discard_partial(master_out)
             return ("error", stem,
                     f"Header ist LAS 1.{meta.get('minor_version')}/"
                     f"PF{meta.get('dataformat_id')}, erwartet LAS "
                     f"1.{LAS_OUT_MINOR_VERSION}/PF{LAS_OUT_POINT_FORMAT} - sonst kann "
                     f"GeoSuite/REFRAME die Datei nicht lesen.")
 
+        # Der Master ist nur brauchbar, wenn er wirklich PF7 ist und dieselbe
+        # Punktmenge traegt - ein halb geschriebener Master faellt sonst erst im
+        # Tab [LN02] auf, also nach dem GeoSuite-Lauf.
+        if master_out:
+            if not os.path.isfile(master_out):
+                _discard_partial(laz_out)
+                return ("error", stem, "PF7-Master wurde nicht geschrieben.")
+            m_meta = _pdal_info_metadata(pdal_exe, master_out)
+            if m_meta.get("dataformat_id") != MASTER_POINT_FORMAT:
+                _discard_partial(laz_out)
+                _discard_partial(master_out)
+                return ("error", stem,
+                        f"PF7-Master hat dataformat_id {m_meta.get('dataformat_id')}, "
+                        f"erwartet {MASTER_POINT_FORMAT}.")
+            if int(m_meta.get("count", 0)) != int(meta.get("count", 0)):
+                _discard_partial(laz_out)
+                _discard_partial(master_out)
+                return ("error", stem,
+                        f"PF7-Master hat {m_meta.get('count')} Punkte, die "
+                        f"GeoSuite-Eingabe {meta.get('count')} - Join im Tab [LN02] "
+                        f"waere nicht moeglich.")
+
         return ("written", stem, None)
     except Exception as e:
         _discard_partial(laz_out)
+        _discard_partial(master_out)
         return ("error", stem, str(e))
     finally:
         try:
@@ -1271,6 +1370,10 @@ def _process_las(cfg: dict) -> None:
     ogr.UseExceptions()
 
     Path(output_dir_laz).mkdir(parents=True, exist_ok=True)
+    # Der PF7-Master geht in einen festen Unterordner des Output-Ordners - kein
+    # eigenes GUI-Feld, damit es nichts Zusaetzliches falsch zu setzen gibt.
+    master_dir = str(Path(output_dir_laz) / MASTER_SUBDIR)
+    Path(master_dir).mkdir(parents=True, exist_ok=True)
     if create_raster:
         Path(output_dir_raster).mkdir(parents=True, exist_ok=True)
     run_dir = Path(staging_dir) / f"{area}_{jahr}_LAS"
@@ -1346,19 +1449,25 @@ def _process_las(cfg: dict) -> None:
          f"{src_gps_bit} - von GeoSuite/REFRAME lesbar)")
     _log(f"Benennung           : {jahr}_{area}_TIN_{thin_token}raw_<NAME>_LV95_LHN95.{out_format}")
 
-    # PF1 fuehrt keine Farbe. Nur hinweisen, nicht abbrechen: das GDWH-Zielformat (PF6,
-    # siehe Tab [LN02]) fuehrt ebenfalls keine RGB-Werte - verloren geht also nichts,
-    # was spaeter noch ankaeme. Eine Stichprobe auf der ersten Kachel genuegt.
+    _log(f"PF7-Master          : {master_dir}")
+    _log(f"                      (LAS 1.{MASTER_MINOR_VERSION} / PF{MASTER_POINT_FORMAT} mit "
+         f"RGB, gleiche Punkte/scale/offset wie oben - Eingabe fuer den Tab [LN02])")
+
+    # PF1 fuehrt keine Farbe, der Master schon. Nur hinweisen, nicht abbrechen: ohne RGB
+    # in der Quelle ist der Master zwar nutzlos, die GeoSuite-Kette laeuft aber normal
+    # weiter. Eine Stichprobe auf der ersten Kachel genuegt.
     try:
         dims = _pdal_dimension_names(pdal_exe, tile_bboxes[0][0])
         if {"Red", "Green", "Blue"} & dims:
-            _log(f"  HINWEIS: Die Quell-Tiles fuehren Farbwerte (RGB). Das Ausgabeformat "
-                 f"PF{LAS_OUT_POINT_FORMAT} traegt keine Farbe - sie faellt hier weg. Das ist "
-                 f"bewusst so: PF1 ist das Format, das GeoSuite/REFRAME nachweislich liest, "
-                 f"und das GDWH-Zielformat PF6 (Tab [LN02]) traegt ohnehin keine Farbe - sie "
-                 f"kaeme also nirgends an. Wird sie im Zwischenschritt doch gebraucht: "
-                 f"LAS_OUT_POINT_FORMAT auf 3 setzen (LAS 1.2 mit RGB), ob GeoSuite PF3 liest "
-                 f"ist allerdings nicht verifiziert.")
+            _log(f"  Farbe               : Die Quell-Tiles fuehren RGB. Die GeoSuite-Ausgabe "
+                 f"(PF{LAS_OUT_POINT_FORMAT}) traegt sie nicht - GeoSuite liest nur klassisches "
+                 f"LAS. Der PF7-Master oben behaelt sie; der Tab [LN02] fuegt sie dem "
+                 f"Endprodukt wieder hinzu (PF{LN02_POINT_FORMAT_RGB}).")
+        else:
+            _log(f"  WARNUNG: Die Quell-Tiles fuehren KEINE Farbwerte (RGB). Der PF7-Master "
+                 f"wird trotzdem geschrieben, enthaelt aber nur Nullen als Farbe. Fuer diese "
+                 f"Daten im Tab [LN02] besser ohne Master-Ordner arbeiten - dann entsteht "
+                 f"das gewohnte PF{LN02_POINT_FORMAT} ohne Farbe.")
     except Exception as e:
         _log(f"  WARNUNG: Dimensionen der Quelle nicht lesbar ({e}) - RGB-Hinweis uebersprungen.")
 
@@ -1508,7 +1617,7 @@ def _process_las(cfg: dict) -> None:
     cell_workers = {"las": _las_cell_worker, "dsm": _raster_cell_worker}
     cell_tasks = [("las", job["stem"],
                    (job, str(run_dir), output_dir_laz, pdal_exe, clip_wkt, thin_m,
-                    out_format, src_gps_bit))
+                    out_format, src_gps_bit, master_dir))
                   for job in jobs]
     if create_raster:
         cell_tasks += [("dsm", job["cell"],
@@ -1693,11 +1802,18 @@ def _inject_reference_vlrs(las_path: str) -> int:
 
     Arbeitet in-place - nur auf einer Temp-Datei aufrufen (siehe _ln02_tile_worker).
     Gibt die Anzahl entfernter 'LASF_Projection'-VLRs zurueck.
+
+    Der Punktbereich wird chunkweise umkopiert statt die Datei komplett in den Speicher
+    zu lesen: mit dem Farb-Join koennen die Zwischendateien unkomprimiert mehrere
+    hundert MB gross werden, und bei parallelen Kachel-Jobs waere ein Vielfaches davon
+    im RAM. Header und VLR-Block sind dagegen wenige KB und werden ganz gelesen.
     """
     with open(las_path, "rb") as f:
-        data = f.read()
+        head = f.read(512)
+        header_size, offset_to_point_data, n_vlr = struct.unpack_from("<HII", head, 94)
+        f.seek(0)
+        data = f.read(offset_to_point_data)  # nur Header + VLR-Block
 
-    header_size, offset_to_point_data, n_vlr = struct.unpack_from("<HII", data, 94)
     existing_vlr_block = data[header_size:offset_to_point_data]
 
     is_laszip = False
@@ -1730,21 +1846,38 @@ def _inject_reference_vlrs(las_path: str) -> int:
     # wurden oben VLRs entfernt, ist die Nettoverschiebung kleiner.
     shift = new_offset_to_point_data - offset_to_point_data
 
-    point_data = bytearray(data[offset_to_point_data:])
-    if is_laszip:
-        chunk_table_pos, = struct.unpack_from("<q", point_data, 0)
-        if chunk_table_pos != -1:  # -1 = LASzip-Platzhalter, nicht bei fertigen Dateien
-            struct.pack_into("<q", point_data, 0, chunk_table_pos + shift)
+    new_header = bytearray(data[:header_size])
+    struct.pack_into("<I", new_header, 96, new_offset_to_point_data)
+    struct.pack_into("<I", new_header, 100, n_vlr + 2)
+    global_encoding, = struct.unpack_from("<H", new_header, 6)
+    struct.pack_into("<H", new_header, 6, global_encoding | 0x10)  # WKT-Bit setzen
 
-    new_data = bytearray(data[:header_size]) + new_vlr_block + point_data
-    struct.pack_into("<I", new_data, 96, new_offset_to_point_data)
-    struct.pack_into("<I", new_data, 100, n_vlr + 2)
-
-    global_encoding, = struct.unpack_from("<H", new_data, 6)
-    struct.pack_into("<H", new_data, 6, global_encoding | 0x10)  # WKT-Bit setzen
-
-    with open(las_path, "wb") as f:
-        f.write(new_data)
+    tmp_out = las_path + ".vlrtmp"
+    try:
+        with open(las_path, "rb") as fin, open(tmp_out, "wb") as fout:
+            fout.write(new_header)
+            fout.write(new_vlr_block)
+            fin.seek(offset_to_point_data)
+            if is_laszip:
+                # Absoluter Datei-Offset auf die LASzip-Chunk-Tabelle - verschiebt sich
+                # mit den Punktdaten. Ohne diese Korrektur bleibt die Datei fuer
+                # 'pdal info --metadata' lesbar, jeder echte Dekompressions-Durchlauf
+                # bricht aber mit 'Invalid version ... in LAZ chunk table' ab.
+                first8 = fin.read(8)
+                if len(first8) == 8:
+                    chunk_table_pos, = struct.unpack("<q", first8)
+                    if chunk_table_pos != -1:  # -1 = Platzhalter, nicht bei fertigen Dateien
+                        first8 = struct.pack("<q", chunk_table_pos + shift)
+                fout.write(first8)
+            shutil.copyfileobj(fin, fout, 8 * 1024 * 1024)
+        os.replace(tmp_out, las_path)
+        tmp_out = None
+    finally:
+        if tmp_out and os.path.isfile(tmp_out):
+            try:
+                os.remove(tmp_out)
+            except OSError:
+                pass
 
     return n_stripped
 
@@ -1887,7 +2020,8 @@ def _stats_bbox_from_pipeline_metadata(pipeline_metadata) -> dict:
 
 
 def _validate_ln02_target(src_md: dict, dst_md: dict, src_measured: dict = None,
-                          warnings: list = None) -> list:
+                          warnings: list = None, point_format: int = None,
+                          point_length: int = None) -> list:
     """Nachkonversions-Validierung. Gibt eine Liste von Fehler-Strings zurueck
     (leer = alles OK). Prueft NUR, repariert nichts:
       - Punktanzahl identisch
@@ -1899,6 +2033,8 @@ def _validate_ln02_target(src_md: dict, dst_md: dict, src_measured: dict = None,
         Konversion nicht zu Fall bringen. Header-Abweichungen werden stattdessen
         nach 'warnings' gemeldet.
       - minor_version / dataformat_id / point_length / header_size / global_encoding
+        (Punktformat und -laenge ueber 'point_format'/'point_length' waehlbar: ohne
+        Farb-Master PF6/30, mit Master PF7/36 - siehe LN02_POINT_FORMAT_RGB)
       - beide CRS-VLRs vorhanden (34735 + 2112), VLR 2112 endet auf Nullbyte
       - CRS aufloesbar: horizontal 2056, vertikal 5728
       - '5729' bzw. 'LHN95' kommen im Ziel-WKT NICHT vor (Kontrolle, dass wirklich
@@ -1944,8 +2080,8 @@ def _validate_ln02_target(src_md: dict, dst_md: dict, src_measured: dict = None,
                 "(fachlich korrekt); die Quelle sollte geprueft werden.")
 
     for field, expected in (("minor_version",   LN02_MINOR_VERSION),
-                            ("dataformat_id",   LN02_POINT_FORMAT),
-                            ("point_length",    LN02_POINT_LENGTH),
+                            ("dataformat_id",   point_format or LN02_POINT_FORMAT),
+                            ("point_length",    point_length or LN02_POINT_LENGTH),
                             ("header_size",     LN02_HEADER_SIZE),
                             ("global_encoding", LN02_GLOBAL_ENCODING)):
         if dst_md.get(field) != expected:
@@ -1981,6 +2117,293 @@ def _validate_ln02_target(src_md: dict, dst_md: dict, src_measured: dict = None,
     return problems
 
 
+def _validate_ln02_rgb(pdal_exe: str, dst_path: str, join_stats: dict) -> list:
+    """Prueft, dass die Farbe beim Join wirklich angekommen ist. Gibt eine Liste von
+    Fehler-Strings zurueck (leer = alles OK).
+
+    Ohne diese Kontrolle wuerde ein fehlgeschlagener Join gruen validieren:
+    Punktanzahl, BBox und Classification waeren auch dann in Ordnung, wenn in den
+    RGB-Feldern nur Nullen stehen - PF7 fuehrt die Felder ja immer. Verglichen wird
+    die beim Join gemessene RGB-Spanne des MASTERS mit der Spanne in der
+    geschriebenen Zieldatei; beide muessen uebereinstimmen."""
+    problems = []
+    src_lo, src_hi = join_stats.get("rgb_min"), join_stats.get("rgb_max")
+
+    if src_hi in (None, 0):
+        problems.append(
+            "Der PF7-Master fuehrt keine Farbwerte (RGB durchgehend 0) - das Ergebnis "
+            "waere eine schwarze Kachel. Fuehren diese Daten wirklich keine Farbe, "
+            "gehoert der Tab [LN02] ohne Master-Ordner gefahren.")
+        return problems
+
+    try:
+        result = subprocess.run(
+            [pdal_exe, "info", "--dimensions", "Red,Green,Blue", "--stats", dst_path],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+        if result.returncode != 0:
+            msg = (result.stderr or result.stdout or "").strip()
+            raise RuntimeError(f"Exit-Code {result.returncode}" + (f": {msg}" if msg else ""))
+        found = {s.get("name"): s for s in
+                 json.loads(result.stdout).get("stats", {}).get("statistic", [])}
+        if not {"Red", "Green", "Blue"} <= set(found):
+            problems.append("Zieldatei fuehrt keine RGB-Dimensionen - Farb-Join wirkungslos.")
+            return problems
+        dst_lo = int(min(found[c].get("minimum", 0) for c in ("Red", "Green", "Blue")))
+        dst_hi = int(max(found[c].get("maximum", 0) for c in ("Red", "Green", "Blue")))
+    except Exception as e:
+        problems.append(f"RGB-Pruefung fehlgeschlagen: {e}")
+        return problems
+
+    if dst_hi == 0:
+        problems.append(
+            f"RGB in der Zieldatei durchgehend 0, im Master aber {src_lo}-{src_hi} - "
+            f"die Farbe ist beim Schreiben verloren gegangen.")
+    elif (dst_lo, dst_hi) != (int(src_lo), int(src_hi)):
+        problems.append(
+            f"RGB-Spanne veraendert: Master {src_lo}-{src_hi}, Ziel {dst_lo}-{dst_hi}.")
+    return problems
+
+
+def _las_header_info(path: str) -> dict:
+    """Liest die fuer den Farb-Join noetigen Header-Felder direkt aus den Bytes.
+
+    Bewusst ohne laspy: das ist im OSGeo4W-Python nicht vorhanden, und der Join
+    braucht ohnehin nur eine Handvoll Felder an fest definierten Offsets (LAS 1.4 R15,
+    Tabelle 3). numpy und struct genuegen - beides ist da, numpy wird im Runner
+    ohnehin schon fuer die Rasterpfade genutzt."""
+    with open(path, "rb") as f:
+        head = f.read(375)
+    if len(head) < 227 or head[:4] != b"LASF":
+        raise ValueError(f"Keine lesbare LAS/LAZ-Datei (Signatur/Header zu kurz): {path}")
+
+    info = {}
+    info["global_encoding"], = struct.unpack_from("<H", head, 6)
+    info["version_major"], info["version_minor"] = head[24], head[25]
+    info["header_size"], info["offset_to_point_data"], info["n_vlr"] = \
+        struct.unpack_from("<HII", head, 94)
+    # Bit 6/7 des Formatbytes markieren LASZIP-Kompression - fuer den Join muss die
+    # Datei unkomprimiert vorliegen (Punktdaten werden direkt als Bytes gelesen).
+    info["compressed"] = bool(head[104] & 0xC0)
+    info["point_format"] = head[104] & 0x3F
+    info["point_length"], = struct.unpack_from("<H", head, 105)
+    count, = struct.unpack_from("<I", head, 107)          # legacy (LAS 1.0-1.3)
+    if info["version_minor"] >= 4 and info["header_size"] >= 375 and len(head) >= 255:
+        count64, = struct.unpack_from("<Q", head, 247)    # LAS 1.4
+        if count64:
+            count = count64
+    info["point_count"] = int(count)
+    info["scales"] = struct.unpack_from("<3d", head, 131)
+    info["offsets"] = struct.unpack_from("<3d", head, 155)
+    (info["maxx"], info["minx"], info["maxy"],
+     info["miny"], info["maxz"], info["minz"]) = struct.unpack_from("<6d", head, 179)
+    return info
+
+
+def _pf7_dtype(np):
+    """Byte-Layout eines PF7-Punktrecords (LAS 1.4 R15, Tabelle 9 + RGB): 36 Byte.
+    PF7 ist PF6 (30 Byte) plus Red/Green/Blue als je uint16."""
+    return np.dtype([
+        ("X", "<i4"), ("Y", "<i4"), ("Z", "<i4"),        #  0, 4, 8
+        ("intensity", "<u2"),                             # 12
+        ("returns", "u1"),                                # 14  Return Number + Anzahl
+        ("flags", "u1"),                                  # 15  Flags + Scanner Channel
+        ("classification", "u1"),                         # 16
+        ("user_data", "u1"),                              # 17
+        ("scan_angle", "<i2"),                            # 18
+        ("point_source_id", "<u2"),                       # 20
+        ("gps_time", "<f8"),                              # 22
+        ("red", "<u2"), ("green", "<u2"), ("blue", "<u2"),  # 30, 32, 34
+    ])
+
+
+def _xyz_dtype(np, point_length: int):
+    """X/Y/Z liegen bei JEDEM Point Data Record Format in den ersten 12 Byte. Die
+    GeoSuite-Ausgabe kann damit unabhaengig von ihrem Punktformat gelesen werden -
+    der Rest des Records interessiert hier nicht."""
+    fields = [("X", "<i4"), ("Y", "<i4"), ("Z", "<i4")]
+    if point_length > 12:
+        fields.append(("_rest", "V%d" % (point_length - 12)))
+    return np.dtype(fields)
+
+
+def _ensure_uncompressed(pdal_exe: str, path: str, run_dir: Path, tag: str) -> tuple:
+    """Gibt (pfad, temp_datei_oder_None) zurueck. Ist die Datei komprimiert (LAZ),
+    wird sie mit PDAL einmal ins Staging entpackt - der Join liest die Punktdaten
+    direkt als Bytes und kann das nur unkomprimiert.
+
+    Unkomprimierte Eingaben werden unveraendert durchgereicht; wer im Tab [LHN95]
+    '.las' waehlt, spart sich diesen Durchlauf (kostet dafuer Plattenplatz)."""
+    info = _las_header_info(path)
+    if not info["compressed"]:
+        return path, None
+
+    out = run_dir / f"unpacked_{tag}_{os.path.splitext(os.path.basename(path))[0]}.las"
+    pipeline_path = run_dir / f"unpack_{tag}_{os.path.splitext(os.path.basename(path))[0]}.json"
+    try:
+        with open(pipeline_path, "w", encoding="utf-8") as f:
+            json.dump({"pipeline": [
+                {"type": "readers.las", "filename": path},
+                {"type": "writers.las", "filename": str(out),
+                 "forward": "all", "compression": "none"},
+            ]}, f)
+        _run_pdal_pipeline(pdal_exe, pipeline_path)
+    finally:
+        try:
+            pipeline_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+    if not os.path.isfile(out):
+        raise RuntimeError(f"Entpacken nach LAS fehlgeschlagen: {path}")
+    return str(out), str(out)
+
+
+def _ln02_join_master(master_path: str, src_path: str, out_path: str,
+                      origin_x: float, origin_y: float) -> dict:
+    """Fuegt den farbfuehrenden PF7-Master und die von GeoSuite nach LN02 reframte
+    Kachel wieder zu einer Datei zusammen: X/Y und alle Attribute (RGB,
+    Classification, Intensity, ...) kommen aus dem MASTER, Z kommt VERBATIM aus der
+    GeoSuite-Ausgabe. Es wird nichts interpoliert, nichts umgerechnet und kein
+    Ersatzmodell gerechnet - jeder Hoehenwert stammt Punkt fuer Punkt aus REFRAME.
+
+    Der Master ist bereits LAS 1.4/PF7 mit Ziel-scale und Ziel-offset (der Tab [LHN95]
+    schreibt ihn so). Das Ergebnis ist deshalb schlicht der Master mit ersetzten
+    Z-Werten - keine Punktformat-Umwandlung, keine Dimensions-Zuordnung. Header und
+    VLR-Block werden unveraendert uebernommen, nur min_z/max_z werden nachgefuehrt.
+
+    Zugeordnet wird ueber den INDEX (Punkt n <-> Punkt n), nicht ueber die Koordinate:
+    bei einer 2.5D-Oberflaeche gibt es an Felswaenden mehrere Punkte mit fast gleichem
+    X/Y, und Z taugt als Schluessel nicht, weil genau Z transformiert wurde. Der Index
+    ist exakt, solange GeoSuite Reihenfolge UND Anzahl erhaelt - beides wird geprueft
+    statt angenommen (Punktanzahl, X/Y punktweise innerhalb LN02_XY_TOLERANCE_M).
+    Eine verschobene Zuordnung faellt damit sofort auf: der Punktabstand liegt bei den
+    ueblichen Ausduennungen um Zehnerpotenzen ueber dieser Toleranz.
+
+    Gelesen wird per numpy.memmap und in Bloecken zu LN02_JOIN_CHUNK Punkten, der
+    Speicherbedarf waechst also nicht mit der Kachelgroesse.
+
+    Beide Eingaben muessen unkomprimiert sein (siehe _ensure_uncompressed).
+
+    Rueckgabe: dict mit den unterwegs gemessenen Kennzahlen (count, rgb_min/rgb_max,
+    class_min/class_max, gps_min/gps_max, max_dx/max_dy, measured).
+    """
+    import numpy as np
+
+    m = _las_header_info(master_path)
+    g = _las_header_info(src_path)
+
+    if m["compressed"] or g["compressed"]:
+        raise ValueError("Join braucht unkomprimierte LAS-Dateien (siehe _ensure_uncompressed).")
+    if m["point_format"] != MASTER_POINT_FORMAT:
+        raise ValueError(
+            f"Master hat Punktformat PF{m['point_format']}, erwartet "
+            f"PF{MASTER_POINT_FORMAT} - er stammt nicht aus dem Tab [LHN95].")
+
+    dt_master = _pf7_dtype(np)
+    if m["point_length"] != dt_master.itemsize:
+        raise ValueError(
+            f"Master hat point_length {m['point_length']}, erwartet {dt_master.itemsize} "
+            f"(PF{MASTER_POINT_FORMAT}).")
+    if g["point_length"] < 12:
+        raise ValueError(f"GeoSuite-Ausgabe hat unplausible point_length {g['point_length']}.")
+
+    n = m["point_count"]
+    if n != g["point_count"]:
+        raise ValueError(
+            f"Punktanzahl unterschiedlich: Master {n}, GeoSuite-Ausgabe "
+            f"{g['point_count']}. Der Index-Join waere damit nicht zuordenbar - GeoSuite "
+            f"hat Punkte verloren oder hinzugefuegt, oder die beiden Dateien gehoeren "
+            f"nicht zusammen.")
+    if n == 0:
+        raise ValueError("Master enthaelt keine Punkte.")
+
+    # Der Master muss auf dem Zielgitter liegen - sonst waeren die unveraendert
+    # uebernommenen X/Y-Rohwerte falsch interpretiert.
+    if not (abs(m["offsets"][0] - origin_x) < 1e-6 and abs(m["offsets"][1] - origin_y) < 1e-6
+            and abs(m["offsets"][2]) < 1e-6
+            and all(abs(s - LN02_SCALE) < 1e-12 for s in m["scales"])):
+        raise ValueError(
+            f"Master liegt nicht auf dem Zielgitter (scale {m['scales']}, offset "
+            f"{m['offsets']}), erwartet scale {LN02_SCALE} und offset "
+            f"({origin_x}, {origin_y}, 0). Master aus einer aelteren Version?")
+
+    stats = {"count": 0, "rgb_min": None, "rgb_max": None,
+             "class_min": None, "class_max": None, "max_dx": 0.0, "max_dy": 0.0,
+             "gps_min": None, "gps_max": None}
+    measured = {}
+
+    def _track(key, lo, hi):
+        k_lo, k_hi = f"min{key}", f"max{key}"
+        measured[k_lo] = lo if k_lo not in measured else min(measured[k_lo], lo)
+        measured[k_hi] = hi if k_hi not in measured else max(measured[k_hi], hi)
+
+    mm = np.memmap(master_path, dtype=dt_master, mode="r",
+                   offset=m["offset_to_point_data"], shape=(n,))
+    gm = np.memmap(src_path, dtype=_xyz_dtype(np, g["point_length"]), mode="r",
+                   offset=g["offset_to_point_data"], shape=(n,))
+    try:
+        with open(out_path, "wb") as fo:
+            # Header + VLR-Block des Masters unveraendert uebernehmen: er traegt schon
+            # LAS 1.4/PF7 mit Ziel-scale und Ziel-offset. min_z/max_z werden unten
+            # nachgefuehrt, alles andere bleibt wie es ist.
+            with open(master_path, "rb") as fm:
+                fo.write(fm.read(m["offset_to_point_data"]))
+
+            for i in range(0, n, LN02_JOIN_CHUNK):
+                j = min(i + LN02_JOIN_CHUNK, n)
+                rec = np.array(mm[i:j])            # Kopie - memmap ist schreibgeschuetzt
+
+                m_x = rec["X"].astype(np.float64) * m["scales"][0] + m["offsets"][0]
+                m_y = rec["Y"].astype(np.float64) * m["scales"][1] + m["offsets"][1]
+                g_x = gm["X"][i:j].astype(np.float64) * g["scales"][0] + g["offsets"][0]
+                g_y = gm["Y"][i:j].astype(np.float64) * g["scales"][1] + g["offsets"][1]
+                g_z = gm["Z"][i:j].astype(np.float64) * g["scales"][2] + g["offsets"][2]
+
+                # --- Kontrolle: ist Punkt n wirklich Punkt n? ---
+                dx = float(np.max(np.abs(m_x - g_x)))
+                dy = float(np.max(np.abs(m_y - g_y)))
+                stats["max_dx"] = max(stats["max_dx"], dx)
+                stats["max_dy"] = max(stats["max_dy"], dy)
+                if dx > LN02_XY_TOLERANCE_M or dy > LN02_XY_TOLERANCE_M:
+                    raise ValueError(
+                        f"X/Y von Master und GeoSuite-Ausgabe stimmen nicht ueberein "
+                        f"(max. Abweichung X {dx:.4f} m, Y {dy:.4f} m, Toleranz "
+                        f"{LN02_XY_TOLERANCE_M} m). Die Punktreihenfolge wurde von "
+                        f"GeoSuite veraendert - der Index-Join ist damit ungueltig und "
+                        f"wuerde Farben auf die falschen Punkte schreiben.")
+
+                # NUR Z wird ersetzt - X/Y und alle Attribute bleiben Master-Bytes.
+                rec["Z"] = np.round((g_z - m["offsets"][2]) / m["scales"][2]).astype(np.int32)
+                fo.write(rec.tobytes())
+
+                # Kennzahlen im selben Durchlauf mitnehmen - ein zweiter kompletter
+                # Lesedurchlauf nur fuer die Statistik waere reine Verschwendung.
+                rgb_lo = int(min(rec["red"].min(), rec["green"].min(), rec["blue"].min()))
+                rgb_hi = int(max(rec["red"].max(), rec["green"].max(), rec["blue"].max()))
+                cls_lo, cls_hi = int(rec["classification"].min()), int(rec["classification"].max())
+                gps_lo, gps_hi = float(rec["gps_time"].min()), float(rec["gps_time"].max())
+                stats["rgb_min"] = rgb_lo if stats["rgb_min"] is None else min(stats["rgb_min"], rgb_lo)
+                stats["rgb_max"] = rgb_hi if stats["rgb_max"] is None else max(stats["rgb_max"], rgb_hi)
+                stats["class_min"] = cls_lo if stats["class_min"] is None else min(stats["class_min"], cls_lo)
+                stats["class_max"] = cls_hi if stats["class_max"] is None else max(stats["class_max"], cls_hi)
+                stats["gps_min"] = gps_lo if stats["gps_min"] is None else min(stats["gps_min"], gps_lo)
+                stats["gps_max"] = gps_hi if stats["gps_max"] is None else max(stats["gps_max"], gps_hi)
+                _track("x", float(g_x.min()), float(g_x.max()))
+                _track("y", float(g_y.min()), float(g_y.max()))
+                _track("z", float(g_z.min()), float(g_z.max()))
+                stats["count"] += (j - i)
+    finally:
+        del mm, gm  # memmaps schliessen, sonst bleibt die Datei unter Windows gesperrt
+
+    # min_z/max_z im uebernommenen Header nachfuehren - die Z-Werte sind jetzt LN02.
+    with open(out_path, "r+b") as fo:
+        fo.seek(211)
+        fo.write(struct.pack("<d", measured["maxz"]))
+        fo.write(struct.pack("<d", measured["minz"]))
+
+    stats["measured"] = measured
+    return stats
+
+
 def _ln02_tile_worker(args) -> tuple:
     """Konvertiert EINE bereits nach LN02 reframte 1km-Kachel in die GDWH-taugliche
     LAS-1.4-Form. Laeuft in einem eigenen Prozess (Gegenstueck zu _raster_cell_worker).
@@ -1990,18 +2413,31 @@ def _ln02_tile_worker(args) -> tuple:
     Zieldatei unangetastet und die Temp-Datei wird verworfen. Die Quelle wird NIE
     veraendert.
 
+    Zwei Betriebsarten, gesteuert ueber 'master_path':
+      - ohne Master: unveraendert wie bisher, reine PDAL-Requantisierung nach
+        PF{LN02_POINT_FORMAT} ohne Farbe.
+      - mit Master : Farb-Join (siehe _ln02_join_master) nach PF{LN02_POINT_FORMAT_RGB}.
+        X/Y und alle Attribute kommen aus dem Master, Z verbatim aus dieser
+        GeoSuite-Ausgabe.
+
     Rueckgabe: (status, name, fehler, warnungen) mit status in
     'written' | 'copied' | 'error'."""
-    (src_path, dst_path, pdal_exe, run_dir_str, origin_x, origin_y) = args
+    (src_path, dst_path, pdal_exe, run_dir_str, origin_x, origin_y, master_path) = args
 
     src_name = os.path.basename(src_path)
     dst_name = os.path.basename(dst_path)
+    with_color = bool(master_path)
+    tgt_format = LN02_POINT_FORMAT_RGB if with_color else LN02_POINT_FORMAT
+    tgt_length = LN02_POINT_LENGTH_RGB if with_color else LN02_POINT_LENGTH
     warnings = []
     run_dir = Path(run_dir_str)
     stem = os.path.splitext(dst_name)[0]
     pipeline_path = run_dir / f"pipeline_ln02_{stem}.json"
     meta_path = run_dir / f"pipemeta_ln02_{stem}.json"
     tmp_path = None
+    # Zwischendateien des Farb-Joins im Staging (entpackte Eingaben, zusammengefuegte
+    # Datei) - werden am Ende immer aufgeraeumt, auch im Fehlerfall.
+    side_temps = []
 
     try:
         try:
@@ -2018,8 +2454,11 @@ def _ln02_tile_worker(args) -> tuple:
         # pauschal zu warnen.
         src_gps_bit = int(src_md.get("global_encoding", 0) or 0) & 0x01
 
+        # Die Abkuerzung "schon migriert, nur kopieren" gilt NUR ohne Farb-Join: mit
+        # Master muss die Farbe in jedem Fall dazu, eine unveraenderte Kopie waere
+        # farblos. (Praktisch greift sie dort ohnehin nie - GeoSuite liefert PF1.)
         same_ext = os.path.splitext(src_path)[1].lower() == os.path.splitext(dst_path)[1].lower()
-        if same_ext and _ln02_is_already_migrated(src_md):
+        if not with_color and same_ext and _ln02_is_already_migrated(src_md):
             shutil.copy2(src_path, dst_path)
             return ("copied", dst_name, None, warnings)
 
@@ -2028,11 +2467,35 @@ def _ln02_tile_worker(args) -> tuple:
         os.close(tmp_fd)
         os.remove(tmp_path)  # writers.las soll die Datei selbst anlegen
 
+        join_stats = None
+        pipeline_src = src_path
+        if with_color:
+            # Farb-Join: X/Y und alle Attribute aus dem Master, Z verbatim aus der
+            # GeoSuite-Ausgabe. Der Join liest die Punktdaten direkt als Bytes und
+            # braucht beide Eingaben deshalb unkomprimiert; er liefert die Kennzahlen
+            # (Classification, GpsTime, gemessene Extents, RGB-Spanne) im selben
+            # Durchlauf mit - ein separater filters.stats-Lauf entfaellt.
+            master_las, tmp_master = _ensure_uncompressed(pdal_exe, master_path, run_dir, "m")
+            src_las, tmp_src = _ensure_uncompressed(pdal_exe, src_path, run_dir, "g")
+            side_temps += [p for p in (tmp_master, tmp_src) if p]
+
+            joined_path = str(run_dir / f"joined_{stem}.las")
+            side_temps.append(joined_path)
+            join_stats = _ln02_join_master(master_las, src_las, joined_path,
+                                            origin_x, origin_y)
+            src_class = (join_stats["class_min"], join_stats["class_max"])
+            src_measured = join_stats.get("measured") or None
+            gps_min, gps_max = join_stats.get("gps_min"), join_stats.get("gps_max")
+            pipeline_src = joined_path
+
+        # Die autoritative Ausgabe schreibt in BEIDEN Faellen PDAL - gleiche
+        # Writer-Konfiguration, nur das Punktformat unterscheidet sich. Beim Farb-Join
+        # ist die Eingabe die zusammengefuegte Datei, sonst die GeoSuite-Kachel direkt.
         writer = {
             "type": "writers.las",
             "filename": tmp_path,
             "minor_version": LN02_MINOR_VERSION,
-            "dataformat_id": LN02_POINT_FORMAT,
+            "dataformat_id": tgt_format,
             "scale_x": LN02_SCALE, "scale_y": LN02_SCALE, "scale_z": LN02_SCALE,
             "offset_x": origin_x, "offset_y": origin_y, "offset_z": 0,
             "global_encoding": LN02_GLOBAL_ENCODING,
@@ -2040,31 +2503,34 @@ def _ln02_tile_worker(args) -> tuple:
         if dst_name.lower().endswith(".laz"):
             writer["compression"] = "laszip"
 
-        # 'filters.stats' haengt sich als reiner Durchlauf-Filter (veraendert keine
-        # Punkte) an den ohnehin noetigen Lesedurchlauf und liefert die
-        # Classification-Spanne der QUELLE gratis mit - ohne sie ein zweites Mal
-        # komplett einzulesen.
-        stages = [
-            {"type": "readers.las", "filename": src_path},
+        stages = [{"type": "readers.las", "filename": pipeline_src}]
+        if not with_color:
+            # 'filters.stats' haengt sich als reiner Durchlauf-Filter (veraendert keine
+            # Punkte) an den ohnehin noetigen Lesedurchlauf und liefert die
+            # Classification-Spanne der QUELLE gratis mit - ohne sie ein zweites Mal
+            # komplett einzulesen.
             # GpsTime kostet hier nichts extra und entscheidet unten, ob der
             # GPS-Time-Typ ueberhaupt eine Aussage ueber die Daten macht.
             # X/Y/Z liefern im selben Durchlauf die tatsaechlichen Extents der
             # Quellpunkte - Referenz fuer die BBox-Validierung, weil die
             # Header-BBox der Quelle dafuer nicht immer verlaesslich ist.
-            {"type": "filters.stats", "dimensions": "Classification,GpsTime,X,Y,Z"},
-            writer,
-        ]
+            stages.append({"type": "filters.stats",
+                           "dimensions": "Classification,GpsTime,X,Y,Z"})
+        stages.append(writer)
+
         with open(pipeline_path, "w", encoding="utf-8") as f:
             json.dump({"pipeline": stages}, f)
         pipe_md = _run_pdal_pipeline(pdal_exe, pipeline_path, meta_path)
 
-        src_class = _stat_range_from_pipeline_metadata(pipe_md, "Classification")
-        if src_class == (None, None):
-            src_class = _pdal_classification_range(pdal_exe, src_path)
+        if not with_color:
+            src_class = _stat_range_from_pipeline_metadata(pipe_md, "Classification")
+            if src_class == (None, None):
+                src_class = _pdal_classification_range(pdal_exe, src_path)
+            src_measured = _stats_bbox_from_pipeline_metadata(pipe_md)
+            gps_min, gps_max = _stat_range_from_pipeline_metadata(pipe_md, "GpsTime")
 
         # GPS-Time-Typ: nur melden, wenn es die Daten wirklich betrifft.
         if not src_gps_bit:
-            gps_min, gps_max = _stat_range_from_pipeline_metadata(pipe_md, "GpsTime")
             if gps_min is None:
                 warnings.append(
                     f"{src_name}: global_encoding-Bit 0 (GPS-Time-Typ) ist in der Quelle "
@@ -2084,16 +2550,21 @@ def _ln02_tile_worker(args) -> tuple:
 
         n_stripped = _inject_reference_vlrs(tmp_path)
         if n_stripped:
-            warnings.append(f"{src_name}: {n_stripped} von PDAL aus der Quelle uebernommene(r) "
+            warnings.append(f"{src_name}: {n_stripped} aus der Quelle uebernommene(r) "
                              f"'LASF_Projection'-VLR(s) entfernt (nicht autoritativ) - durch die "
                              f"LV95/LN02-Referenz-VLRs ersetzt.")
-
         dst_md = _pdal_info_metadata(pdal_exe, tmp_path)
         val_warnings = []
-        problems = _validate_ln02_target(src_md, dst_md,
-                                          _stats_bbox_from_pipeline_metadata(pipe_md),
-                                          val_warnings)
+        problems = _validate_ln02_target(src_md, dst_md, src_measured, val_warnings,
+                                          point_format=tgt_format,
+                                          point_length=tgt_length)
         warnings.extend(f"{src_name}: {w}" for w in val_warnings)
+
+        # Farbkontrolle: ohne sie wuerde ein fehlgeschlagener Join gruen validieren -
+        # Punktanzahl, BBox und Classification waeren auch dann in Ordnung, wenn in
+        # den RGB-Feldern nur Nullen stehen.
+        if with_color:
+            problems.extend(_validate_ln02_rgb(pdal_exe, tmp_path, join_stats))
 
         # Classification-Kontrolle: PF1/PF3 packen die Klasse als 5-Bit-Wert zusammen
         # mit Flag-Bits in ein Byte, PF6 trennt beides - genau hier koennte die
@@ -2122,6 +2593,11 @@ def _ln02_tile_worker(args) -> tuple:
                 os.remove(tmp_path)
             except OSError:
                 pass
+        for p in side_temps:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
         for p in (pipeline_path, meta_path):
             try:
                 p.unlink(missing_ok=True)
@@ -2139,6 +2615,9 @@ def _process_las_ln02(cfg: dict) -> None:
     input_dir         = cfg["input_dir"]
     output_dir_las    = cfg["output_dir_las"]
     output_dir_raster = cfg.get("output_dir_raster")
+    # Optional: Ordner mit den PF7-Mastern aus dem Tab [LHN95]. Leer = wie bisher,
+    # PF6 ohne Farbe. Gesetzt = Farb-Join, Ergebnis PF7 mit RGB.
+    master_dir        = (cfg.get("master_dir") or "").strip() or None
     out_format        = cfg.get("out_format", "laz")
     clip_shape_path   = cfg.get("clip_shape_path")
     staging_dir       = cfg["staging_dir"]
@@ -2158,6 +2637,18 @@ def _process_las_ln02(cfg: dict) -> None:
         # Frueh pruefen: sonst faellt das erst nach dem kompletten Metadaten-Scan auf.
         raise FileNotFoundError(
             f"AOI/Footprint-Shape fuer die Raster-Maskierung nicht gefunden: {clip_shape_path}")
+
+    if master_dir:
+        if not os.path.isdir(master_dir):
+            raise FileNotFoundError(
+                f"Master-Ordner (PF7 mit RGB) nicht gefunden: {master_dir}")
+        try:
+            import numpy  # noqa: F401  - der Join arbeitet auf numpy-Arrays
+        except ImportError as e:
+            raise RuntimeError(
+                f"Der Farb-Join braucht numpy, das hier nicht verfuegbar ist ({e}). "
+                f"Entweder im OSGeo4W-Python bereitstellen oder den Master-Ordner leer "
+                f"lassen - dann entsteht wie bisher PF{LN02_POINT_FORMAT} ohne Farbe.")
 
     gdal.UseExceptions()
     ogr.UseExceptions()
@@ -2220,6 +2711,69 @@ def _process_las_ln02(cfg: dict) -> None:
                           "Ausgabedateien wuerden sich gegenseitig ueberschreiben:\n  - "
                           + "\n  - ".join(duplicates))
 
+    # --- Schritt 1b: Master-Kacheln zuordnen (nur mit Farb-Join) ---
+    # Gepaart wird ueber die KACHELKOORDINATEN, nicht ueber den Dateinamen: die
+    # GeoSuite-Ausgabe traegt '_LV95_LN02' oder noch '_LV95_LHN95', der Master immer
+    # '_LV95_LHN95' - die Stems sind also verschieden, die Zelle ist es nicht.
+    # Fehlt ein Master, ist das ein harter Fehler: eine still farblos gebliebene
+    # Kachel wuerde erst in der GDWH-Lieferung auffallen.
+    masters = {}
+    if master_dir:
+        master_files = sorted(glob.glob(os.path.join(master_dir, "*.las")) +
+                              glob.glob(os.path.join(master_dir, "*.laz")))
+        if not master_files:
+            raise FileNotFoundError(
+                f"Keine .las/.laz Master-Kacheln gefunden in: {master_dir}")
+        master_dups = []
+        for m in master_files:
+            try:
+                cell = _parse_tile_origin(os.path.basename(m))
+            except ValueError:
+                continue  # Fremddateien im Master-Ordner still ignorieren
+            if cell in masters:
+                master_dups.append(f"{cell[0]}_{cell[1]}: "
+                                   f"{os.path.basename(masters[cell])} / {os.path.basename(m)}")
+            else:
+                masters[cell] = m
+        if master_dups:
+            raise ValueError("Mehrere Master-Kacheln zeigen auf dieselbe Gitterzelle - die "
+                              "Zuordnung waere nicht eindeutig:\n  - " + "\n  - ".join(master_dups))
+
+        missing = [f"{origins[t][0]}_{origins[t][1]} (zu {os.path.basename(t)})"
+                   for t in tiles if origins[t] not in masters]
+        if missing:
+            raise FileNotFoundError(
+                f"Zu {len(missing)} von {len(tiles)} Input-Kachel(n) gibt es keinen "
+                f"PF7-Master in {master_dir}:\n  - " + "\n  - ".join(missing)
+                + "\n\nOhne Master koennte die Farbe nicht zurueckgeschrieben werden. "
+                  "Entweder den richtigen Master-Ordner waehlen (Unterordner "
+                  f"'{MASTER_SUBDIR}' im Output-Ordner des Tabs [LHN95]) oder das Feld "
+                  "leer lassen - dann entsteht wie bisher PF"
+                f"{LN02_POINT_FORMAT} ohne Farbe.")
+        unused = len(masters) - len(tiles)
+        if unused > 0:
+            _log(f"  HINWEIS: {unused} Master-Kachel(n) ohne passende Input-Kachel - "
+                 f"werden nicht verwendet.")
+
+        # Stichprobe auf der ersten Master-Kachel: ein falsch gewaehlter Ordner (z.B.
+        # der GeoSuite-Output statt '_master_PF7') soll hier auffallen, nicht erst
+        # nach dem Metadaten-Scan bei jeder einzelnen Kachel.
+        sample_master = masters[origins[tiles[0]]]
+        try:
+            m0 = _las_header_info(sample_master)
+        except Exception as e:
+            raise RuntimeError(f"Master-Kachel nicht lesbar ({sample_master}): {e}")
+        if m0["point_format"] != MASTER_POINT_FORMAT:
+            raise ValueError(
+                f"Master-Kacheln sind PF{m0['point_format']}, erwartet "
+                f"PF{MASTER_POINT_FORMAT} mit RGB ({os.path.basename(sample_master)}). "
+                f"Zeigt der Master-Ordner wirklich auf '{MASTER_SUBDIR}' im Output-Ordner "
+                f"des Tabs [LHN95]?")
+        if m0["compressed"]:
+            _log(f"  HINWEIS: Die Master sind komprimiert (.laz). Fuer den Join wird jede "
+                 f"Kachel einmal ins Staging entpackt - mit '.las' im Tab [LHN95] entfaellt "
+                 f"dieser Durchlauf (dafuer braucht der Master mehr Plattenplatz).")
+
     # --- Schritt 2: Bounding Boxes parallel einlesen (Gesamt-Extent + Raster-Zellen) ---
     _log("Lese Metadaten (Bounding Box) aller Kacheln...")
     tile_bboxes = []
@@ -2246,10 +2800,21 @@ def _process_las_ln02(cfg: dict) -> None:
     all_maxy = max(b[4] for b in tile_bboxes)
     _log(f"  Gesamt-Extent Input: {all_minx:.1f}, {all_miny:.1f} - {all_maxx:.1f}, {all_maxy:.1f}")
 
-    _log(f"\nZielformat          : LAS 1.4 / PF{LN02_POINT_FORMAT}, global_encoding "
+    tgt_fmt = LN02_POINT_FORMAT_RGB if master_dir else LN02_POINT_FORMAT
+    _log(f"\nZielformat          : LAS 1.4 / PF{tgt_fmt}, global_encoding "
          f"{LN02_GLOBAL_ENCODING}, scale {LN02_SCALE}, Offset = Kachelursprung")
     _log(f"CRS-Tag             : LV95 + LN02 (EPSG:2056+5728), byte-exakte "
          f"Referenz-VLRs 34735 + 2112")
+    if master_dir:
+        _log(f"Farbe (RGB)         : AKTIV - Join mit den PF7-Mastern aus")
+        _log(f"                      {master_dir}")
+        _log(f"                      X/Y und alle Attribute aus dem Master, Z verbatim aus "
+             f"der GeoSuite-Ausgabe.")
+        _log(f"                      Kontrolle je Kachel: Punktanzahl, X/Y punktweise "
+             f"(Toleranz {LN02_XY_TOLERANCE_M} m), RGB-Spanne.")
+    else:
+        _log(f"Farbe (RGB)         : inaktiv (kein Master-Ordner) - PF{LN02_POINT_FORMAT} "
+             f"ohne Farbwerte")
     _log(f"Punktwolken-Format  : .{out_format}")
     _log(f"Raster erstellen    : "
          f"{'AKTIV (GSD ' + format(gsd_raster, 'g') + ' m)' if create_raster else 'inaktiv'}")
@@ -2287,7 +2852,8 @@ def _process_las_ln02(cfg: dict) -> None:
         thin_token = _parse_thin_token(os.path.basename(t))
         stem = f"{jahr}_{area}_TIN_{thin_token}raw_{cell}_LV95_LN02"
         job = {"src": t, "cell": cell, "stem": stem,
-               "origin": (easting_km * 1000.0, northing_km * 1000.0)}
+               "origin": (easting_km * 1000.0, northing_km * 1000.0),
+               "master": masters.get((easting_km, northing_km))}
         if create_raster:
             # Nominalen 1km-Rahmen auf das globale, gesnappte GSD-Raster legen, damit
             # sich die Zell-Raster luecken- und ueberlappungsfrei mosaikieren lassen.
@@ -2318,7 +2884,8 @@ def _process_las_ln02(cfg: dict) -> None:
     cell_workers = {"ln02": _ln02_tile_worker, "dsm": _raster_cell_worker}
     cell_tasks = [("ln02", job["stem"],
                    (job["src"], str(Path(output_dir_las) / f"{job['stem']}.{out_format}"),
-                    pdal_exe, str(run_dir), job["origin"][0], job["origin"][1]))
+                    pdal_exe, str(run_dir), job["origin"][0], job["origin"][1],
+                    job["master"]))
                   for job in jobs]
     if create_raster:
         cell_tasks += [("dsm", job["cell"],
