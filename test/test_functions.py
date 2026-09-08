@@ -1162,3 +1162,34 @@ def test_ln02_worker_with_master_produces_pf7(tmp_path, monkeypatch):
     # Die Farbe ist wirklich im Ergebnis
     info = runner_mod._las_header_info(str(dst_path))
     assert info["point_format"] == 7 and info["point_count"] == 5
+
+
+def test_ln02_join_failures_are_not_retried(tmp_path, monkeypatch):
+    """Die Join-Pruefungen sind deterministisch - eine serielle Wiederholung liefert
+    garantiert denselben Fehler und kostet nur einen weiteren kompletten Durchlauf
+    pro Kachel. Der Worker muss das als 'error_final' melden."""
+    import shutil as _shutil
+    runner_mod = _runner()
+
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    pair = tmp_path / "pair"
+    pair.mkdir()
+
+    master, geo, ox, oy, *_ = _write_join_pair(pair, shuffle=True)
+    src_path = tmp_path / "2026_G_TIN_raw_2713_1206_LV95_LN02.las"
+    _shutil.copy2(geo, src_path)
+
+    monkeypatch.setattr(runner_mod, "_pdal_info_metadata",
+                        lambda exe, path: _ln02_target_metadata())
+
+    status, _name, err, _w = runner_mod._ln02_tile_worker(
+        (str(src_path), str(out_dir / "z.laz"), "pdal.exe", str(staging), ox, oy, master))
+
+    assert status == "error_final", "deterministischer Fehler darf nicht wiederholt werden"
+    assert "Punktreihenfolge" in err
+    # Kein halbfertiges Produkt, kein Muell im Staging
+    assert not (out_dir / "z.laz").exists()
+    assert not list(staging.glob("joined_*"))
