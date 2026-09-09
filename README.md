@@ -10,7 +10,8 @@ Struktur und Styling analog zu `topo-COGTIFFconverter`.
 python GUI_DMCdataConverter.py
 ```
 
-<img width="635" height="764" alt="image" src="https://github.com/user-attachments/assets/1cac941f-ceaf-44b9-bade-fc79a711d6c9" />
+<img width="855" height="1386" alt="image" src="https://github.com/user-attachments/assets/1118d9c9-4098-4e85-a1af-1316d6fb9918" />
+
 
 
 Beim ersten Start erkennt das GUI automatisch die OSGeo4W/QGIS-Installation. Der Pfad kann
