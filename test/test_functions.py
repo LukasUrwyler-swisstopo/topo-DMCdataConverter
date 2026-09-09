@@ -153,9 +153,11 @@ def test_ln02_action_available():
     for name in ("_process_las_ln02", "_ln02_tile_worker", "_inject_reference_vlrs",
                  "_parse_tile_origin", "_validate_ln02_target", "_resolve_crs_epsg"):
         assert callable(getattr(runner_mod, name)), name
-    # Zielwerte identisch zu SB_DSM_PUNKTWOLKE
+    # Zielwerte wie SB_DSM_PUNKTWOLKE - bis auf das Punktformat: PF7 statt PF6,
+    # damit die Farbe der DMC-Daten im GDWH-Produkt erhalten bleibt.
     assert (runner_mod.LN02_MINOR_VERSION, runner_mod.LN02_POINT_FORMAT,
-            runner_mod.LN02_GLOBAL_ENCODING, runner_mod.LN02_SCALE) == (4, 6, 17, 0.01)
+            runner_mod.LN02_GLOBAL_ENCODING, runner_mod.LN02_SCALE) == (4, 7, 17, 0.01)
+    assert runner_mod.LN02_POINT_LENGTH == 36
     assert runner_mod.LAS_LN02_SRS == "EPSG:2056+5728"
 
 
@@ -231,7 +233,7 @@ def _ln02_target_metadata(**overrides):
     md = {
         "count": 100, "minx": 2713000.0, "maxx": 2713999.99,
         "miny": 1206000.0, "maxy": 1206999.99, "minz": 1000.0, "maxz": 1100.0,
-        "minor_version": 4, "dataformat_id": 6, "point_length": 30,
+        "minor_version": 4, "dataformat_id": 7, "point_length": 36,
         "header_size": 375, "global_encoding": 17,
         "vlr_0": {"user_id": "LASF_Projection", "record_id": 34735, "data": ""},
         "vlr_1": {"user_id": "LASF_Projection", "record_id": 2112,
@@ -316,7 +318,7 @@ def test_ln02_stats_bbox_from_pipeline_metadata():
 
 
 def test_ln02_tile_worker_writer_options(tmp_path, monkeypatch):
-    """Die Schreib-Pipeline muss exakt die GDWH-Zielwerte setzen: LAS 1.4/PF6,
+    """Die Schreib-Pipeline muss exakt die GDWH-Zielwerte setzen: LAS 1.4/PF7,
     scale 0.01, Offset = Kachelursprung, global_encoding 17 - und bei .laz
     zusaetzlich LASzip-Kompression."""
     import json
@@ -347,8 +349,7 @@ def test_ln02_tile_worker_writer_options(tmp_path, monkeypatch):
                          else _ln02_target_metadata())
 
     status, name, err, warnings = runner_mod._ln02_tile_worker(
-        (str(src_path), str(dst_path), "pdal.exe", str(tmp_path), 2713000.0, 1206000.0,
-         None))
+        (str(src_path), str(dst_path), "pdal.exe", str(tmp_path), 2713000.0, 1206000.0))
 
     assert (status, err) == ("written", None)
     assert name == dst_path.name
@@ -358,7 +359,7 @@ def test_ln02_tile_worker_writer_options(tmp_path, monkeypatch):
     assert types == ["readers.las", "filters.stats", "writers.las"]
     writer = captured["stages"][-1]
     assert writer["minor_version"] == 4
-    assert writer["dataformat_id"] == 6
+    assert writer["dataformat_id"] == 7
     assert writer["global_encoding"] == 17
     assert (writer["scale_x"], writer["scale_y"], writer["scale_z"]) == (0.01, 0.01, 0.01)
     assert (writer["offset_x"], writer["offset_y"], writer["offset_z"]) == (2713000.0, 1206000.0, 0)
@@ -383,7 +384,7 @@ def test_ln02_tile_worker_rejects_points_outside_frame(tmp_path, monkeypatch):
 
     status, _name, err, _w = runner_mod._ln02_tile_worker(
         (str(tmp_path / "a.las"), str(dst_path), "pdal.exe", str(tmp_path),
-         2713000.0, 1206000.0, None))
+         2713000.0, 1206000.0))
 
     assert status == "error"
     assert "Kachelrahmen" in err
@@ -597,12 +598,11 @@ def test_prepare_hillshade_values(tmp_path):
     assert runner_mod._prepare_hillshade_values(path) == (0, 0)
 
 
-def test_las_tile_writer_is_geosuite_readable(tmp_path):
+def test_las_tile_writer_keeps_colour_for_geosuite(tmp_path):
     """Die Punktwolken-Tiles aus dem Tab [LHN95] sind die EINGABE fuer den
-    GeoSuite/REFRAME-Batch. Ohne explizite Angabe schreibt PDAL 2.8.3 LAS 1.4 / PF7
-    (nachgemessen), was GeoSuite mit "unknown or unsupported format" ablehnt -
-    geschrieben werden muss LAS 1.2 / PF1, wie in der etablierten
-    SB_DSM_PUNKTWOLKE-Lieferkette."""
+    GeoSuite/REFRAME-Batch und zugleich der Traeger der Farbe. Geschrieben wird
+    deshalb explizit LAS 1.4 / PF7 (= PF6 + RGB) - GeoSuite liest das seit dem
+    LAS-1.4-Update und reicht die Farbwerte durch."""
     import json
 
     runner_mod = _runner()
@@ -616,42 +616,46 @@ def test_las_tile_writer_is_geosuite_readable(tmp_path):
 
     runner_mod._run_pdal_pipeline = fake_run
     runner_mod._pdal_info_metadata = lambda exe, path: {
-        "count": 42, "minor_version": 2, "dataformat_id": 1}
+        "count": 42, "minor_version": 4, "dataformat_id": 7}
 
     job = {"stem": out_file.stem, "cell_bounds": (2713000.0, 1206000.0, 2714000.0, 1207000.0),
            "tiles": [os.path.join("X:", "in", "a.laz")]}
     args = (job, str(tmp_path), str(tmp_path), "pdal.exe", "POLYGON((0 0,1 0,1 1,0 0))",
-            None, "las", 1, None)
+            None, "las", 1)
     status, _name, err = runner_mod._las_cell_worker(args)
 
     assert (status, err) == ("written", None)
     writer = captured["stages"][-1]
     assert writer["type"] == "writers.las"
-    assert writer["minor_version"] == 2          # LAS 1.2
-    assert writer["dataformat_id"] == 1          # PF1 - NICHT PDALs Default 3
+    assert writer["minor_version"] == 4          # LAS 1.4
+    assert writer["dataformat_id"] == 7          # PF7 - PF6 + RGB
     assert writer["a_srs"] == "EPSG:2056"        # nur horizontal, kein VerticalCSTypeGeoKey
     assert writer["scale_x"] == writer["scale_y"] == writer["scale_z"] == 0.01
+    # Offset = Kachelursprung aus dem DATEINAMEN - dasselbe Gitter wie im Tab [LN02],
+    # die dortige Requantisierung verschiebt dann keine Koordinaten.
+    assert (writer["offset_x"], writer["offset_y"]) == (2713000.0, 1206000.0)
     # Der Hoehenbezug darf im Header NICHT getaggt sein (REFRAME bekommt ihn aus
     # der Batch-Konfiguration; den autoritativen LN02-Tag setzt erst Tab [LN02]).
     assert "5729" not in writer["a_srs"] and "5728" not in writer["a_srs"]
-    # GPS-Time-Typ wird aus der Quelle uebernommen, nicht erfunden; Bit 4 (WKT) gibt es
-    # erst ab LAS 1.4 und darf hier nicht gesetzt sein.
-    assert writer["global_encoding"] == 1
+    # Bit 4 (WKT) gehoert bei LAS 1.4 mit PF >= 6 gesetzt, Bit 0 kommt aus der Quelle.
+    assert writer["global_encoding"] == 0x11
 
-    # Kontrolle statt Annahme: schreibt PDAL wider Erwarten doch LAS 1.4/PF7, darf die
-    # Kachel nicht im Output-Ordner liegen bleiben - sie waere fuer REFRAME unbrauchbar.
+    # Kontrolle statt Annahme: schreibt PDAL wider Erwarten ein anderes Format (z.B.
+    # das frueher noetige LAS 1.2/PF1 ohne Farbfelder), darf die Kachel nicht im
+    # Output-Ordner liegen bleiben.
     runner_mod._pdal_info_metadata = lambda exe, path: {
-        "count": 42, "minor_version": 4, "dataformat_id": 7}
+        "count": 42, "minor_version": 2, "dataformat_id": 1}
     status, _name, err = runner_mod._las_cell_worker(args)
     assert status == "error"
-    assert "LAS 1.4/PF7" in err and "GeoSuite" in err
+    assert "LAS 1.2/PF1" in err and "PF7" in err
     assert not out_file.exists()
 
 
 def test_las_tile_forwards_gps_time_type(tmp_path):
     """Bit 0 des global_encoding (GPS-Time-Typ) beschreibt, wie die GpsTime-Werte zu
     lesen sind - das ist eine Eigenschaft der Daten. Es wird aus der Quelle uebernommen
-    und nur gesetzt, wenn ALLE Quell-Tiles es fuehren."""
+    und nur gesetzt, wenn ALLE Quell-Tiles es fuehren. Bit 4 (WKT) setzt LAS 1.4 mit
+    PF >= 6 dagegen immer."""
     import json
 
     runner_mod = _runner()
@@ -665,15 +669,15 @@ def test_las_tile_forwards_gps_time_type(tmp_path):
 
     runner_mod._run_pdal_pipeline = fake_run
     runner_mod._pdal_info_metadata = lambda exe, path: {
-        "count": 42, "minor_version": 2, "dataformat_id": 1}
+        "count": 42, "minor_version": 4, "dataformat_id": 7}
 
     job = {"stem": out_file.stem, "cell_bounds": (2713000.0, 1206000.0, 2714000.0, 1207000.0),
            "tiles": [os.path.join("X:", "in", "a.laz")]}
     for gps_bit in (0, 1):
         runner_mod._las_cell_worker(
             (job, str(tmp_path), str(tmp_path), "pdal.exe", "POLYGON((0 0,1 0,1 1,0 0))",
-             None, "las", gps_bit, None))
-        assert captured["stages"][-1]["global_encoding"] == gps_bit
+             None, "las", gps_bit))
+        assert captured["stages"][-1]["global_encoding"] == 0x10 | gps_bit
 
 
 def test_ln02_gps_time_notice_is_measured_not_assumed():
@@ -686,7 +690,7 @@ def test_ln02_gps_time_notice_is_measured_not_assumed():
 
     src = inspect.getsource(runner_mod._ln02_tile_worker)
     # GpsTime wird im ohnehin noetigen Lesedurchlauf mitgemessen (kein zweiter Scan)
-    assert '"dimensions": "Classification,GpsTime,X,Y,Z"' in src
+    assert 'stats_dims = "Classification,GpsTime,X,Y,Z"' in src
     assert 'gps_min == 0 and gps_max == 0' in src
     # Die WERTE werden nie angefasst - es gibt keine GpsTime-Umrechnung
     assert "filters.assign" not in src
@@ -701,355 +705,12 @@ def test_ln02_gps_time_notice_is_measured_not_assumed():
     assert runner_mod._stat_range_from_pipeline_metadata(meta, "Fehlt") == (None, None)
 
 
-# ══════════════════════ Farb-Join: PF7-Master (RGB) ══════════════════════
-
-def test_las_cell_worker_writes_pf7_master(tmp_path):
-    """Der Tab [LHN95] muss aus DEMSELBEN Pipeline-Lauf zwei Ausgaben schreiben:
-    das PF1-LAS fuer GeoSuite und den farbfuehrenden PF7-Master. Zwei getrennte
-    Laeufe waeren nicht zulaessig - 'filters.sample' entscheidet ueber die
-    Punktauswahl, deren Identitaet waere dann nur eine Annahme."""
-    import json
-
-    runner_mod = _runner()
-    captured = {}
-    master_dir = tmp_path / "_master_PF7"
-    master_dir.mkdir()
-    out_file = tmp_path / "2026_G_TIN_raw_2713_1206_LV95_LHN95.las"
-    master_file = master_dir / out_file.name
-
-    def fake_run(pdal_exe, pipeline_path, metadata_path=None):
-        captured["stages"] = json.loads(
-            open(pipeline_path, encoding="utf-8").read())["pipeline"]
-        out_file.write_bytes(b"dummy")
-        master_file.write_bytes(b"dummy")
-
-    runner_mod._run_pdal_pipeline = fake_run
-    runner_mod._pdal_info_metadata = lambda exe, path: (
-        {"count": 42, "minor_version": 4, "dataformat_id": 7} if "_master_PF7" in path
-        else {"count": 42, "minor_version": 2, "dataformat_id": 1})
-
-    job = {"stem": out_file.stem,
-           "cell_bounds": (2713000.0, 1206000.0, 2714000.0, 1207000.0),
-           "tiles": [os.path.join("X:", "in", "a.laz")]}
-    status, _name, err = runner_mod._las_cell_worker(
-        (job, str(tmp_path), str(tmp_path), "pdal.exe", "POLYGON((0 0,1 0,1 1,0 0))",
-         0.2, "las", 1, str(master_dir)))
-
-    assert (status, err) == ("written", None)
-
-    writers = [s for s in captured["stages"] if s["type"] == "writers.las"]
-    assert len(writers) == 2, "GeoSuite-Ausgabe und Master muessen beide geschrieben werden"
-    geosuite = next(w for w in writers if "_master_PF7" not in w["filename"])
-    master = next(w for w in writers if "_master_PF7" in w["filename"])
-
-    # Der Master fuehrt Farbe, die GeoSuite-Eingabe nicht
-    assert geosuite["dataformat_id"] == 1 and geosuite["minor_version"] == 2
-    assert master["dataformat_id"] == 7 and master["minor_version"] == 4
-
-    # Beide haengen an DERSELBEN letzten Filterstufe - ein Lauf, eine Punktauswahl
-    assert geosuite["inputs"] == master["inputs"]
-    sample = [s for s in captured["stages"] if s["type"] == "filters.sample"]
-    assert len(sample) == 1
-    assert geosuite["inputs"] == [sample[0]["tag"]]
-
-    # Gleiches Gitter: nur so ist die X/Y-Kontrolle beim Join exakt
-    for w in (geosuite, master):
-        assert (w["scale_x"], w["scale_y"], w["scale_z"]) == (0.01, 0.01, 0.01)
-        assert (w["offset_x"], w["offset_y"], w["offset_z"]) == (2713000.0, 1206000.0, 0)
-
-
-def test_las_cell_worker_discards_master_on_count_mismatch(tmp_path):
-    """Traegt der Master nicht dieselbe Punktmenge wie die GeoSuite-Eingabe, waere der
-    Index-Join spaeter nicht zuordenbar - das muss hier auffallen, nicht erst nach dem
-    GeoSuite-Lauf."""
-    runner_mod = _runner()
-    master_dir = tmp_path / "_master_PF7"
-    master_dir.mkdir()
-    out_file = tmp_path / "2026_G_TIN_raw_2713_1206_LV95_LHN95.las"
-    master_file = master_dir / out_file.name
-
-    def fake_run(pdal_exe, pipeline_path, metadata_path=None):
-        out_file.write_bytes(b"dummy")
-        master_file.write_bytes(b"dummy")
-
-    runner_mod._run_pdal_pipeline = fake_run
-    runner_mod._pdal_info_metadata = lambda exe, path: (
-        {"count": 41, "minor_version": 4, "dataformat_id": 7} if "_master_PF7" in path
-        else {"count": 42, "minor_version": 2, "dataformat_id": 1})
-
-    job = {"stem": out_file.stem,
-           "cell_bounds": (2713000.0, 1206000.0, 2714000.0, 1207000.0),
-           "tiles": [os.path.join("X:", "in", "a.laz")]}
-    status, _name, err = runner_mod._las_cell_worker(
-        (job, str(tmp_path), str(tmp_path), "pdal.exe", "POLYGON((0 0,1 0,1 1,0 0))",
-         None, "las", 1, str(master_dir)))
-
-    assert status == "error"
-    assert "41" in err and "42" in err
-    assert not out_file.exists() and not master_file.exists()
-
-
-def test_ln02_validate_target_accepts_pf7_profile():
-    """Mit Farb-Join ist PF7/36 das Ziel, ohne ihn PF6/30. Beide Profile muessen
-    sauber durchgehen - und das jeweils andere Format als Fehler melden."""
-    runner_mod = _runner()
-    src = _ln02_target_metadata()
-
-    pf7 = _ln02_target_metadata(dataformat_id=7, point_length=36)
-    assert runner_mod._validate_ln02_target(src, pf7, point_format=7, point_length=36) == []
-
-    # PF6-Datei, aber PF7 erwartet -> muss auffallen
-    problems = runner_mod._validate_ln02_target(src, _ln02_target_metadata(),
-                                                point_format=7, point_length=36)
-    assert any("dataformat_id" in p for p in problems)
-    assert any("point_length" in p for p in problems)
-
-    # Default (ohne Parameter) bleibt das bisherige PF6-Profil
-    assert runner_mod._validate_ln02_target(src, _ln02_target_metadata()) == []
-
-
-def test_validate_ln02_rgb_detects_lost_colour(monkeypatch, tmp_path):
-    """Ohne RGB-Kontrolle wuerde ein fehlgeschlagener Join gruen validieren:
-    Punktanzahl, BBox und Classification sind auch bei lauter Nullen in Ordnung."""
-    import json as _json
-    runner_mod = _runner()
-    dst = str(tmp_path / "x.laz")
-    span = {"lo": 0, "hi": 65280}
-
-    def fake_run(cmd, **kwargs):
-        class R:
-            returncode = 0
-            stdout = _json.dumps({"stats": {"statistic": [
-                {"name": c, "minimum": span["lo"], "maximum": span["hi"]}
-                for c in ("Red", "Green", "Blue")]}})
-            stderr = ""
-        return R()
-    monkeypatch.setattr(runner_mod.subprocess, "run", fake_run)
-
-    master = {"rgb_min": 0, "rgb_max": 65280}
-
-    # Farbe korrekt durchgereicht
-    assert runner_mod._validate_ln02_rgb("pdal.exe", dst, master) == []
-
-    # Ziel schwarz, Master hatte Farbe -> harter Fehler
-    span["hi"] = 0
-    problems = runner_mod._validate_ln02_rgb("pdal.exe", dst, master)
-    assert problems and "verloren" in problems[0]
-
-    # Spanne veraendert -> Fehler
-    span["hi"] = 255
-    problems = runner_mod._validate_ln02_rgb("pdal.exe", dst, master)
-    assert problems and "RGB-Spanne veraendert" in problems[0]
-
-
-def test_validate_ln02_rgb_rejects_colourless_master(tmp_path):
-    """Ein Master ohne Farbwerte ergaebe eine schwarze Kachel - lieber abbrechen als
-    ausliefern. Es wird gar nicht erst in die Zieldatei geschaut."""
-    runner_mod = _runner()
-    problems = runner_mod._validate_ln02_rgb("pdal.exe", str(tmp_path / "x.laz"),
-                                             {"rgb_min": 0, "rgb_max": 0})
-    assert problems and "schwarze Kachel" in problems[0]
-
-
-# ─── Farb-Join: echte Dateien, echter Durchlauf ────────────────────────────────
-# Der Join arbeitet ohne laspy direkt auf den LAS-Bytes (numpy + struct) und laesst
-# sich deshalb hier vollstaendig ausfuehren - nicht nur auf Quelltext-Ebene pruefen.
-
-def _make_las(point_format, point_length, records, scales, offsets,
-              minor_version=4, bounds=None):
-    """Baut eine minimale, gueltige LAS-Datei ohne VLRs im Speicher."""
-    import struct
-    header_size = 375 if minor_version >= 4 else 227
-    n = len(records) // point_length
-    h = bytearray(header_size)
-    h[0:4] = b"LASF"
-    struct.pack_into("<H", h, 6, 17)                 # global_encoding
-    h[24], h[25] = 1, minor_version
-    struct.pack_into("<HII", h, 94, header_size, header_size, 0)
-    h[104] = point_format
-    struct.pack_into("<H", h, 105, point_length)
-    struct.pack_into("<I", h, 107, n if minor_version < 4 else 0)
-    struct.pack_into("<3d", h, 131, *scales)
-    struct.pack_into("<3d", h, 155, *offsets)
-    bx = bounds or (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-    struct.pack_into("<6d", h, 179, *bx)             # maxx,minx,maxy,miny,maxz,minz
-    if minor_version >= 4:
-        struct.pack_into("<Q", h, 247, n)
-    return bytes(h) + records
-
-
-def _pf7_records(xyz_raw, rgb, classification=2, gps=0.0):
-    """PF7-Punktrecords (36 Byte) aus Rohkoordinaten und Farben."""
-    import struct
-    out = bytearray()
-    for (x, y, z), (r, g, b) in zip(xyz_raw, rgb):
-        rec = bytearray(36)
-        struct.pack_into("<3i", rec, 0, x, y, z)
-        struct.pack_into("<H", rec, 12, 100)          # intensity
-        rec[16] = classification
-        struct.pack_into("<d", rec, 22, gps)
-        struct.pack_into("<3H", rec, 30, r, g, b)
-        out += rec
-    return bytes(out)
-
-
-def _pf1_records(xyz_raw):
-    """PF1-Punktrecords (28 Byte) - so kommt die Kachel von GeoSuite zurueck."""
-    import struct
-    out = bytearray()
-    for (x, y, z) in xyz_raw:
-        rec = bytearray(28)
-        struct.pack_into("<3i", rec, 0, x, y, z)
-        out += rec
-    return bytes(out)
-
-
-def _write_join_pair(tmp_path, dz=-0.37, shuffle=False, drop=0):
-    """Master (PF7, LN02-Zielgitter) + GeoSuite-Ausgabe (PF1, anderes Gitter).
-    Die GeoSuite-Datei nutzt bewusst ein ANDERES scale/offset - damit ist belegt, dass
-    der Join die echten Koordinaten rekonstruiert und nicht Rohwerte vergleicht."""
-    ox, oy = 2713000.0, 1206000.0
-    dxy = [(0.0, 0.0), (1.23, 4.56), (500.0, 500.0), (999.99, 999.99), (250.5, 750.25)]
-    z_lhn95 = [1000.00, 1001.50, 1100.25, 1234.56, 999.01]
-    rgb = [(0, 0, 0), (65280, 32000, 100), (255, 255, 255), (1000, 2000, 3000), (7, 8, 9)]
-
-    master_raw = [(round(dx / 0.01), round(dy / 0.01), round(z / 0.01))
-                  for (dx, dy), z in zip(dxy, z_lhn95)]
-    geo_raw = [(round((ox + dx) / 0.01), round((oy + dy) / 0.01), round((z + dz) / 0.01))
-               for (dx, dy), z in zip(dxy, z_lhn95)]
-    if shuffle:
-        geo_raw = geo_raw[1:] + geo_raw[:1]
-    if drop:
-        geo_raw = geo_raw[:-drop]
-
-    master = tmp_path / "master.las"
-    geo = tmp_path / "geo.las"
-    master.write_bytes(_make_las(7, 36, _pf7_records(master_raw, rgb),
-                                 (0.01, 0.01, 0.01), (ox, oy, 0.0)))
-    geo.write_bytes(_make_las(1, 28, _pf1_records(geo_raw),
-                              (0.01, 0.01, 0.01), (0.0, 0.0, 0.0), minor_version=2))
-    return str(master), str(geo), ox, oy, z_lhn95, rgb, dz
-
-
-def test_ln02_join_master_roundtrip(tmp_path):
-    """Vollstaendiger Durchlauf: X/Y und Farbe kommen aus dem Master, Z verbatim aus
-    der GeoSuite-Ausgabe. Der Join darf Z NICHT umrechnen."""
-    import struct
-    runner_mod = _runner()
-    master, geo, ox, oy, z_lhn95, rgb, dz = _write_join_pair(tmp_path)
-    out = str(tmp_path / "joined.las")
-
-    stats = runner_mod._ln02_join_master(master, geo, out, ox, oy)
-
-    assert stats["count"] == 5
-    assert (stats["rgb_min"], stats["rgb_max"]) == (0, 65280)
-    assert (stats["class_min"], stats["class_max"]) == (2, 2)
-    assert stats["max_dx"] <= runner_mod.LN02_XY_TOLERANCE_M
-    assert stats["max_dy"] <= runner_mod.LN02_XY_TOLERANCE_M
-
-    info = runner_mod._las_header_info(out)
-    assert info["point_format"] == 7 and info["point_length"] == 36
-    assert info["point_count"] == 5
-
-    raw = open(out, "rb").read()[info["offset_to_point_data"]:]
-    for i, (z_src, (r, g, b)) in enumerate(zip(z_lhn95, rgb)):
-        x, y, z = struct.unpack_from("<3i", raw, i * 36)
-        rr, gg, bb = struct.unpack_from("<3H", raw, i * 36 + 30)
-        # Z ist der LN02-Wert aus der GeoSuite-Datei, unveraendert uebernommen
-        assert z == round((z_src + dz) / 0.01), f"Punkt {i}: Z falsch"
-        # X/Y unveraendert aus dem Master (Zielgitter, offset = Kachelursprung)
-        assert abs((x * 0.01 + ox) - (ox + [0.0, 1.23, 500.0, 999.99, 250.5][i])) < 1e-6
-        # Farbe unveraendert
-        assert (rr, gg, bb) == (r, g, b), f"Punkt {i}: RGB falsch"
-
-    # min_z/max_z im Header nachgefuehrt - die Werte sind jetzt LN02
-    maxz, minz = struct.unpack_from("<2d", open(out, "rb").read(375), 211)
-    assert abs(minz - (min(z_lhn95) + dz)) < 1e-6
-    assert abs(maxz - (max(z_lhn95) + dz)) < 1e-6
-    assert abs(stats["measured"]["minz"] - (min(z_lhn95) + dz)) < 1e-6
-
-
-def test_ln02_join_master_detects_reordering(tmp_path):
-    """Wird die Punktreihenfolge von GeoSuite veraendert, wuerde der Index-Join die
-    Farben auf die falschen Punkte schreiben - das muss auffallen."""
-    import pytest
-    runner_mod = _runner()
-    master, geo, ox, oy, *_ = _write_join_pair(tmp_path, shuffle=True)
-
-    with pytest.raises(ValueError) as e:
-        runner_mod._ln02_join_master(master, geo, str(tmp_path / "j.las"), ox, oy)
-    assert "Punktreihenfolge" in str(e.value)
-
-
-def test_ln02_join_master_detects_count_mismatch(tmp_path):
-    """Verliert GeoSuite Punkte, ist die Zuordnung ueber den Index nicht mehr
-    definiert - harter Fehler statt stillem Versatz."""
-    import pytest
-    runner_mod = _runner()
-    master, geo, ox, oy, *_ = _write_join_pair(tmp_path, drop=2)
-
-    with pytest.raises(ValueError) as e:
-        runner_mod._ln02_join_master(master, geo, str(tmp_path / "j.las"), ox, oy)
-    assert "Punktanzahl unterschiedlich" in str(e.value)
-
-
-def test_ln02_join_master_rejects_wrong_grid(tmp_path):
-    """Liegt der Master nicht auf dem Zielgitter, waeren die unveraendert uebernommenen
-    X/Y-Rohwerte falsch interpretiert."""
-    import pytest
-    runner_mod = _runner()
-    master, geo, ox, oy, *_ = _write_join_pair(tmp_path)
-
-    with pytest.raises(ValueError) as e:
-        # Falscher Kachelursprung -> Master passt nicht zum Ziel
-        runner_mod._ln02_join_master(master, geo, str(tmp_path / "j.las"), 2714000.0, oy)
-    assert "Zielgitter" in str(e.value)
-
-
-def test_ln02_join_master_rejects_non_pf7(tmp_path):
-    """Zeigt der Master-Ordner versehentlich auf die GeoSuite-Ausgabe, ist das Format
-    PF1 - der Join muss das melden statt Unsinn zu schreiben."""
-    import pytest
-    runner_mod = _runner()
-    _master, geo, ox, oy, *_ = _write_join_pair(tmp_path)
-
-    with pytest.raises(ValueError) as e:
-        runner_mod._ln02_join_master(geo, geo, str(tmp_path / "j.las"), ox, oy)
-    assert "PF7" in str(e.value) or "Punktformat" in str(e.value)
-
-
-def test_las_header_info_reads_both_las_versions(tmp_path):
-    """Punktanzahl steht in LAS 1.4 als uint64 an Offset 247, in 1.2 als uint32 an 107."""
-    runner_mod = _runner()
-    recs = _pf1_records([(1, 2, 3), (4, 5, 6)])
-
-    p12 = tmp_path / "a12.las"
-    p12.write_bytes(_make_las(1, 28, recs, (0.01,) * 3, (0.0,) * 3, minor_version=2))
-    i12 = runner_mod._las_header_info(str(p12))
-    assert (i12["version_minor"], i12["point_count"], i12["header_size"]) == (2, 2, 227)
-    assert not i12["compressed"]
-
-    p14 = tmp_path / "a14.las"
-    p14.write_bytes(_make_las(1, 28, recs, (0.01,) * 3, (0.0,) * 3, minor_version=4))
-    i14 = runner_mod._las_header_info(str(p14))
-    assert (i14["version_minor"], i14["point_count"], i14["header_size"]) == (4, 2, 375)
-
-
-def test_las_header_info_flags_compression(tmp_path):
-    """Bit 6/7 im Formatbyte markiert LASZIP - der Join braucht unkomprimierte Daten
-    und muss das erkennen, damit _ensure_uncompressed greift."""
-    runner_mod = _runner()
-    p = tmp_path / "c.laz"
-    p.write_bytes(_make_las(1 | 0x80, 28, _pf1_records([(1, 2, 3)]),
-                            (0.01,) * 3, (0.0,) * 3))
-    info = runner_mod._las_header_info(str(p))
-    assert info["compressed"] is True
-    assert info["point_format"] == 1
-
-
-def test_ln02_worker_without_master_stays_pf6(tmp_path, monkeypatch):
-    """Ohne Master-Ordner muss der Tab [LN02] unveraendert arbeiten: PDAL-Pipeline,
-    PF6, keine Farbe. Bestehende Projekte duerfen sich nicht anders verhalten."""
+def test_ln02_worker_reports_missing_colour(tmp_path, monkeypatch):
+    """PF7 fuehrt die RGB-Felder immer - auch wenn nur Nullen darin stehen. Eine
+    farblos gewordene Lieferung faellt sonst erst im GDWH auf. Geprueft wird deshalb
+    am Punktformat der Quelle UND an den gemessenen RGB-Werten; RGB darf dabei nur
+    dann in 'filters.stats' stehen, wenn die Quelle die Dimensionen ueberhaupt hat
+    (die Stage bricht sonst ab)."""
     import json
     runner_mod = _runner()
 
@@ -1058,138 +719,80 @@ def test_ln02_worker_without_master_stays_pf6(tmp_path, monkeypatch):
     src_path = tmp_path / "2026_G_TIN_raw_2713_1206_LV95_LHN95.las"
     src_path.write_bytes(b"x")
     dst_path = out_dir / "2026_G_TIN_raw_2713_1206_LV95_LN02.laz"
+
     captured = {}
 
-    def fake_pipeline(pdal_exe, pipeline_path, metadata_path=None):
-        captured["stages"] = json.loads(
-            open(pipeline_path, encoding="utf-8").read())["pipeline"]
-        open(captured["stages"][-1]["filename"], "wb").write(b"tmp")
-        return {"stages": {"filters.stats": {"statistic": [
-            {"name": "Classification", "minimum": 1, "maximum": 2}]}}}
+    def run_with(src_format, rgb_max):
+        src_md = _ln02_target_metadata(minor_version=2, dataformat_id=src_format,
+                                        global_encoding=1)
+        stats = [{"name": "Classification", "minimum": 1, "maximum": 2}]
+        if rgb_max is not None:
+            stats += [{"name": c, "minimum": 0, "maximum": rgb_max}
+                      for c in ("Red", "Green", "Blue")]
 
-    monkeypatch.setattr(runner_mod, "_run_pdal_pipeline", fake_pipeline)
-    monkeypatch.setattr(runner_mod, "_inject_reference_vlrs", lambda path: 0)
-    monkeypatch.setattr(runner_mod, "_pdal_classification_range", lambda exe, path: (1, 2))
-    monkeypatch.setattr(runner_mod, "_pdal_info_metadata",
-                        lambda exe, path: _ln02_target_metadata())
-    # Wuerde der Join trotzdem laufen, faellt der Test hier um
-    monkeypatch.setattr(runner_mod, "_ln02_join_master",
-                        lambda *a, **k: (_ for _ in ()).throw(
-                            AssertionError("Join darf ohne Master nicht laufen")))
+        def fake_pipeline(pdal_exe, pipeline_path, metadata_path=None):
+            captured["stages"] = json.loads(
+                open(pipeline_path, encoding="utf-8").read())["pipeline"]
+            open(captured["stages"][-1]["filename"], "wb").write(b"tmp")
+            return {"stages": {"filters.stats": {"statistic": stats}}}
 
-    status, _name, err, _w = runner_mod._ln02_tile_worker(
-        (str(src_path), str(dst_path), "pdal.exe", str(tmp_path),
-         2713000.0, 1206000.0, None))
+        monkeypatch.setattr(runner_mod, "_run_pdal_pipeline", fake_pipeline)
+        monkeypatch.setattr(runner_mod, "_inject_reference_vlrs", lambda path: 0)
+        monkeypatch.setattr(runner_mod, "_pdal_classification_range", lambda exe, path: (1, 2))
+        monkeypatch.setattr(runner_mod, "_pdal_info_metadata",
+                             lambda exe, path: src_md if path == str(src_path)
+                             else _ln02_target_metadata())
+        return runner_mod._ln02_tile_worker(
+            (str(src_path), str(dst_path), "pdal.exe", str(tmp_path), 2713000.0, 1206000.0))
 
+    # Quelle ohne Farbfelder (PF1, z.B. aus einem GeoSuite-Lauf vor dem LAS-1.4-Update)
+    status, _n, err, warnings = run_with(1, None)
     assert (status, err) == ("written", None)
-    assert captured["stages"][-1]["dataformat_id"] == 6
+    assert "Red" not in captured["stages"][1]["dimensions"]
+    assert any("keine Farbfelder" in w for w in warnings)
+
+    # Quelle mit Farbfeldern, aber durchgehend 0 -> schwarze Kachel
+    status, _n, err, warnings = run_with(7, 0)
+    assert (status, err) == ("written", None)
+    assert captured["stages"][1]["dimensions"].endswith("Red,Green,Blue")
+    assert any("durchgehend 0" in w for w in warnings)
+
+    # Quelle mit echten Farbwerten -> kein Farb-Hinweis
+    status, _n, err, warnings = run_with(7, 65280)
+    assert (status, err) == ("written", None)
+    assert not any("Farb" in w or "RGB" in w for w in warnings)
 
 
-def test_ln02_worker_with_master_produces_pf7(tmp_path, monkeypatch):
-    """Verdrahtung des Farb-Pfads: der Join laeuft echt, sein Ergebnis geht als
-    Eingabe in die PDAL-Ausgabe (PF7), und die Zwischendateien im Staging werden
-    wieder aufgeraeumt."""
-    import json
-    import shutil as _shutil
+def test_ln02_copy_shortcut_only_for_finished_tiles():
+    """Die Abkuerzung 'schon migriert, nur kopieren' darf NUR fuer das fertige
+    Zielprodukt greifen. Seit auch die Zwischenstufe LAS 1.4/PF7 ist, unterscheidet
+    sich eine GeoSuite-Ausgabe davon nur noch an scale/offset und den CRS-VLRs -
+    ohne diese Kontrollen wuerde eine reframte Kachel unveraendert durchgereicht."""
+    import base64
     runner_mod = _runner()
 
-    out_dir = tmp_path / "out"
-    out_dir.mkdir()
-    staging = tmp_path / "staging"
-    staging.mkdir()
-    pair_dir = tmp_path / "pair"
-    pair_dir.mkdir()
+    def md(**over):
+        m = _ln02_target_metadata(scale_x=0.01, scale_y=0.01, scale_z=0.01)
+        m.update(over)
+        return m
 
-    master, geo, ox, oy, *_ = _write_join_pair(pair_dir)
-    # Quelldatei so benennen, wie sie nach GeoSuite heisst
-    src_path = tmp_path / "2026_G_TIN_raw_2713_1206_LV95_LN02.las"
-    _shutil.copy2(geo, src_path)
-    dst_path = out_dir / "2026_G_TIN_raw_2713_1206_LV95_LN02.laz"
+    # Fertige Kachel: byte-exakte Referenz-VLRs, scale 0.01, PF7/17
+    finished = md(vlr_0={"user_id": "LASF_Projection", "record_id": 34735,
+                          "data": runner_mod.REFERENCE_VLR_34735_B64},
+                   vlr_1={"user_id": "LASF_Projection", "record_id": 2112,
+                          "data": runner_mod.REFERENCE_VLR_2112_B64})
+    assert runner_mod._ln02_is_already_migrated(finished)
 
-    captured = {}
+    # Gleiches Format und CRS, aber fremde CRS-VLRs (z.B. von GeoSuite) -> keine Kopie
+    foreign = md(vlr_0={"user_id": "LASF_Projection", "record_id": 34735,
+                         "data": base64.b64encode(b"nicht die Referenz").decode()},
+                  vlr_1={"user_id": "LASF_Projection", "record_id": 2112,
+                         "data": base64.b64encode(b"auch nicht").decode()})
+    assert not runner_mod._ln02_is_already_migrated(foreign)
 
-    def fake_pipeline(pdal_exe, pipeline_path, metadata_path=None):
-        stages = json.loads(open(pipeline_path, encoding="utf-8").read())["pipeline"]
-        captured["stages"] = stages
-        # PDAL simulieren: Eingabe (die zusammengefuegte Datei) an den Zielort kopieren
-        _shutil.copy2(stages[0]["filename"], stages[-1]["filename"])
-        return {}
-
-    monkeypatch.setattr(runner_mod, "_run_pdal_pipeline", fake_pipeline)
-    monkeypatch.setattr(runner_mod, "_inject_reference_vlrs", lambda path: 0)
-    monkeypatch.setattr(runner_mod, "_pdal_classification_range", lambda exe, path: (2, 2))
-    monkeypatch.setattr(runner_mod, "_pdal_info_metadata",
-                        lambda exe, path: _ln02_target_metadata(
-                            dataformat_id=7, point_length=36, count=5,
-                            minx=2713000.0, maxx=2713999.99,
-                            miny=1206000.0, maxy=1206999.99,
-                            minz=998.64, maxz=1234.19))
-
-    # RGB-Kontrolle: 'pdal info --stats' auf der Zieldatei simulieren
-    def fake_run(cmd, **kwargs):
-        class R:
-            returncode = 0
-            stdout = json.dumps({"stats": {"statistic": [
-                {"name": c, "minimum": 0, "maximum": 65280}
-                for c in ("Red", "Green", "Blue")]}})
-            stderr = ""
-        return R()
-    monkeypatch.setattr(runner_mod.subprocess, "run", fake_run)
-
-    status, name, err, warnings = runner_mod._ln02_tile_worker(
-        (str(src_path), str(dst_path), "pdal.exe", str(staging), ox, oy, master))
-
-    assert (status, err) == ("written", None), err
-    assert name == dst_path.name
-    assert dst_path.is_file()
-
-    # PDAL bekommt die zusammengefuegte Datei, nicht die GeoSuite-Kachel
-    assert captured["stages"][0]["filename"].endswith(".las")
-    assert "joined_" in os.path.basename(captured["stages"][0]["filename"])
-    writer = captured["stages"][-1]
-    assert writer["dataformat_id"] == 7          # PF7 mit RGB
-    assert writer["global_encoding"] == 17
-    assert (writer["offset_x"], writer["offset_y"], writer["offset_z"]) == (ox, oy, 0)
-    assert writer["compression"] == "laszip"
-    # Ohne Farb-Join haengt filters.stats dazwischen - mit Join liefert der die Werte
-    assert [s["type"] for s in captured["stages"]] == ["readers.las", "writers.las"]
-
-    # Staging wieder sauber: keine zusammengefuegten oder entpackten Reste
-    assert not list(staging.glob("joined_*")), "Zwischendatei nicht aufgeraeumt"
-    assert not list(staging.glob("unpacked_*"))
-    assert not list(staging.glob("pipeline_ln02_*.json"))
-
-    # Die Farbe ist wirklich im Ergebnis
-    info = runner_mod._las_header_info(str(dst_path))
-    assert info["point_format"] == 7 and info["point_count"] == 5
-
-
-def test_ln02_join_failures_are_not_retried(tmp_path, monkeypatch):
-    """Die Join-Pruefungen sind deterministisch - eine serielle Wiederholung liefert
-    garantiert denselben Fehler und kostet nur einen weiteren kompletten Durchlauf
-    pro Kachel. Der Worker muss das als 'error_final' melden."""
-    import shutil as _shutil
-    runner_mod = _runner()
-
-    out_dir = tmp_path / "out"
-    out_dir.mkdir()
-    staging = tmp_path / "staging"
-    staging.mkdir()
-    pair = tmp_path / "pair"
-    pair.mkdir()
-
-    master, geo, ox, oy, *_ = _write_join_pair(pair, shuffle=True)
-    src_path = tmp_path / "2026_G_TIN_raw_2713_1206_LV95_LN02.las"
-    _shutil.copy2(geo, src_path)
-
-    monkeypatch.setattr(runner_mod, "_pdal_info_metadata",
-                        lambda exe, path: _ln02_target_metadata())
-
-    status, _name, err, _w = runner_mod._ln02_tile_worker(
-        (str(src_path), str(out_dir / "z.laz"), "pdal.exe", str(staging), ox, oy, master))
-
-    assert status == "error_final", "deterministischer Fehler darf nicht wiederholt werden"
-    assert "Punktreihenfolge" in err
-    # Kein halbfertiges Produkt, kein Muell im Staging
-    assert not (out_dir / "z.laz").exists()
-    assert not list(staging.glob("joined_*"))
+    # Referenz-VLRs, aber falsches scale -> keine Kopie (Requantisierung fehlt)
+    assert not runner_mod._ln02_is_already_migrated(dict(finished, scale_x=0.001))
+    # Noch die Zwischenstufe (kein Vertikal-CRS) -> keine Kopie
+    assert not runner_mod._ln02_is_already_migrated(dict(
+        finished, srs={"json": {"components": [
+            {"type": "ProjectedCRS", "id": {"authority": "EPSG", "code": 2056}}]}}))

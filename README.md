@@ -14,9 +14,10 @@ drei Tabs:
   nachgelagerten Reframe LHN95→LN02 via GeoSuite gedacht.
 - **DMC - LASconverter [LN02]** (PDAL) — nimmt die via GeoSuite nach LN02 reframten 1km-Kacheln
   entgegen und bringt sie unveraendert (kein Thinning, kein Crop, keine Neu-Kachelung) in die
-  GDWH-taugliche Form: LAS 1.4 / Point Data Record Format 6,
+  GDWH-taugliche Form: LAS 1.4 / Point Data Record Format 7 (PF6 + RGB),
   `global_encoding` 17, `scale` 0.01, Offset = Kachelursprung, CRS-Tag LV95+LN02 als byte-exakte
-  Referenz-VLRs (identisch zu `SB_DSM_PUNKTWOLKE`). Optional ebenfalls DSM + Hillshade.
+  Referenz-VLRs (wie `SB_DSM_PUNKTWOLKE`, dort aber PF6 — hier PF7, damit die DMC-Farbe erhalten
+  bleibt). Optional ebenfalls DSM + Hillshade.
 
 Struktur und Styling analog zu `topo-COGTIFFconverter`.
 
@@ -112,8 +113,9 @@ automatisch erkannt (PATH, OSGeo4W-/QGIS-Installationspfade), kein eigenes GUI-F
 
 3. **Output-Ordner (Punktwolken-Kacheln)** + **Ausgabeformat** (Dropdown `las`/`laz`, Default
    `las`): Ziel fuer die 1km-Grid-Kacheln. Default `las`, da die Weiterverarbeitung (Reframe
-   LHN95→LN02) via GeoSuite unkomprimiertes LAS erwartet. Geschrieben wird **LAS 1.2 / Point
-   Data Record Format 1** mit CRS-Tag `EPSG:2056` — siehe „GeoSuite-Kompatibilitaet" unten.
+   LHN95→LN02) via GeoSuite unkomprimiertes LAS erwartet. Geschrieben wird **LAS 1.4 / Point
+   Data Record Format 7** (PF6 + RGB) mit CRS-Tag `EPSG:2056` — siehe „GeoSuite-Kompatibilitaet"
+   unten.
 
 4. **Output-Ordner (DSM-Raster)**: nur sichtbar, wenn "Create DSM-Raster from LAZ" aktiv ist.
    Ziel fuer das eine DSM-TIFF+TFW und das Hillshade-TIFF+TFW der AOI (beide im selben Ordner).
@@ -169,43 +171,43 @@ als `.las` oder `.laz` geschrieben wird, entscheidet sich rein an der Dateiendun
   wird bewusst die amtliche GeoSuite/REFRAME-Software separat verwendet (`.las`-Output).
 - **`scale_x/y/z = 0.01`** fix in den Output-Kacheln gesetzt (Schweizer Konvention, keine
   uebertriebene Nachkommastellen-Praezision).
-- **GeoSuite-Kompatibilitaet der Zwischenausgabe**: die Tiles sind die Eingabe fuer den
-  GeoSuite/REFRAME-Batch, deshalb wird das Ausgabeformat explizit gesetzt statt PDALs Defaults
-  zu uebernehmen:
-  | | ohne Angabe (PDAL 2.8.3, nachgemessen) | hier gesetzt |
-  |---|---|---|
-  | `minor_version` | **4** (LAS 1.4) | **2** (LAS 1.2) |
-  | `dataformat_id` | **7** (PF6 + RGB, `point_length` 36) | **1** |
-  | `global_encoding` | 16 (WKT-Bit) | 0 |
-  | CRS im Header | 2× OGC-WKT-VLR `record_id` 2112 mit `EPSG:2056+5729` | GeoTIFF-Keys `EPSG:2056` (nur horizontal) |
+- **Ausgabeformat der Zwischenausgabe**: die Tiles sind die Eingabe fuer den
+  GeoSuite/REFRAME-Batch, deshalb wird das Format explizit gesetzt statt PDALs Defaults zu
+  uebernehmen (PDAL entscheidet sonst anhand der vorhandenen Dimensionen und koennte je nach
+  Quelle wechseln):
 
-  GeoSuite liest klassisches LAS (1.0–1.2, PF0–PF3) und lehnt LAS 1.4/PF7 mit
-  `ERROR: File format incorrect ... unknown or unsupported format` ab — „Format" meint in LAS
-  genau das Point Data Record Format. LAS 1.2/PF1 ohne Vertikal-Key ist exakt das Format, in dem
-  die etablierte `SB_DSM_PUNKTWOLKE`-Lieferkette ihre Tiles fuehrt (siehe
-  `topo-importDATAtoGDWH-STAC`, `4_SB_DSM_PUNKTWOLKE_LAS14upgrade.py`: *„LAS 1.2, Point Data
-  Record Format 1, keine CRS-Angabe im Header"*). Der Hoehenbezug wird bewusst **nicht** getaggt:
-  REFRAME bekommt Ein- und Ausgangsrahmen aus der Batch-Konfiguration, den autoritativen
-  LV95/LN02-Tag setzt erst der Tab [LN02].
+  | | hier gesetzt |
+  |---|---|
+  | `minor_version` | **4** (LAS 1.4) |
+  | `dataformat_id` | **7** (PF6 + RGB, `point_length` 36) |
+  | `global_encoding` | 17 bzw. 16 — Bit 4 (WKT) immer, Bit 0 (GPS-Time-Typ) aus der Quelle |
+  | `scale` / `offset` | 0.01 / Kachelursprung (aus dem Dateinamen geparst) |
+  | CRS im Header | `EPSG:2056` — nur horizontal, kein Vertikal-Key |
+
+  **PF7 traegt die Farbe durch die ganze Kette.** Die DMC-Quelldaten aus Reality Studio sind PF2
+  (RGB vorhanden, `GpsTime` nicht); PF7 ist PF6 + RGB und behaelt die Farbwerte, GeoSuite/REFRAME
+  reicht sie durch, der Tab [LN02] uebernimmt sie unveraendert ins GDWH-Produkt. Fuehrt die
+  Quelle gar keine Farbe, steht das als Warnung im Log — die Kacheln werden trotzdem PF7
+  geschrieben, ihre RGB-Felder bleiben dann 0.
+
+  Der Offset wird bewusst aus dem **Dateinamen** bestimmt (Kachelursprung), nicht aus dem
+  Datenminimum: der Tab [LN02] macht es genauso, damit liegt die Zwischenstufe schon auf dem
+  Ganzzahl-Gitter des Endprodukts und die dortige Requantisierung verschiebt keine Koordinaten.
+
+  Der Hoehenbezug wird bewusst **nicht** getaggt: REFRAME bekommt Ein- und Ausgangsrahmen aus
+  der Batch-Konfiguration, den autoritativen LV95/LN02-Tag setzt erst der Tab [LN02].
 
   Nach dem Schreiben wird der Header jeder Kachel geprueft (die Metadaten werden fuer den
   Punktzahl-Check ohnehin gelesen) — stimmt er nicht, wird die Kachel verworfen statt eine fuer
   REFRAME unbrauchbare Datei im Output-Ordner zu hinterlassen.
 
-  **Farbe (PF7-Master):** PF1 fuehrt keine RGB-Werte, die DMC-Quelldaten aus Reality Studio
-  aber schon (PF2: RGB vorhanden, `GpsTime` nicht). Damit die Farbe nicht am GeoSuite-Schritt
-  verloren geht, schreibt derselbe Pipeline-Lauf eine **zweite** vollstaendige Ausgabe: den
-  **PF7-Master** im Unterordner `_master_PF7` des Output-Ordners — gleiche Punkte, gleiches
-  `scale`, gleiches `offset` (Kachelursprung), nur eben mit Farbe.
-
-  Bewusst **ein** Pipeline-Lauf mit zwei `writers.las` an derselben letzten Filterstufe: ueber
-  die Punktauswahl entscheidet `filters.sample`, und bei zwei getrennten Laeufen waere die
-  Identitaet der beiden Punktmengen nur eine Annahme. So ist sie eine Konstruktionseigenschaft —
-  und die teure KD-Baum-Auswahl laeuft nur einmal.
-
-  Der Tab [LN02] fuegt Master und GeoSuite-Ausgabe wieder zusammen (siehe dort). Wird der
-  Master dort nicht angegeben, entsteht wie bisher PF6 ohne Farbe; der Master kann dann
-  geloescht werden. Fuehrt die Quelle gar keine Farbe, steht das als Warnung im Log.
+  > **Historie (nicht wieder einbauen):** Bis zum GeoSuite-Update vom 09.09.2026 las GeoSuite nur
+  > klassisches LAS (1.0–1.2, PF0–PF3) und lehnte LAS 1.4/PF7 mit
+  > `ERROR: File format incorrect ... unknown or unsupported format` ab — „Format" meint in LAS
+  > genau das Point Data Record Format. Die Zwischenausgabe musste deshalb **LAS 1.2 / PF1** sein,
+  > und die Farbe wurde ueber einen zweiten, farbfuehrenden „PF7-Master" plus Index-Join im Tab
+  > [LN02] gerettet. Mit dem Update ist dieser Umweg hinfaellig; Master und Join wurden ersatzlos
+  > entfernt.
 
   **GPS-Time-Typ:** `global_encoding` Bit 0 sagt, wie die `GpsTime`-Werte zu lesen sind
   (0 = GPS Week Time, 1 = Adjusted Standard GPS Time). Das ist eine Eigenschaft der Daten, keine
@@ -267,9 +269,10 @@ Raster-Maskierung gebraucht und ist nur sichtbar, wenn die Raster-Option aktiv i
    Ordner, per Cutline maskiert (DSM NoData `-3.4028235e+38`, Hillshade NoData `255`) — exakt
    wie im Tab [LHN95].
 
-5. **Datei-Info**: zeigt zusätzlich **LAS-Version/Point-Format** und **global_encoding** der
-   Quelle. Steht dort bereits `LAS 1.4 / PF6` und `17`, ist die Kachel schon im Zielformat und
-   wird nur kopiert statt konvertiert.
+5. **Datei-Info**: zeigt zusätzlich **LAS-Version/Point-Format**, **Farbe (RGB)** und
+   **global_encoding** der Quelle. Steht dort bereits `LAS 1.4 / PF7` und `17`, ist die Kachel
+   schon im Zielformat und wird nur kopiert statt konvertiert. Steht bei Farbe `nein`, hat die
+   Quelle kein RGB-Feld — dann kommt aus dem Lauf eine Warnung pro Kachel.
 
 6. **Staging & Parallelisierung**: analog den anderen Tabs, eigener Unterordner
    (`<AREA>_<JAHR>_LN02`).
@@ -281,7 +284,7 @@ Raster-Maskierung gebraucht und ist nur sichtbar, wenn die Raster-Option aktiv i
 | Eigenschaft | Wert |
 |---|---|
 | LAS-Version | 1.4 |
-| Point Data Record Format | **6** (`point_length` 30) ohne Master · **7** (`point_length` 36, mit RGB) mit Master |
+| Point Data Record Format | **7** (`point_length` 36) — PF6 + RGB |
 | `header_size` | 375 (unabhängig vom Punktformat) |
 | `global_encoding` | 17 — Bit 0 (Adjusted Standard GPS Time) + Bit 4 (WKT) |
 | `scale_x/y/z` | 0.01 |
@@ -293,58 +296,30 @@ fängt sonst irgendwo mitten in der Zelle an. Die geparsten Kilometerwerte werde
 Schweizer Landesgrenzen (LV95) plausibilisiert; zeigen zwei Input-Kacheln auf dieselbe Zelle
 (die Ausgaben würden sich überschreiben), bricht der Lauf vorher ab.
 
-### Farbe zurückholen — der Index-Join mit dem PF7-Master
+### Farbe
 
-GeoSuite/REFRAME liest nur klassisches LAS und gibt darum farblose Kacheln zurück. Ist im Feld
-**„Master-Ordner (PF7 mit RGB)"** der Ordner `_master_PF7` aus dem Tab [LHN95] angegeben, werden
-beide Dateien wieder zusammengeführt:
+Die Farbe kommt **unverändert aus der Quelle**: der Tab [LHN95] schreibt PF7, GeoSuite/REFRAME
+reicht die RGB-Werte durch, PDAL übernimmt sie beim Requantisieren nach PF7. Es wird nichts
+zusammengefügt und nichts rekonstruiert.
 
-- **X/Y und alle Attribute** (RGB, Classification, Intensity, …) kommen aus dem **Master**,
-- **Z kommt verbatim aus der GeoSuite-Ausgabe** — Punkt für Punkt, ohne Umrechnung.
+Kontrolliert wird trotzdem, denn PF7 führt die RGB-Felder auch dann, wenn nur Nullen darin
+stehen — eine farblos gewordene Lieferung fällt sonst erst im GDWH auf:
 
-Die amtliche Transformation bleibt damit unangetastet: es wird nichts interpoliert und kein
-Ersatzmodell gerechnet. (Der Umweg über `filters.reprojection` von `EPSG:2056+5729` nach `+5728`
-wäre **keine** Alternative — PROJ kennt kein HTRANS, sondern nur den Umweg über zwei
-CHGeo2004-Gitter mit *unknown accuracy*, und fällt bei fehlenden Gittern still auf `+proj=noop`
-zurück: LHN95-Höhen mit LN02-Etikett. Deshalb gibt es in diesem Projekt bewusst kein
-`filters.reprojection`.)
-
-**Zugeordnet wird über den Index** (Punkt *n* ↔ Punkt *n*), nicht über die Koordinate: bei einer
-2.5D-Oberfläche gibt es an Felswänden mehrere Punkte mit fast gleichem X/Y, und Z taugt als
-Schlüssel nicht, weil genau Z transformiert wurde. Der Index ist exakt, solange GeoSuite
-Reihenfolge und Anzahl erhält — beides wird **geprüft, nicht angenommen**:
-
-| Kontrolle | Wirkung bei Abweichung |
+| Befund an der Quelle | Meldung |
 |---|---|
-| Punktanzahl Master vs. GeoSuite-Ausgabe | harter Fehler, Kachel wird nicht geschrieben |
-| X/Y punktweise (Toleranz 1 mm) | harter Fehler — eine verschobene Zuordnung liegt um Zehnerpotenzen darüber |
-| RGB-Spanne Master vs. Zieldatei | harter Fehler — ohne diese Kontrolle würde ein fehlgeschlagener Join grün validieren |
-| Classification-Spanne | harter Fehler (wie bisher) |
+| Punktformat ohne RGB-Feld (z.B. PF1) | Warnung pro Kachel — Hinweis auf einen Reframe mit einer GeoSuite-Version vor dem LAS-1.4-Update |
+| RGB-Felder vorhanden, Werte durchgehend 0 | Warnung pro Kachel („schwarze Kachel") |
 
-Gepaart werden die Dateien über die **Kachelkoordinaten** aus dem Namen, nicht über den Stem —
-die GeoSuite-Ausgabe heisst `…_LV95_LN02`, der Master `…_LV95_LHN95`. Fehlt zu einer Input-Kachel
-der Master, bricht der Lauf **vor** der Verarbeitung ab; eine still farblos gebliebene Kachel
-würde sonst erst in der GDWH-Lieferung auffallen.
+Gemessen wird im **ohnehin nötigen Lesedurchlauf** (`filters.stats` hängt sich als reiner
+Durchlauf-Filter an) — kein zweiter Scan. `Red,Green,Blue` werden der Stage nur dann mitgegeben,
+wenn das Punktformat der Quelle sie überhaupt führt: `filters.stats` bricht mit einem Fehler ab,
+wenn eine angeforderte Dimension nicht existiert.
 
-**Keine neue Abhängigkeit:** der Join arbeitet mit `numpy` und `struct` direkt auf den LAS-Bytes.
-`laspy` ist im OSGeo4W-Python **nicht** vorhanden (nachgeprüft) und wird auch nicht gebraucht —
-numpy nutzt der Runner für die Rasterpfade ohnehin schon.
-
-Möglich wird das durch eine Eigenschaft der Konstruktion: der Master ist bereits LAS 1.4/PF7 mit
-dem Ziel-`scale` und dem Ziel-`offset`. Das Ergebnis ist damit schlicht **der Master mit
-ersetzten Z-Werten** — keine Punktformat-Umwandlung, keine Dimensions-Zuordnung. Header und
-VLR-Block werden verbatim übernommen, nur `min_z`/`max_z` werden nachgeführt. Gelesen wird per
-`numpy.memmap` in Blöcken zu 1 Mio. Punkten, der Speicherbedarf wächst also nicht mit der
-Kachelgrösse. Die GeoSuite-Ausgabe wird formatunabhängig gelesen: X/Y/Z liegen bei **jedem**
-Point Data Record Format in den ersten 12 Byte.
-
-Die autoritative Ausgabe schreibt weiterhin **PDAL** (Kompression, `global_encoding`,
-`scale`/`offset`) — dieselbe Writer-Konfiguration wie ohne Farbe, nur mit `dataformat_id 7`. Der
-Join liefert dafür eine unkomprimierte Zwischendatei im Staging, die danach wieder gelöscht wird.
-
-Beide Eingaben müssen dafür unkomprimiert vorliegen. Ist der Master `.laz`, wird er pro Kachel
-einmal ins Staging entpackt (ein Durchlauf mehr); mit `.las` im Tab [LHN95] entfällt das, kostet
-dafür rund das Vierfache an Plattenplatz für den Master. Das Log sagt, welcher Fall vorliegt.
+> **Höhe:** Z bleibt in jedem Fall verbatim das, was GeoSuite/REFRAME geliefert hat. Der Umweg
+> über `filters.reprojection` von `EPSG:2056+5729` nach `+5728` wäre **keine** Alternative — PROJ
+> kennt kein HTRANS, sondern nur den Umweg über zwei CHGeo2004-Gitter mit *unknown accuracy*, und
+> fällt bei fehlenden Gittern still auf `+proj=noop` zurück: LHN95-Höhen mit LN02-Etikett.
+> Deshalb gibt es in diesem Projekt bewusst kein `filters.reprojection`.
 
 > **GpsTime:** PF7 verlangt das Feld, die DMC-Quelle (PF2) führt aber gar keine GPS-Zeit — es
 > bleibt durchgehend 0. `global_encoding` 17 deklariert darüber trotzdem *Adjusted Standard GPS
@@ -385,6 +360,13 @@ für `pdal info --metadata` lesbar, aber jeder echte Dekompressions-Durchlauf br
   1 cm, Header-Zielwerte (siehe Tabelle), beide CRS-VLRs vorhanden (VLR 2112 endet auf
   Nullbyte), CRS auflösbar als 2056 + 5728 — und `5729`/`LHN95` kommen im Ziel-WKT **nicht** vor
   (fängt ab, dass versehentlich nicht-reframte LHN95-Kacheln als LN02 getaggt werden).
+- **„Schon fertig“-Abkürzung nur mit Beweis**: eine Kachel wird unverändert kopiert statt
+  konvertiert, wenn sie bereits das Zielprodukt ist. Geprüft wird dafür nicht nur
+  Version/Punktformat/`global_encoding`/CRS, sondern auch `scale` **und** die byte-exakten
+  Referenz-VLRs. Grund: seit auch die Zwischenstufe LAS 1.4/PF7 ist, unterscheidet sich eine
+  GeoSuite-Ausgabe vom fertigen Produkt nur noch an `scale`/`offset` und den CRS-Tags — ohne
+  diese beiden Kontrollen könnte eine reframte Kachel mit GeoSuites CRS-Tags durchgereicht
+  werden statt mit den autoritativen.
 - **GPS-Time-Typ**: Das Zielformat verlangt `global_encoding` 17, also Bit 0 gesetzt
   (Adjusted Standard GPS Time). Ob das gegenueber der Quelle eine Aussage veraendert, wird an den
   DATEN gemessen statt pauschal gewarnt: die `filters.stats`-Stage misst `GpsTime` im ohnehin
@@ -395,7 +377,7 @@ für `pdal info --metadata` lesbar, aber jeder echte Dekompressions-Durchlauf br
   Typ-Angabe im Header.
 - **Classification-Kontrolle**: Min/Max der `Classification`-Dimension muss vor und nach der
   Konversion gleich sein. PF1/PF3 packen die Klasse als 5-Bit-Wert zusammen mit Flag-Bits in ein
-  Byte, PF6 trennt beides — genau hier könnte die Punktformat-Umwandlung die Klasse still
+  Byte, PF6/PF7 trennen beides — genau hier könnte die Punktformat-Umwandlung die Klasse still
   verändern. Die Spanne der Quelle wird per `filters.stats` am ohnehin nötigen Lesedurchlauf
   mitgemessen (kein zweiter Durchlauf).
 - **Kachelrahmen-Prüfung**: Punkte ausserhalb des nominalen 1km-Rahmens sind ein harter Fehler
@@ -432,7 +414,7 @@ process_scripts/_osgeo_runner.py   (OSGeo4W Python, GDAL/OGR)
     Aktion "process_las_ln02"  (Tab "DMC - LASconverter [LN02]"):
         │  1) Kachelursprung aus allen Dateinamen parsen (Abbruch vor dem
         │     ersten Schreibzugriff), Metadaten-Scan parallel
-        │  2) Job-Pool: je Kachel Requantisierung auf LAS 1.4/PF6 + VLR-Byte-
+        │  2) Job-Pool: je Kachel Requantisierung auf LAS 1.4/PF7 + VLR-Byte-
         │     Injektion + Validierung (+ optional DSM-Zelle), Retry seriell
         │  3) Zell-Raster mosaikieren (VRT) -> Cutline-Clip -> Hillshade
         │

@@ -10,9 +10,8 @@ Tkinter-Oberflaeche mit drei Tabs:
                                    Raster (.tif/.tfw) rastern - Hoehe bleibt LHN95,
                                    Reframe zu LN02 erfolgt separat via GeoSuite
   - "DMC - LASconverter [LN02]"  : die via GeoSuite nach LN02 reframten 1km-Tiles
-                                   in die GDWH-taugliche LAS-1.4-Form bringen (PF6, mit
-                                   PF7-Master aus dem Tab [LHN95] auch PF7 mit RGB,
-                                   global_encoding 17, scale 0.01, Offset =
+                                   in die GDWH-taugliche LAS-1.4-Form bringen (PF7
+                                   mit RGB, global_encoding 17, scale 0.01, Offset =
                                    Tile-Ursprung, byte-exakte LV95/LN02-CRS-VLRs)
                                    und optional ebenfalls DSM + Hillshade rastern
 Styling analog zu topo-COGTIFFconverter / GUI_cogtiffConverter.py.
@@ -239,11 +238,11 @@ _PC_FORMATS_WITH_RGB = (2, 3, 5, 7, 8, 10)
 def _pc_rgb(meta: dict, path: str) -> str:
     """Ob das Punktformat ueberhaupt RGB-Felder fuehrt - headerbasiert, ohne die
     Punktdaten zu lesen. Ob dort auch Werte stehen (statt lauter Nullen), sagt erst
-    eine Statistik ueber alle Punkte; die laeuft im Tab-Lauf selbst und landet als
-    RGB-Spanne pro Kachel im Log."""
+    eine Statistik ueber alle Punkte; die laeuft im Tab-Lauf selbst und meldet sich
+    dort als Warnung pro Kachel."""
     fmt = meta.get("dataformat_id")
     if fmt is None:
-        return "–"
+        return "-"
     return (f"ja  (PF{fmt} fuehrt RGB)" if fmt in _PC_FORMATS_WITH_RGB
             else f"nein  (PF{fmt} hat kein Farbfeld)")
 
@@ -560,8 +559,9 @@ class DMCConverterApp(tk.Tk):
                      values=["las", "laz"], state="readonly", width=6
                      ).pack(side="left", padx=(8, 8))
         self._las_out_format_var.trace_add("write", lambda *_: self._update_las_name_preview())
-        h = ttk.Label(fmt_row, text="1km-Grid-Tiles als LAS 1.2 / PF1, CRS-Tag EPSG:2056  |  Default 'las':\n"
-                                     "genau dieses Format liest GeoSuite/REFRAME (LHN95->LN02) ein",
+        h = ttk.Label(fmt_row, text="1km-Grid-Tiles als LAS 1.4 / PF7 (mit RGB), CRS-Tag EPSG:2056\n"
+                                     "GeoSuite/REFRAME (LHN95->LN02) liest das seit dem LAS-1.4-Update "
+                                     "und behaelt die Farbe",
                        font=("", 8), justify="left")
         h.pack(side="left")
         self._dim_labels.append(h)
@@ -621,6 +621,7 @@ class DMCConverterApp(tk.Tk):
             ("Extent (X/Y):",    "_las_info_extent"),
             ("Z-Bereich:",       "_las_info_zrange"),
             ("Koordinatensys.:", "_las_info_crs"),
+            ("Farbe (RGB):",     "_las_info_rgb"),
             ("Komprimiert:",     "_las_info_compressed"),
             ("Dateigroesse:",    "_las_info_size"),
         ]
@@ -702,9 +703,8 @@ class DMCConverterApp(tk.Tk):
         intro = ttk.Label(sec, text="Nachgelagert zum Tab [LHN95]: dessen .las-Tiles, nachdem sie mit "
                                      "GeoSuite/REFRAME\nvon LHN95 nach LN02 reframt wurden. Kein Reframe, "
                                      "kein Re-Tiling, kein Punktwolken-Crop\nim Tool - nur die "
-                                     "GDWH-Metadaten (LAS 1.4 / PF6 / global_encoding 17 / "
-                                     "LV95_LN02) - bzw. PF7 mit Farbe, wenn unten ein "
-                                     "Master-Ordner gesetzt ist.",
+                                     "GDWH-Metadaten (LAS 1.4 / PF7 mit RGB / global_encoding 17 / "
+                                     "LV95_LN02).",
                            font=("", 8), justify="left")
         intro.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
         self._dim_labels.append(intro)
@@ -768,11 +768,13 @@ class DMCConverterApp(tk.Tk):
         meta_lbl = ttk.Label(sec, text="Ziel-Metadaten:", font=("Segoe UI", 9, "bold"))
         meta_lbl.grid(row=8, column=0, sticky="nw", pady=(6, 3))
         meta_val = ttk.Label(sec, justify="left", font=("", 8),
-                              text="LAS 1.4, Point Data Record Format 6, global_encoding 17, "
+                              text="LAS 1.4, Point Data Record Format 7 (PF6 + RGB), "
+                                   "global_encoding 17, "
                                    "scale 0.01,\nOffset = Tile-Ursprung (aus dem Dateinamen), "
                                    "CRS-Tag LV95 + LN02 (EPSG:2056+5728)\n"
-                                   "als byte-exakte Referenz-VLRs 34735 + 2112 "
-                                   "(identisch zu SB_DSM_PUNKTWOLKE)")
+                                   "als byte-exakte Referenz-VLRs 34735 + 2112\n"
+                                   "(wie SB_DSM_PUNKTWOLKE, dort aber PF6 - hier PF7, damit die "
+                                   "DMC-Farbe erhalten bleibt)")
         meta_val.grid(row=8, column=1, columnspan=2, sticky="w", padx=(8, 0), pady=(6, 3))
         self._dim_labels.append(meta_val)
 
@@ -801,14 +803,8 @@ class DMCConverterApp(tk.Tk):
         area = self._ln02_area_var.get().strip() or "AREA"
         out_format = getattr(self, "_ln02_out_format_var", None)
         ext = out_format.get() if out_format is not None else "laz"
-        # Das Zielformat haengt daran, ob ein Master-Ordner gesetzt ist - deshalb hier
-        # mitanzeigen, statt es erst im Log sichtbar zu machen.
-        master = getattr(self, "_ln02_master_var", None)
-        fmt_note = ("PF7 mit RGB" if (master is not None and master.get().strip())
-                    else "PF6 ohne Farbe")
         text = (f"Punktwolke (pro 1km-Tile):  "
-                f"{jahr}_{area}_TIN_[thinnedout<NN>_]raw_<E>_<N>_LV95_LN02.{ext}"
-                f"   [LAS 1.4 / {fmt_note}]")
+                f"{jahr}_{area}_TIN_[thinnedout<NN>_]raw_<E>_<N>_LV95_LN02.{ext}")
         if getattr(self, "_ln02_create_raster_var", None) and self._ln02_create_raster_var.get():
             try:
                 gsd_label = f"{round(float(self._ln02_gsd_var.get().strip().replace('m', '')) * 100)}cm"
@@ -836,26 +832,6 @@ class DMCConverterApp(tk.Tk):
         h = ttk.Label(sec, text="1km-Tiles (.las/.laz) nach dem GeoSuite-Reframe, CH1903+/LV95 + LN02.\n"
                                  "Dateiname muss auf '_<E>_<N>_LV95_<LHN95|LN02>' enden - daraus kommt "
                                  "der Tile-Ursprung.", font=("", 8), justify="left")
-        h.grid(row=row, column=1, sticky="w", padx=(8, 0))
-        self._dim_labels.append(h)
-        row += 1
-
-        lbl = ttk.Label(sec, text="Master-Ordner (PF7 mit RGB):", font=("Segoe UI", 9, "bold"))
-        lbl.grid(row=row, column=0, sticky="w", pady=(8, 3))
-        self._ln02_master_var = tk.StringVar()
-        ttk.Entry(sec, textvariable=self._ln02_master_var
-                   ).grid(row=row, column=1, sticky="ew", padx=(8, 4), pady=(8, 3))
-        ttk.Button(sec, text="Ordner…", command=self._browse_ln02_master
-                    ).grid(row=row, column=2, pady=(8, 3))
-        # Das Zielformat (PF6 oder PF7) haengt an diesem Feld - Vorschau mitziehen.
-        self._ln02_master_var.trace_add("write", lambda *_: self._update_ln02_name_preview())
-        row += 1
-        h = ttk.Label(sec, text="OPTIONAL - Unterordner '_master_PF7' im Output-Ordner des Tabs [LHN95].\n"
-                                 "Gesetzt: die Farbe (RGB) wird ins Endprodukt zurueckgeschrieben, "
-                                 "Ergebnis PF7. X/Y und alle Attribute\nkommen aus dem Master, Z verbatim "
-                                 "aus der GeoSuite-Ausgabe - die Transformation bleibt unangetastet.\n"
-                                 "Leer: wie bisher PF6 ohne Farbe.",
-                       font=("", 8), justify="left")
         h.grid(row=row, column=1, sticky="w", padx=(8, 0))
         self._dim_labels.append(h)
         row += 1
@@ -931,6 +907,7 @@ class DMCConverterApp(tk.Tk):
             ("Z-Bereich:",       "_ln02_info_zrange"),
             ("Koordinatensys.:", "_ln02_info_crs"),
             ("LAS-Version:",     "_ln02_info_version"),
+            ("Farbe (RGB):",     "_ln02_info_rgb"),
             ("global_encoding:", "_ln02_info_globalenc"),
             ("Komprimiert:",     "_ln02_info_compressed"),
             ("Dateigroesse:",    "_ln02_info_size"),
@@ -946,9 +923,9 @@ class DMCConverterApp(tk.Tk):
         info_hint = ttk.Label(sec,
             text="Metadaten des ersten gefundenen Tiles im Input-Ordner (stellvertretend fuer alle), "
                  "via pdal info.\nZeigt LAS-Version/Point-Format und global_encoding der QUELLE - "
-                 "'LAS 1.4 / PF6' + '17' heisst: bereits im Zielformat.\n"
-                 "Nach GeoSuite ist hier LAS 1.2 / PF1 der Normalfall - die Farbe kommt "
-                 "aus dem Master.",
+                 "'LAS 1.4 / PF7' + '17' heisst: bereits im Zielformat.\n"
+                 "Fehlt der Quelle die Farbe (PF ohne RGB), bleiben die RGB-Werte im "
+                 "Endprodukt 0 - der Lauf warnt dann pro Kachel.",
             font=("", 8), justify="left")
         info_hint.grid(row=len(fields), column=0, columnspan=2, sticky="w", pady=(4, 0))
         self._dim_labels.append(info_hint)
@@ -956,36 +933,6 @@ class DMCConverterApp(tk.Tk):
         refresh_btn = ttk.Button(sec, text="Datei-Info aktualisieren",
                                   command=self._refresh_ln02_info)
         refresh_btn.grid(row=len(fields) + 1, column=0, columnspan=2, sticky="w", pady=(8, 0))
-
-        # --- Master-Info (nur relevant, wenn ein Master-Ordner gesetzt ist) ---
-        ttk.Separator(sec, orient="horizontal").grid(
-            row=len(fields) + 2, column=0, columnspan=2, sticky="ew", pady=(10, 6))
-        m_fields = [
-            ("Master Version:",  "_ln02_master_info_version"),
-            ("Master Farbe:",    "_ln02_master_info_rgb"),
-            ("Master Punkte:",   "_ln02_master_info_count"),
-        ]
-        for i, (label, attr) in enumerate(m_fields):
-            lbl = ttk.Label(sec, text=label, font=("Segoe UI", 9, "bold"))
-            lbl.grid(row=len(fields) + 3 + i, column=0, sticky="w", pady=1)
-            val = ttk.Label(sec, text="–", font=("Segoe UI", 9))
-            val.grid(row=len(fields) + 3 + i, column=1, sticky="w", padx=(8, 0), pady=1)
-            setattr(self, attr, val)
-            self._accent_labels.append(val)
-
-        m_hint = ttk.Label(sec,
-            text="Erster Tile im Master-Ordner. 'LAS 1.4 / PF7' + Farbe 'ja' heisst: der Farb-Join "
-                 "kann laufen.\nOb in den RGB-Feldern auch Werte stehen, zeigt erst der Lauf selbst "
-                 "(RGB-Spanne pro Kachel im Log).",
-            font=("", 8), justify="left")
-        m_hint.grid(row=len(fields) + 3 + len(m_fields), column=0, columnspan=2,
-                    sticky="w", pady=(4, 0))
-        self._dim_labels.append(m_hint)
-
-        m_btn = ttk.Button(sec, text="Master-Info aktualisieren",
-                            command=self._refresh_ln02_master_info)
-        m_btn.grid(row=len(fields) + 4 + len(m_fields), column=0, columnspan=2,
-                   sticky="w", pady=(8, 0))
 
     def _build_ln02_staging(self, parent):
         sec = ttk.LabelFrame(parent, text="Staging & Parallelisierung", padding=10,
@@ -1326,19 +1273,6 @@ class DMCConverterApp(tk.Tk):
             self._ln02_in_var.set(path.replace("/", "\\"))
             self._refresh_ln02_info()
 
-    def _browse_ln02_master(self):
-        # Startpunkt: der Master liegt im Unterordner '_master_PF7' des LHN95-Outputs.
-        # Ist der Tab [LHN95] ausgefuellt, wird der Pfad direkt vorgeschlagen.
-        start = self._las_out_laz_var.get().strip()
-        kwargs = {"title": "Master-Ordner (PF7 mit RGB) auswaehlen"}
-        if start:
-            candidate = os.path.join(start, "_master_PF7")
-            kwargs["initialdir"] = candidate if os.path.isdir(candidate) else start
-        path = filedialog.askdirectory(**kwargs)
-        if path:
-            self._ln02_master_var.set(path.replace("/", "\\"))
-            self._refresh_ln02_master_info()
-
     def _browse_ln02_output_las(self):
         path = filedialog.askdirectory(title="Output-Ordner (Punktwolken-Tiles) auswaehlen")
         if path:
@@ -1494,15 +1428,9 @@ class DMCConverterApp(tk.Tk):
             ("_las_info_extent",     _pc_extent),
             ("_las_info_zrange",     _pc_zrange),
             ("_las_info_crs",        _pc_crs),
+            ("_las_info_rgb",        _pc_rgb),
             ("_las_info_compressed", _pc_compressed),
             ("_las_info_size",       _pc_size),
-        ))
-
-    def _refresh_ln02_master_info(self):
-        self._refresh_pointcloud_info(self._ln02_master_var.get().strip(), (
-            ("_ln02_master_info_version", _pc_version),
-            ("_ln02_master_info_rgb",     _pc_rgb),
-            ("_ln02_master_info_count",   _pc_count),
         ))
 
     def _refresh_ln02_info(self):
@@ -1512,6 +1440,7 @@ class DMCConverterApp(tk.Tk):
             ("_ln02_info_zrange",     _pc_zrange),
             ("_ln02_info_crs",        _pc_crs),
             ("_ln02_info_version",    _pc_version),
+            ("_ln02_info_rgb",        _pc_rgb),
             ("_ln02_info_globalenc",  _pc_globalenc),
             ("_ln02_info_compressed", _pc_compressed),
             ("_ln02_info_size",       _pc_size),
@@ -2040,18 +1969,6 @@ class DMCConverterApp(tk.Tk):
             errors.append("Input- und Output-Ordner sind identisch - bitte ein separates "
                            "Zielverzeichnis waehlen (die Quelldateien bleiben so unangetastet).")
 
-        # Master-Ordner ist optional - ist er aber gesetzt, muss er auch existieren und
-        # Kacheln enthalten. Sonst faellt das erst nach dem Metadaten-Scan auf.
-        master_dir = self._ln02_master_var.get().strip()
-        if master_dir:
-            if not os.path.isdir(master_dir):
-                errors.append(f"Master-Ordner (PF7 mit RGB) nicht gefunden:\n  {master_dir}")
-            elif not [p for pat in ("*.laz", "*.las")
-                      for p in _glob.glob(os.path.join(master_dir, pat))]:
-                errors.append("Master-Ordner enthaelt keine .las/.laz Kacheln:\n  "
-                              f"{master_dir}\nErwartet wird der Unterordner '_master_PF7' "
-                              "aus dem Output-Ordner des Tabs [LHN95].")
-
         if self._ln02_create_raster_var.get():
             try:
                 gsd = float(self._ln02_gsd_var.get().strip().replace("m", ""))
@@ -2101,7 +2018,6 @@ class DMCConverterApp(tk.Tk):
             "gsd":                 float(self._ln02_gsd_var.get().strip().replace("m", ""))
                                    if create_raster else None,
             "input_dir":           self._ln02_in_var.get().strip(),
-            "master_dir":          self._ln02_master_var.get().strip() or None,
             "output_dir_las":      self._ln02_out_las_var.get().strip(),
             "output_dir_raster":   self._ln02_out_raster_var.get().strip() if create_raster else None,
             "out_format":          self._ln02_out_format_var.get(),
