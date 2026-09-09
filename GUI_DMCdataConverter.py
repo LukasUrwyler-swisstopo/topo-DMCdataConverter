@@ -12,8 +12,11 @@ Tkinter-Oberflaeche mit drei Tabs:
   - "DMC - LASconverter [LN02]"  : die via GeoSuite nach LN02 reframten 1km-Tiles
                                    in die GDWH-taugliche LAS-1.4-Form bringen (PF7
                                    mit RGB, global_encoding 17, scale 0.01, Offset =
-                                   Tile-Ursprung, byte-exakte LV95/LN02-CRS-VLRs)
+                                   Tile-Ursprung, byte-exakte LV95/LN02-CRS-VLRs),
+                                   optional eine Virtual Point Cloud (.vpc) fuer QGIS
                                    und optional ebenfalls DSM + Hillshade rastern
+  - "Create DSM-Raster"          : DSM + Hillshade aus einem beliebigen Ordner mit
+                                   LAS/LAZ-Kacheln - ohne Punktwolken-Verarbeitung
 Styling analog zu topo-COGTIFFconverter / GUI_cogtiffConverter.py.
 
 Das GUI laeuft mit Standard-Python (kein osgeo erforderlich).
@@ -231,6 +234,22 @@ def _pc_version(meta: dict, path: str) -> str:
             f"  /  PF{meta.get('dataformat_id', '?')}")
 
 
+# Kachelname der Konverter-Tabs, z.B.
+# "2026_GUPPENFIRN_v2_TIN_thinnedout02_raw_2713_1206_LV95_LN02.laz".
+# Daraus lassen sich Jahr, AREA und Hoehenbezug fuer den Tab "Create DSM-Raster"
+# vorbelegen - eintippen muss man sie dann nur bei Fremddaten.
+_TILE_PROJECT_PATTERN = re.compile(
+    r"^(\d{4})_(.+?)_TIN_.*_LV95_(LHN95|LN02)\.(?:las|laz)$", re.IGNORECASE)
+
+
+def _project_from_tile_name(filename: str):
+    """(jahr, area, hoehenbezug) aus einem Kachelnamen - oder None."""
+    m = _TILE_PROJECT_PATTERN.match(os.path.basename(filename))
+    if not m:
+        return None
+    return m.group(1), m.group(2), m.group(3).upper()
+
+
 # Point Data Record Formats mit RGB-Feldern (LAS 1.4 R15, Tabellen 6-13)
 _PC_FORMATS_WITH_RGB = (2, 3, 5, 7, 8, 10)
 
@@ -331,13 +350,16 @@ class DMCConverterApp(tk.Tk):
         tab_tiff = ttk.Frame(self._notebook)
         tab_las  = ttk.Frame(self._notebook)
         tab_ln02 = ttk.Frame(self._notebook)
+        tab_dsm  = ttk.Frame(self._notebook)
         self._notebook.add(tab_tiff, text="DMC - TIFFconverter")
         self._notebook.add(tab_las,  text="DMC - LASconverter [LHN95]")
         self._notebook.add(tab_ln02, text="DMC - LASconverter [LN02]")
+        self._notebook.add(tab_dsm,  text="Create DSM-Raster")
 
         self._build_tiff_tab(tab_tiff)
         self._build_las_tab(tab_las)
         self._build_ln02_tab(tab_ln02)
+        self._build_dsm_tab(tab_dsm)
 
         # Log
         ttk.Separator(self).pack(fill="x", padx=12, pady=4)
@@ -724,20 +746,35 @@ class DMCConverterApp(tk.Tk):
         h2.grid(row=2, column=2, sticky="w", padx=(8, 0))
         self._dim_labels.append(h2)
 
+        self._ln02_create_vpc_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(sec, text="Create Virtual Point Cloud (VPC)  (alle Tiles als EINE Ebene in QGIS)",
+                         variable=self._ln02_create_vpc_var,
+                         command=self._update_ln02_name_preview
+                         ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        h_vpc = ttk.Label(sec, text="Legt '_vpc\\<JAHR>_<AREA>_LV95_LN02.vpc' im Output-Ordner an: eine "
+                                     "JSON-Datei, die alle\nfertigen Kacheln mit relativen Pfaden "
+                                     "zusammenfasst - das Punktwolken-Gegenstueck zum Raster-VRT.\n"
+                                     "Es wird nichts kopiert und nichts umgerechnet. QGIS ab 3.32 liest das "
+                                     "nativ, ArcGIS Pro NICHT\n(dort braucht es ein LAS-Dataset, das nur "
+                                     "arcpy erzeugen kann).",
+                           font=("", 8), justify="left")
+        h_vpc.grid(row=4, column=0, columnspan=3, sticky="w", padx=(20, 0))
+        self._dim_labels.append(h_vpc)
+
         self._ln02_create_raster_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(sec, text="Create DSM-Raster from LAS/LAZ  (ein Gesamt-TIFF+TFW fuer die AOI)",
                          variable=self._ln02_create_raster_var,
                          command=self._on_ln02_create_raster_toggle
-                         ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(10, 0))
+                         ).grid(row=5, column=0, columnspan=3, sticky="w", pady=(10, 0))
         h_rast = ttk.Label(sec, text="Alle Tiles -> IDW-Raster (DSM) -> Loecher bis 900 m2 interpoliert, "
                                       "groessere bleiben NoData\n-> per AOI maskiert -> Hillshade daraus "
                                       "(im AOI lochfrei, NoData=255 nur ausserhalb)",
                             font=("", 8), justify="left")
-        h_rast.grid(row=4, column=0, columnspan=3, sticky="w", padx=(20, 0))
+        h_rast.grid(row=6, column=0, columnspan=3, sticky="w", padx=(20, 0))
         self._dim_labels.append(h_rast)
 
         self._ln02_gsd_frame = ttk.Frame(sec)
-        self._ln02_gsd_frame.grid(row=5, column=0, columnspan=3, sticky="w",
+        self._ln02_gsd_frame.grid(row=7, column=0, columnspan=3, sticky="w",
                                    padx=(20, 0), pady=(4, 0))
         lbl3 = ttk.Label(self._ln02_gsd_frame, text="Raster-Aufloesung (GSD):",
                           font=("Segoe UI", 9, "bold"))
@@ -752,21 +789,21 @@ class DMCConverterApp(tk.Tk):
         self._on_ln02_create_raster_toggle()
 
         name_lbl = ttk.Label(sec, text="Ausgabe-Benennung:", font=("Segoe UI", 9, "bold"))
-        name_lbl.grid(row=6, column=0, sticky="nw", pady=(10, 3))
+        name_lbl.grid(row=8, column=0, sticky="nw", pady=(10, 3))
         self._ln02_name_preview_lbl = ttk.Label(sec, text="–", font=("Courier New", 9),
                                                  justify="left")
-        self._ln02_name_preview_lbl.grid(row=6, column=1, columnspan=2, sticky="w",
+        self._ln02_name_preview_lbl.grid(row=8, column=1, columnspan=2, sticky="w",
                                           padx=(8, 0), pady=(10, 3))
         self._accent_labels.append(self._ln02_name_preview_lbl)
 
         h_name = ttk.Label(sec, text="[thinnedout<NN>_] und <E>_<N> werden aus dem Input-Dateinamen "
                                       "uebernommen -\nausgeduennt wurde bereits im Tab [LHN95], "
                                       "hier wird nichts mehr veraendert.", font=("", 8), justify="left")
-        h_name.grid(row=7, column=1, columnspan=2, sticky="w", padx=(8, 0))
+        h_name.grid(row=9, column=1, columnspan=2, sticky="w", padx=(8, 0))
         self._dim_labels.append(h_name)
 
         meta_lbl = ttk.Label(sec, text="Ziel-Metadaten:", font=("Segoe UI", 9, "bold"))
-        meta_lbl.grid(row=8, column=0, sticky="nw", pady=(6, 3))
+        meta_lbl.grid(row=10, column=0, sticky="nw", pady=(6, 3))
         meta_val = ttk.Label(sec, justify="left", font=("", 8),
                               text="LAS 1.4, Point Data Record Format 7 (PF6 + RGB), "
                                    "global_encoding 17, "
@@ -775,7 +812,7 @@ class DMCConverterApp(tk.Tk):
                                    "als byte-exakte Referenz-VLRs 34735 + 2112\n"
                                    "(wie SB_DSM_PUNKTWOLKE, dort aber PF6 - hier PF7, damit die "
                                    "DMC-Farbe erhalten bleibt)")
-        meta_val.grid(row=8, column=1, columnspan=2, sticky="w", padx=(8, 0), pady=(6, 3))
+        meta_val.grid(row=10, column=1, columnspan=2, sticky="w", padx=(8, 0), pady=(6, 3))
         self._dim_labels.append(meta_val)
 
         for var in (self._ln02_jahr_var, self._ln02_area_var):
@@ -805,6 +842,8 @@ class DMCConverterApp(tk.Tk):
         ext = out_format.get() if out_format is not None else "laz"
         text = (f"Punktwolke (pro 1km-Tile):  "
                 f"{jahr}_{area}_TIN_[thinnedout<NN>_]raw_<E>_<N>_LV95_LN02.{ext}")
+        if getattr(self, "_ln02_create_vpc_var", None) and self._ln02_create_vpc_var.get():
+            text += f"\nVirtual Point Cloud (QGIS):   _vpc\\{jahr}_{area}_LV95_LN02.vpc"
         if getattr(self, "_ln02_create_raster_var", None) and self._ln02_create_raster_var.get():
             try:
                 gsd_label = f"{round(float(self._ln02_gsd_var.get().strip().replace('m', '')) * 100)}cm"
@@ -963,6 +1002,329 @@ class DMCConverterApp(tk.Tk):
         ttk.Checkbutton(sec, text="Staging-Dateien nach Abschluss behalten (nicht loeschen)",
                          variable=self._ln02_keep_staging_var
                          ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 0))
+
+    # ── Tab: Create DSM-Raster ────────────────────────────────────────────────
+    def _build_dsm_tab(self, parent):
+        sf = self._build_scrollable(parent, "_canvas_dsm", "_sf_dsm")
+
+        self._build_group_header(sf, "Projekt-Parameter")
+        self._build_dsm_projekt(sf)
+
+        self._build_group_header(sf, "Dateien")
+        self._build_dsm_dateien(sf)
+
+        self._build_group_header(sf, "Staging & Parallelisierung")
+        self._build_dsm_staging(sf)
+
+        btn_row = ttk.Frame(parent)
+        btn_row.pack(fill="x", pady=(6, 0))
+        self._start_btn_dsm = ttk.Button(btn_row, text="\u25b6   DSM-RASTER ERSTELLEN",
+                                          command=self._start_dsm)
+        self._start_btn_dsm.pack(side="right", ipadx=22, ipady=7)
+
+    def _build_dsm_projekt(self, parent):
+        sec = ttk.LabelFrame(parent, text="Projekt", padding=10,
+                              style="Section.TLabelframe")
+        sec.pack(fill="x", pady=(0, 6))
+        sec.columnconfigure(1, weight=1)
+
+        intro = ttk.Label(sec, text="Rastert einen beliebigen Ordner mit LAS/LAZ-Kacheln zu EINEM "
+                                     "DSM + Hillshade.\nKeine Punktwolken-Verarbeitung: kein Re-Tiling, "
+                                     "kein Thinning, kein Crop der Punkte -\nund die Hoehen werden "
+                                     "nirgends umgerechnet.",
+                           font=("", 8), justify="left")
+        intro.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
+        self._dim_labels.append(intro)
+
+        lbl = ttk.Label(sec, text="Jahr:", font=("Segoe UI", 9, "bold"))
+        lbl.grid(row=1, column=0, sticky="w", pady=3)
+        self._dsm_jahr_var = tk.StringVar()
+        ttk.Entry(sec, textvariable=self._dsm_jahr_var, width=12
+                   ).grid(row=1, column=1, sticky="w", padx=(8, 0), pady=3)
+        h = ttk.Label(sec, text="z.B.  2026", font=("", 8))
+        h.grid(row=1, column=2, sticky="w", padx=(8, 0))
+        self._dim_labels.append(h)
+
+        lbl2 = ttk.Label(sec, text="AREA / AOI - Name:", font=("Segoe UI", 9, "bold"))
+        lbl2.grid(row=2, column=0, sticky="w", pady=3)
+        self._dsm_area_var = tk.StringVar()
+        ttk.Entry(sec, textvariable=self._dsm_area_var, width=24
+                   ).grid(row=2, column=1, sticky="w", padx=(8, 0), pady=3)
+        h2 = ttk.Label(sec, text="z.B.  GUPPENFIRN", font=("", 8))
+        h2.grid(row=2, column=2, sticky="w", padx=(8, 0))
+        self._dim_labels.append(h2)
+
+        lbl3 = ttk.Label(sec, text="Hoehenbezug:", font=("Segoe UI", 9, "bold"))
+        lbl3.grid(row=3, column=0, sticky="w", pady=3)
+        self._dsm_href_var = tk.StringVar(value="LHN95")
+        ttk.Combobox(sec, textvariable=self._dsm_href_var, values=["LHN95", "LN02"],
+                     state="readonly", width=10
+                     ).grid(row=3, column=1, sticky="w", padx=(8, 0), pady=3)
+        h3 = ttk.Label(sec, text="Steuert NUR die Benennung und den SRS-Tag der Reader - "
+                                  "die Z-Werte bleiben unangetastet.\nWird aus dem ersten "
+                                  "Kachelnamen vorbelegt, sofern er der Konvention folgt.",
+                        font=("", 8), justify="left")
+        h3.grid(row=4, column=1, columnspan=2, sticky="w", padx=(8, 0))
+        self._dim_labels.append(h3)
+
+        gsd_row = ttk.Frame(sec)
+        gsd_row.grid(row=5, column=0, columnspan=3, sticky="w", pady=(10, 3))
+        ttk.Label(gsd_row, text="Raster-Aufloesung (GSD):",
+                  font=("Segoe UI", 9, "bold")).pack(side="left")
+        self._dsm_gsd_var = tk.StringVar(value="0.5")
+        ttk.Entry(gsd_row, textvariable=self._dsm_gsd_var, width=10
+                   ).pack(side="left", padx=(8, 8))
+        h4 = ttk.Label(gsd_row, text="in Metern, z.B. 0.5", font=("", 8))
+        h4.pack(side="left")
+        self._dim_labels.append(h4)
+
+        name_lbl = ttk.Label(sec, text="Ausgabe-Benennung:", font=("Segoe UI", 9, "bold"))
+        name_lbl.grid(row=6, column=0, sticky="nw", pady=(10, 3))
+        self._dsm_name_preview_lbl = ttk.Label(sec, text="\u2013", font=("Courier New", 9),
+                                                justify="left")
+        self._dsm_name_preview_lbl.grid(row=6, column=1, columnspan=2, sticky="w",
+                                         padx=(8, 0), pady=(10, 3))
+        self._accent_labels.append(self._dsm_name_preview_lbl)
+
+        for var in (self._dsm_jahr_var, self._dsm_area_var, self._dsm_gsd_var,
+                    self._dsm_href_var):
+            var.trace_add("write", lambda *_: self._update_dsm_name_preview())
+        self._update_dsm_name_preview()
+
+    def _update_dsm_name_preview(self):
+        if getattr(self, "_dsm_name_preview_lbl", None) is None:
+            return
+        jahr = self._dsm_jahr_var.get().strip() or "JAHR"
+        area = self._dsm_area_var.get().strip() or "AREA"
+        ref  = self._dsm_href_var.get().strip() or "LHN95"
+        try:
+            gsd_label = f"{round(float(self._dsm_gsd_var.get().strip().replace('m', '')) * 100)}cm"
+        except (ValueError, AttributeError):
+            gsd_label = "GSD"
+        self._dsm_name_preview_lbl.config(
+            text=(f"DSM (gesamte AOI):        {jahr}_{area}_DSM_{gsd_label}_LV95_{ref}.tif  (+ .tfw)"
+                  f"\nHillshade (gesamte AOI):  {jahr}_{area}_hillshade_{gsd_label}_LV95_{ref}.tif  (+ .tfw)"))
+
+    def _build_dsm_dateien(self, parent):
+        sec = ttk.LabelFrame(parent, text="Ordner & Shapes", padding=10,
+                              style="Section.TLabelframe")
+        sec.pack(fill="x", pady=(0, 6))
+        sec.columnconfigure(1, weight=1)
+
+        lbl = ttk.Label(sec, text="Input-Ordner (LAS/LAZ):", font=("Segoe UI", 9, "bold"))
+        lbl.grid(row=0, column=0, sticky="w", pady=3)
+        self._dsm_in_var = tk.StringVar()
+        ttk.Entry(sec, textvariable=self._dsm_in_var
+                   ).grid(row=0, column=1, sticky="ew", padx=(8, 4), pady=3)
+        ttk.Button(sec, text="Ordner\u2026", command=self._browse_dsm_input
+                    ).grid(row=0, column=2, pady=3)
+        h = ttk.Label(sec, text="Alle .las/.laz im Ordner werden verwendet. Die Kachelung ist "
+                                 "beliebig -\nintern wird zellweise gerastert und danach zu einem "
+                                 "Gesamtbild mosaikiert.",
+                       font=("", 8), justify="left")
+        h.grid(row=1, column=1, columnspan=2, sticky="w", padx=(8, 0))
+        self._dim_labels.append(h)
+
+        lbl2 = ttk.Label(sec, text="Output-Ordner (Raster):", font=("Segoe UI", 9, "bold"))
+        lbl2.grid(row=2, column=0, sticky="w", pady=(8, 3))
+        self._dsm_out_var = tk.StringVar()
+        ttk.Entry(sec, textvariable=self._dsm_out_var
+                   ).grid(row=2, column=1, sticky="ew", padx=(8, 4), pady=(8, 3))
+        ttk.Button(sec, text="Ordner\u2026", command=self._browse_dsm_output
+                    ).grid(row=2, column=2, pady=(8, 3))
+        h2 = ttk.Label(sec, text="DSM und Hillshade landen als je ein .tif + .tfw im selben Ordner",
+                        font=("", 8))
+        h2.grid(row=3, column=1, sticky="w", padx=(8, 0))
+        self._dim_labels.append(h2)
+
+        lbl3 = ttk.Label(sec, text="Footprint / AOI-Shape:", font=("Segoe UI", 9, "bold"))
+        lbl3.grid(row=4, column=0, sticky="w", pady=(8, 3))
+        self._dsm_clip_var = tk.StringVar()
+        ttk.Entry(sec, textvariable=self._dsm_clip_var
+                   ).grid(row=4, column=1, sticky="ew", padx=(8, 4), pady=(8, 3))
+        ttk.Button(sec, text="Datei\u2026", command=self._browse_dsm_clip_shape
+                    ).grid(row=4, column=2, pady=(8, 3))
+        h3 = ttk.Label(sec, text="Maskierung (kein Crop der Punkte): ausserhalb -> NoData, "
+                                  "Extent bleibt.\nDSM NoData = -3.4028235e+38, Hillshade NoData = 255.",
+                        font=("", 8), justify="left")
+        h3.grid(row=5, column=1, columnspan=2, sticky="w", padx=(8, 0))
+        self._dim_labels.append(h3)
+
+    def _build_dsm_staging(self, parent):
+        sec = ttk.LabelFrame(parent, text="Staging & Parallelisierung", padding=10,
+                              style="Section.TLabelframe")
+        sec.pack(fill="x", pady=(0, 6))
+        sec.columnconfigure(1, weight=1)
+
+        lbl = ttk.Label(sec, text="Staging-Ordner:", font=("Segoe UI", 9, "bold"))
+        lbl.grid(row=0, column=0, sticky="w", pady=3)
+        self._dsm_staging_var = tk.StringVar(value=DEFAULT_STAGING_DIR)
+        ttk.Entry(sec, textvariable=self._dsm_staging_var
+                   ).grid(row=0, column=1, sticky="ew", padx=(8, 4), pady=3)
+        ttk.Button(sec, text="Ordner\u2026", command=self._browse_dsm_staging
+                    ).grid(row=0, column=2, pady=3)
+        h = ttk.Label(sec, text="Zwischendateien (PDAL-Pipelines, Zell-Rohraster) fuer die Verarbeitung",
+                       font=("", 8))
+        h.grid(row=1, column=1, sticky="w", padx=(8, 0))
+        self._dim_labels.append(h)
+
+        lbl2 = ttk.Label(sec, text="CPU-Kerne:", font=("Segoe UI", 9, "bold"))
+        lbl2.grid(row=2, column=0, sticky="w", pady=(8, 3))
+        cpu_max = max(1, os.cpu_count() or 8)
+        self._dsm_workers_var = tk.StringVar(value=str(min(6, cpu_max)))
+        tk.Spinbox(sec, from_=1, to=cpu_max, textvariable=self._dsm_workers_var, width=6
+                   ).grid(row=2, column=1, sticky="w", padx=(8, 0), pady=(8, 3))
+
+        self._dsm_keep_staging_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(sec, text="Staging-Dateien nach Abschluss behalten (nicht loeschen)",
+                         variable=self._dsm_keep_staging_var
+                         ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 0))
+
+    # ── Browse-Helfer (DSM-Tab) ───────────────────────────────────────────────
+    def _browse_dsm_input(self):
+        path = filedialog.askdirectory(title="Input-Ordner (LAS/LAZ) auswaehlen")
+        if not path:
+            return
+        self._dsm_in_var.set(path.replace("/", "\\"))
+        # Jahr/AREA/Hoehenbezug aus dem ersten Kachelnamen vorbelegen, sofern er der
+        # Konvention folgt - bei Fremddaten bleibt alles wie eingetippt.
+        tiles = sorted(_glob.glob(os.path.join(path, "*.laz")) +
+                       _glob.glob(os.path.join(path, "*.las")))
+        if not tiles:
+            return
+        parsed = _project_from_tile_name(tiles[0])
+        if not parsed:
+            return
+        jahr, area, ref = parsed
+        if not self._dsm_jahr_var.get().strip():
+            self._dsm_jahr_var.set(jahr)
+        if not self._dsm_area_var.get().strip():
+            self._dsm_area_var.set(area)
+        self._dsm_href_var.set(ref)
+
+    def _browse_dsm_output(self):
+        path = filedialog.askdirectory(title="Output-Ordner (Raster) auswaehlen")
+        if path:
+            self._dsm_out_var.set(path.replace("/", "\\"))
+
+    def _browse_dsm_clip_shape(self):
+        current   = self._dsm_clip_var.get().strip()
+        start_dir = os.path.dirname(current) if current and os.path.isfile(current) \
+                    else self._dsm_in_var.get().strip()
+        kwargs = {"title": "Footprint / AOI-Shape auswaehlen",
+                  "filetypes": [("Shapefile", "*.shp"), ("Alle Dateien", "*.*")]}
+        if start_dir and os.path.isdir(start_dir):
+            kwargs["initialdir"] = start_dir
+        path = filedialog.askopenfilename(**kwargs)
+        if path:
+            self._dsm_clip_var.set(path.replace("/", "\\"))
+
+    def _browse_dsm_staging(self):
+        current = self._dsm_staging_var.get().strip()
+        kwargs = {"title": "Staging-Ordner auswaehlen"}
+        if current and os.path.isdir(current):
+            kwargs["initialdir"] = current
+        path = filedialog.askdirectory(**kwargs)
+        if path:
+            self._dsm_staging_var.set(path.replace("/", "\\"))
+
+    # ── Validierung (DSM-Tab) ─────────────────────────────────────────────────
+    def _validate_dsm(self):
+        errors = []
+
+        if not self._osgeo_python or not os.path.isfile(self._osgeo_python):
+            errors.append(
+                "OSGeo4W Python nicht gefunden.\n"
+                "Bitte Pfad via 'Aendern\u2026' festlegen  (z.B. C:\\OSGeo4W\\bin\\python3.exe)."
+            )
+        if not self._pdal_exe or not os.path.isfile(self._pdal_exe):
+            errors.append(
+                "pdal.exe wurde nicht gefunden.\n"
+                "Bitte pdal (Teil von OSGeo4W/QGIS) zum System-PATH hinzufuegen."
+            )
+
+        jahr = self._dsm_jahr_var.get().strip()
+        if not jahr or not jahr.isdigit():
+            errors.append("Jahr fehlt oder ist ungueltig (numerisch erwartet, z.B. 2026).")
+        if not self._dsm_area_var.get().strip():
+            errors.append("AREA / AOI - Name fehlt.")
+        if self._dsm_href_var.get().strip().upper() not in ("LHN95", "LN02"):
+            errors.append("Hoehenbezug ungueltig (LHN95 oder LN02).")
+
+        in_dir = self._dsm_in_var.get().strip()
+        if not in_dir:
+            errors.append("Input-Ordner fehlt.")
+        elif not os.path.isdir(in_dir):
+            errors.append(f"Input-Ordner nicht gefunden:\n  {in_dir}")
+        elif not [p for pat in ("*.las", "*.laz")
+                  for p in _glob.glob(os.path.join(in_dir, pat))]:
+            errors.append(f"Keine .las/.laz Kacheln im Input-Ordner:\n  {in_dir}")
+
+        if not self._dsm_out_var.get().strip():
+            errors.append("Output-Ordner (Raster) fehlt.")
+
+        clip = self._dsm_clip_var.get().strip()
+        if not clip:
+            errors.append("Footprint / AOI-Shape fehlt (wird fuer die Raster-Maskierung gebraucht).")
+        elif not os.path.isfile(clip):
+            errors.append(f"Footprint / AOI-Shape nicht gefunden:\n  {clip}")
+
+        try:
+            if float(self._dsm_gsd_var.get().strip().replace("m", "")) <= 0:
+                raise ValueError
+        except Exception:
+            errors.append("Raster-Aufloesung (GSD) ungueltig (Zahl in Metern erwartet, z.B. 0.5).")
+
+        if not self._dsm_staging_var.get().strip():
+            errors.append("Staging-Ordner fehlt.")
+        try:
+            if int(self._dsm_workers_var.get()) < 1:
+                raise ValueError
+        except Exception:
+            errors.append("CPU-Kerne ungueltig.")
+
+        if errors:
+            from tkinter import messagebox
+            messagebox.showerror("Eingabe-Fehler",
+                                  "\n\n".join(f"\u2022 {e}" for e in errors), parent=self)
+            return False
+        return True
+
+    # ── Verarbeitung starten (DSM-Tab) ────────────────────────────────────────
+    def _start_dsm(self):
+        if self._running:
+            return
+        if not self._validate_dsm():
+            return
+
+        cfg = {
+            "action":             "process_dsm",
+            "jahr":                self._dsm_jahr_var.get().strip(),
+            "area":                self._dsm_area_var.get().strip(),
+            "height_ref":          self._dsm_href_var.get().strip().upper(),
+            "gsd":                 float(self._dsm_gsd_var.get().strip().replace("m", "")),
+            "input_dir":           self._dsm_in_var.get().strip(),
+            "output_dir_raster":   self._dsm_out_var.get().strip(),
+            "clip_shape_path":     self._dsm_clip_var.get().strip(),
+            "staging_dir":         self._dsm_staging_var.get().strip(),
+            "num_workers":         int(self._dsm_workers_var.get()),
+            "keep_staging":        bool(self._dsm_keep_staging_var.get()),
+            "pdal_exe":            self._pdal_exe,
+        }
+
+        self._running = True
+        self._active_start_btn = self._start_btn_dsm
+        self._start_btn_dsm.config(state="disabled")
+        self._progress_frame.pack(fill="x", padx=12, pady=(0, 4), before=self._btn_row)
+        self._progress_bar.start(10)
+        self._clear_log()
+        self._log("=== DSM-Raster-Erstellung gestartet ===\n\n")
+
+        log_stem = f"{cfg['jahr']}_{cfg['area']}_DSM_{cfg['height_ref']}"
+        threading.Thread(
+            target=self._run_thread, args=(cfg, log_stem, "DSM-Raster-Erstellung"),
+            daemon=True
+        ).start()
 
     # ── Tab: DMC - TIFFconverter ───────────────────────────────────────────────
     def _build_tiff_tab(self, parent):
@@ -2017,6 +2379,7 @@ class DMCConverterApp(tk.Tk):
             "create_raster":       create_raster,
             "gsd":                 float(self._ln02_gsd_var.get().strip().replace("m", ""))
                                    if create_raster else None,
+            "create_vpc":          bool(self._ln02_create_vpc_var.get()),
             "input_dir":           self._ln02_in_var.get().strip(),
             "output_dir_las":      self._ln02_out_las_var.get().strip(),
             "output_dir_raster":   self._ln02_out_raster_var.get().strip() if create_raster else None,

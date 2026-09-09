@@ -16,6 +16,8 @@ Aktionen:
                   Kommentarblock direkt ueber _process_las() weiter unten.
     process_las_ln02 - DMC-LAS-Pipeline LN02 (Tab "DMC - LASconverter [LN02]"),
                   siehe Kommentarblock direkt ueber _process_las_ln02() weiter unten.
+    process_dsm - DSM + Hillshade aus einem beliebigen LAS/LAZ-Ordner
+                  (Tab "Create DSM-Raster"), siehe Kommentarblock ueber _process_dsm().
 """
 
 import sys
@@ -135,6 +137,33 @@ LN02_BBOX_TOLERANCE_M = 0.01   # zulaessige BBox-Abweichung Quelle vs. Ziel nach
 # byte-exakten Referenz-VLRs (siehe _inject_reference_vlrs).
 LAS_LN02_SRS = "EPSG:2056+5728"
 
+# ─── Virtual Point Cloud (VPC) fuer QGIS ───────────────────────────────────────
+# Eine .vpc ist das Punktwolken-Gegenstueck zum Raster-VRT: eine JSON-Datei (STAC-
+# FeatureCollection), die alle Kacheln zu EINER Ebene zusammenfasst. QGIS liest das
+# ab 3.32 nativ. Reines Ansichtsprodukt - es wird nichts kopiert und nichts
+# umgerechnet, die Datei verweist nur relativ auf die Kacheln daneben.
+#
+# ArcGIS Pro liest KEIN VPC. Dafuer braucht es ein LAS-Dataset (.lasd), das nur
+# arcpy erzeugen kann - hier bewusst nicht umgesetzt (kein arcpy im OSGeo4W-Python).
+#
+# Das Format ist an einer mit 'pdal_wrench build_vpc' erzeugten Referenz-VPC
+# nachgemessen und gegen den QGIS-Provider gegengelesen (QGIS 3.44). Dabei gilt:
+#   - 'proj:wkt2' MUSS gesetzt sein, sonst lehnt QGIS die Datei ab.
+#   - 'geometry'/'bbox' sind WGS84 (STAC-Konvention), die Landeskoordinaten stehen
+#     in 'proj:bbox'. Mit LV95 in 'bbox' laedt QGIS die Ebene zwar OHNE Fehler,
+#     liefert aber einen unendlichen Extent - man sieht nichts. Genau deshalb steht
+#     die Umrechnung nach WGS84 unten und nicht "spaeter vielleicht".
+#   - 'pc:schemas', 'stac_extensions' und 'proj:geometry' sind optional (geprueft).
+VPC_SUBDIR = "_vpc"
+VPC_STAC_VERSION = "1.0.0"
+VPC_STAC_EXTENSIONS = [
+    "https://stac-extensions.github.io/pointcloud/v1.0.0/schema.json",
+    "https://stac-extensions.github.io/projection/v1.1.0/schema.json",
+]
+# STAC-Pointcloud-Typ: 'eopc' = electro-optical point cloud. Fachlich korrekt fuer
+# photogrammetrisch abgeleitete Wolken (DMC/Reality Studio) - 'lidar' waere falsch.
+VPC_POINTCLOUD_TYPE = "eopc"
+
 # Kachelname-Muster fuer die deterministische Bestimmung des Kachelursprungs
 # (Offset), z.B. "2026_GUPPENFIRN_TIN_raw_2713_1206_LV95_LHN95.las" -> (2713, 1206).
 # Der Ursprung wird bewusst aus dem NAMEN geparst, nicht aus dem Datenminimum -
@@ -156,6 +185,29 @@ LV95_NORTHING_KM_RANGE = (1070, 1300)
 # NICHT aus GeoTIFF-Keys/EPSG-Code neu berechnen (siehe _inject_reference_vlrs) -
 # sondern unveraendert aus der Referenz uebernehmen.
 REFERENCE_VLR_DESCRIPTION = "by LAStools of rapidlasso GmbH"
+
+# VLRs, die einen RAUMBEZUG deklarieren. Alle davon muessen vor der Injektion raus -
+# im Ziel darf es genau EINE Aussage zum CRS geben, naemlich die Referenz unten.
+#
+# 'LASF_Projection' ist laut LAS-Spezifikation fuer Projektionsangaben reserviert und
+# wird komplett entfernt. 'liblas' ist der Grund, warum diese Liste ueberhaupt
+# existiert: PDALs writers.las schreibt denselben WKT ein ZWEITES Mal unter
+# user_id 'liblas', record_id 2112 ("OGR variant of OpenGIS WKT SRS") - an einer
+# erzeugten Kachel nachgemessen. Dieser Zwilling steht in der Datei VOR der
+# autoritativen Angabe und enthaelt nur den horizontalen Teil (LV95 ohne LN02). Ein
+# Leser, der schlicht den ersten 2112er nimmt, bekaeme damit die falsche Aussage.
+#
+# 'laszip encoded' (22204) ist ausdruecklich NICHT betroffen - ohne diesen VLR laesst
+# sich eine .laz nicht mehr dekomprimieren.
+CRS_VLR_USER_IDS   = ("LASF_Projection", "liblas")
+CRS_VLR_RECORD_IDS = (2111, 2112, 34735, 34736, 34737)
+
+
+def _is_crs_vlr(user_id: str, record_id: int) -> bool:
+    """True, wenn dieser VLR einen Raumbezug deklariert (siehe CRS_VLR_USER_IDS)."""
+    if user_id == "LASF_Projection":
+        return True
+    return user_id in CRS_VLR_USER_IDS and record_id in CRS_VLR_RECORD_IDS
 REFERENCE_VLR_34735_B64 = (
     "AQABAAAABQAABAAAAQABAAAMAAABAAgIBAwAAAEAKSMDEAAAAQApIwAQAAABAGAW"
 )
@@ -1710,10 +1762,11 @@ def _inject_reference_vlrs(las_path: str) -> int:
     Header), jeder echte Dekompressions-Durchlauf bricht aber mit 'Invalid version
     ... found in LAZ chunk table' ab.
 
-    Ein bereits vorhandener VLR mit user_id 'LASF_Projection' wird ENTFERNT, nicht
-    als Fehler behandelt: PDAL uebernimmt eine in der Quelle vorgefundene (hier:
-    LHN95-)SRS-VLR beim Schreiben automatisch. Autoritativ fuer die Ziel-CRS ist
-    ausschliesslich die Referenz unten.
+    Bereits vorhandene CRS-VLRs werden ENTFERNT, nicht als Fehler behandelt: PDAL
+    uebernimmt eine in der Quelle vorgefundene (hier: LHN95-)SRS-VLR beim Schreiben
+    automatisch und legt zusaetzlich seinen eigenen 'liblas'-Zwilling an. Autoritativ
+    fuer die Ziel-CRS ist ausschliesslich die Referenz unten - welche VLRs deshalb
+    weichen muessen, steht bei CRS_VLR_USER_IDS.
 
     Arbeitet in-place - nur auf einer Temp-Datei aufrufen (siehe _ln02_tile_worker).
     Gibt die Anzahl entfernter 'LASF_Projection'-VLRs zurueck.
@@ -1740,7 +1793,7 @@ def _inject_reference_vlrs(las_path: str) -> int:
             "<H16sHH32s", existing_vlr_block, pos)
         user_id = user_id_raw.split(b"\x00")[0].decode("ascii", "replace")
         vlr_len = 54 + record_len
-        if user_id == "LASF_Projection":
+        if _is_crs_vlr(user_id, record_id):
             n_stripped += 1
         else:
             kept_vlr_chunks.append(existing_vlr_block[pos:pos + vlr_len])
@@ -2038,15 +2091,19 @@ def _validate_ln02_target(src_md: dict, dst_md: dict, src_measured: dict = None,
             problems.append(f"{field}={dst_md.get(field)}, erwartet {expected}")
 
     found_34735 = found_2112 = vlr2112_ok = False
+    stray_crs = []
     i = 0
     while f"vlr_{i}" in dst_md:
         vlr = dst_md[f"vlr_{i}"]
-        if vlr.get("user_id") == "LASF_Projection":
-            if vlr.get("record_id") == 34735:
-                found_34735 = True
-            elif vlr.get("record_id") == 2112:
-                found_2112 = True
-                vlr2112_ok = base64.b64decode(vlr.get("data", "")).endswith(b"\x00")
+        user_id = vlr.get("user_id")
+        record_id = vlr.get("record_id")
+        if user_id == "LASF_Projection" and record_id == 34735:
+            found_34735 = True
+        elif user_id == "LASF_Projection" and record_id == 2112:
+            found_2112 = True
+            vlr2112_ok = base64.b64decode(vlr.get("data", "")).endswith(b"\x00")
+        elif _is_crs_vlr(user_id or "", record_id or 0):
+            stray_crs.append(f"{user_id}/{record_id}")
         i += 1
     if not found_34735:
         problems.append("VLR record_id 34735 (GeoTIFF KeyDirectory) fehlt im Ziel.")
@@ -2054,6 +2111,14 @@ def _validate_ln02_target(src_md: dict, dst_md: dict, src_measured: dict = None,
         problems.append("VLR record_id 2112 (OGC WKT) fehlt im Ziel.")
     elif not vlr2112_ok:
         problems.append("VLR record_id 2112 (OGC WKT) endet nicht auf Nullbyte.")
+    # Genau EINE Aussage zum CRS: jeder weitere raumbezogene VLR ist eine zweite,
+    # konkurrierende Angabe. Ein Leser, der den falschen nimmt, bekaeme LV95 ohne
+    # LN02 - und niemand wuerde es merken. Deshalb harter Fehler, nicht Warnung.
+    if stray_crs:
+        problems.append(
+            "Zusaetzliche CRS-VLRs im Ziel neben der Referenz: "
+            + ", ".join(stray_crs)
+            + " - die Kachel traegt damit mehr als eine Aussage zum Raumbezug.")
 
     h_epsg, v_epsg = _resolve_crs_epsg(dst_md)
     if h_epsg != 2056:
@@ -2205,7 +2270,7 @@ def _ln02_tile_worker(args) -> tuple:
         n_stripped = _inject_reference_vlrs(tmp_path)
         if n_stripped:
             warnings.append(f"{src_name}: {n_stripped} aus der Quelle uebernommene(r) "
-                             f"'LASF_Projection'-VLR(s) entfernt (nicht autoritativ) - durch die "
+                             f"CRS-VLR(s) entfernt (nicht autoritativ) - durch die "
                              f"LV95/LN02-Referenz-VLRs ersetzt.")
         dst_md = _pdal_info_metadata(pdal_exe, tmp_path)
         val_warnings = []
@@ -2246,6 +2311,132 @@ def _ln02_tile_worker(args) -> tuple:
                 pass
 
 
+def _vpc_tile_worker(args) -> tuple:
+    """Header-Fakten EINER fertigen Ausgabe-Kachel fuer die VPC (Punktanzahl und
+    3D-BBox). Headerbasiert wie _tile_bbox_worker - die Punktdaten werden nicht
+    gelesen, bei .laz also auch nichts dekomprimiert."""
+    pdal_exe, path = args
+    try:
+        md = _pdal_info_metadata(pdal_exe, path)
+        return (path, int(md.get("count", 0)),
+                float(md["minx"]), float(md["miny"]), float(md["minz"]),
+                float(md["maxx"]), float(md["maxy"]), float(md["maxz"]), None)
+    except Exception as e:
+        return (path, None, None, None, None, None, None, None, str(e))
+
+
+def _vpc_feature(stem: str, href: str, count: int, native_bbox: tuple,
+                  lonlat_ring: list, wkt2: str, encoding: str, stamp: str) -> dict:
+    """EIN STAC-Feature der VPC. Bewusst ohne 'pc:schemas' und 'proj:geometry':
+    beides ist optional (am QGIS-Provider geprueft) und waere nur Ballast - die
+    Dimensionsliste stuende sonst fuer jede Kachel identisch in der Datei.
+
+    'native_bbox' ist (minx, miny, minz, maxx, maxy, maxz) in LV95, 'lonlat_ring'
+    der geschlossene WGS84-Ring aus denselben Ecken."""
+    minx, miny, minz, maxx, maxy, maxz = native_bbox
+    lons = [p[0] for p in lonlat_ring]
+    lats = [p[1] for p in lonlat_ring]
+    return {
+        "type": "Feature",
+        "stac_version": VPC_STAC_VERSION,
+        "stac_extensions": list(VPC_STAC_EXTENSIONS),
+        "id": stem,
+        "geometry": {"type": "Polygon",
+                      "coordinates": [[[lon, lat] for lon, lat in lonlat_ring]]},
+        # Reihenfolge nach STAC: [minx, miny, minz, maxx, maxy, maxz] - horizontal
+        # in WGS84, vertikal in Metern (die Hoehe wird nicht umgerechnet).
+        "bbox": [min(lons), min(lats), minz, max(lons), max(lats), maxz],
+        "properties": {
+            "datetime": stamp,
+            "pc:count": count,
+            "pc:type": VPC_POINTCLOUD_TYPE,
+            "pc:encoding": encoding,
+            "proj:bbox": [minx, miny, minz, maxx, maxy, maxz],
+            "proj:wkt2": wkt2,
+        },
+        "links": [],
+        "assets": {"data": {"href": href, "roles": ["data"]}},
+    }
+
+
+def _build_vpc(features: list) -> dict:
+    """Die VPC als Ganzes - eine GeoJSON/STAC-FeatureCollection."""
+    return {"type": "FeatureCollection", "features": features}
+
+
+def _write_vpc(tile_paths: list, vpc_path: str, pdal_exe: str, num_workers: int,
+                log) -> int:
+    """Schreibt die Virtual Point Cloud fuer die uebergebenen Kacheln und gibt die
+    Anzahl aufgenommener Kacheln zurueck.
+
+    Die Kachel-Fakten werden aus den Headern der FERTIGEN Ausgabedateien gelesen
+    (parallel, ohne die Punktdaten anzufassen) - nicht aus den Job-Ergebnissen. So
+    beschreibt die VPC nachweislich das, was im Ordner liegt, statt das, was der
+    Lauf zu schreiben glaubte; unveraendert kopierte Kacheln sind damit ebenso
+    erfasst wie konvertierte.
+
+    Die Pfade sind RELATIV zum Speicherort der .vpc - der Ordner laesst sich damit
+    verschieben oder kopieren, ohne dass die Datei bricht."""
+    from osgeo import osr
+    osr.UseExceptions()
+
+    # Zielkoordinaten der STAC-Felder: WGS84 in Lon/Lat-Reihenfolge. Ohne
+    # TRADITIONAL_GIS_ORDER liefert GDAL 3 bei EPSG:4326 Lat/Lon - die VPC waere
+    # dann um 90 Grad "verdreht" und QGIS zeigte die Kacheln irgendwo im Meer.
+    lv95 = osr.SpatialReference()
+    lv95.ImportFromEPSG(2056)
+    lv95.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+    wgs84 = osr.SpatialReference()
+    wgs84.ImportFromEPSG(4326)
+    wgs84.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+    to_wgs84 = osr.CoordinateTransformation(lv95, wgs84)
+    # Nur der horizontale Rahmen: die VPC ist eine Kartenebene. Der Hoehenbezug
+    # (LN02) steckt in den byte-exakten CRS-VLRs der Kacheln selbst - ein
+    # Compound-CRS an dieser Stelle wuerde die Karten-Ansicht nur verwirren.
+    wkt2 = lv95.ExportToWkt()
+
+    facts = []
+    errors = []
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        futures = [executor.submit(_vpc_tile_worker, (pdal_exe, p)) for p in tile_paths]
+        for fut in as_completed(futures):
+            path, count, minx, miny, minz, maxx, maxy, maxz, err = fut.result()
+            if err:
+                errors.append((path, err))
+            else:
+                facts.append((path, count, minx, miny, minz, maxx, maxy, maxz))
+
+    for p, e in errors:
+        log(f"  WARNUNG: {Path(p).name} nicht in die VPC aufgenommen "
+            f"(Header nicht lesbar): {e}")
+    if not facts:
+        raise RuntimeError("Keine Kachel fuer die VPC lesbar - Datei nicht geschrieben.")
+
+    facts.sort(key=lambda f: f[0])
+    vpc_dir = Path(vpc_path).parent
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    features = []
+    for path, count, minx, miny, minz, maxx, maxy, maxz in facts:
+        ring_native = [(minx, miny), (minx, maxy), (maxx, maxy), (maxx, miny), (minx, miny)]
+        ring_wgs84 = []
+        for x, y in ring_native:
+            lon, lat, _ = to_wgs84.TransformPoint(x, y)
+            ring_wgs84.append((lon, lat))
+        href = os.path.relpath(path, str(vpc_dir)).replace("\\", "/")
+        if not href.startswith("."):
+            href = "./" + href
+        encoding = ("application/vnd.laszip" if path.lower().endswith(".laz")
+                    else "application/vnd.las")
+        features.append(_vpc_feature(Path(path).stem, href, count,
+                                      (minx, miny, minz, maxx, maxy, maxz),
+                                      ring_wgs84, wkt2, encoding, stamp))
+
+    Path(vpc_path).parent.mkdir(parents=True, exist_ok=True)
+    with open(vpc_path, "w", encoding="utf-8") as f:
+        json.dump(_build_vpc(features), f, indent=1)
+    return len(features)
+
+
 def _process_las_ln02(cfg: dict) -> None:
     from osgeo import gdal, ogr
 
@@ -2253,6 +2444,8 @@ def _process_las_ln02(cfg: dict) -> None:
     area              = str(cfg["area"]).strip()
     create_raster     = bool(cfg.get("create_raster", False))
     gsd_raster        = float(cfg["gsd"]) if create_raster else None
+    # Virtual Point Cloud fuer QGIS - reines Ansichtsprodukt neben der Lieferung.
+    create_vpc        = bool(cfg.get("create_vpc", False))
     input_dir         = cfg["input_dir"]
     output_dir_las    = cfg["output_dir_las"]
     output_dir_raster = cfg.get("output_dir_raster")
@@ -2385,6 +2578,9 @@ def _process_las_ln02(cfg: dict) -> None:
         _log(f"  WARNUNG: Punktformat der Quelle nicht lesbar ({e}) - RGB-Hinweis "
              f"uebersprungen.")
     _log(f"Punktwolken-Format  : .{out_format}")
+    _log(f"LAS-Dataset / VPC   : "
+         + (f"AKTIV - {VPC_SUBDIR}/{jahr}_{area}_LV95_LN02.vpc (fuer QGIS)"
+            if create_vpc else "inaktiv"))
     _log(f"Raster erstellen    : "
          f"{'AKTIV (GSD ' + format(gsd_raster, 'g') + ' m)' if create_raster else 'inaktiv'}")
     _log(f"Benennung           : {jahr}_{area}_TIN_[thinnedout<NN>_]raw_<E>_<N>_LV95_LN02."
@@ -2531,6 +2727,28 @@ def _process_las_ln02(cfg: dict) -> None:
                 _log(f"  [Retry {i}/{len(failed)}] FEHLER bleibt bei "
                      f"{_job_label(kind, name)}: {res[2]}")
 
+    # --- Schritt 5b: Virtual Point Cloud (QGIS) ---
+    # Bewusst NACH der Konversion und aus dem Ordner-Inhalt heraus: die VPC soll
+    # beschreiben, was tatsaechlich ausgeliefert wird. Ein Fehler hier darf den Lauf
+    # nicht scheitern lassen - die Kacheln sind das Produkt, die VPC nur die Ansicht.
+    if create_vpc:
+        vpc_tiles = sorted(glob.glob(os.path.join(output_dir_las, f"*.{out_format}")))
+        _log(f"\nVirtual Point Cloud (QGIS): {len(vpc_tiles)} Kachel(n) im Output-Ordner")
+        if not vpc_tiles:
+            _log(f"  WARNUNG: keine .{out_format}-Kachel im Output-Ordner - "
+                 f"keine VPC geschrieben.")
+        else:
+            vpc_path = str(Path(output_dir_las) / VPC_SUBDIR /
+                           f"{jahr}_{area}_LV95_LN02.vpc")
+            try:
+                n_vpc = _write_vpc(vpc_tiles, vpc_path, pdal_exe, num_workers, _log)
+                _log(f"  Geschrieben: {vpc_path}")
+                _log(f"  {n_vpc} Kachel(n) referenziert (relative Pfade). In QGIS als "
+                     f"eine Punktwolken-Ebene zu oeffnen; ArcGIS Pro liest das Format nicht.")
+            except Exception as e:
+                _log(f"  WARNUNG: VPC konnte nicht geschrieben werden ({e}) - die "
+                     f"Kacheln selbst sind davon nicht betroffen.")
+
     # --- Schritt 6: Zell-Raster zum Gesamt-DSM mosaikieren, dann Hillshade ---
     if create_raster:
         if errors_by_kind["dsm"]:
@@ -2566,6 +2784,266 @@ def _process_las_ln02(cfg: dict) -> None:
                             f"verarbeitet werden - siehe Log.")
 
 
+# ─── Create DSM-Raster (eigenstaendiger Raster-Build) ──────────────────────────
+#
+# Rastert einen beliebigen Ordner mit LAS/LAZ-Kacheln zu EINEM DSM + Hillshade.
+# Gegenstueck zur Raster-Option der beiden Konverter-Tabs, nur ohne deren
+# Punktwolken-Verarbeitung: kein Re-Tiling, kein Thinning, kein Crop der Punkte.
+#
+# Unterschied zu den anderen Tabs beim Zellschnitt: die brauchen ihre Zellen ohnehin
+# fuer die Punktwolken-Ausgabe und holen sie deshalb aus dem Grid-Shape bzw. aus den
+# Dateinamen. Hier sind die Zellen NUR ein Mittel zur Parallelisierung und
+# Speicherbegrenzung (ein Gesamt-Merge ueber alle Kacheln sprengt bei grossen
+# Projekten den RAM). Deshalb wird das 1km-Raster direkt aus dem Gesamt-Extent
+# abgeleitet - kein Grid-Shape noetig, und die Kachelnamen muessen keiner Konvention
+# folgen. Das Ergebnis ist identisch, weil ohnehin mosaikiert wird.
+def _dsm_cell_jobs(tile_bboxes, snap_bounds: tuple, gsd: float, srs: str) -> list:
+    """Zerlegt den Datenbereich in 1km-Arbeitszellen fuer den Tab "Create DSM-Raster".
+
+    Anders als in den Konverter-Tabs sind die Zellen hier KEINE Ausgabegeometrie,
+    sondern nur ein Mittel zur Parallelisierung und Speicherbegrenzung (ein
+    Gesamt-Merge ueber alle Kacheln sprengt bei grossen Projekten den RAM). Sie
+    werden am Ende ohnehin mosaikiert.
+
+    Zwei Eigenschaften, auf die es ankommt:
+      - Die Zellen werden auf 'snap_bounds' BESCHNITTEN. Ohne das rastert eine
+        Kachel, die nur in einer Ecke ihrer Kilometerzelle liegt, trotzdem den
+        ganzen Quadratkilometer; das anschliessende Fuellen der NoData-Loecher
+        laeuft dann ueber eine riesige leere Flaeche (an einem Testdatensatz
+        gemessen: 7.7 Mio. NoData-Pixel und >120 s statt 0 Pixel und ~1 s).
+      - Jede Zelle bekommt die Kacheln, die ihren GEPUFFERTEN Ausschnitt beruehren.
+        Der Puffer haelt die IDW-Nachbarschaft am Zellrand vollstaendig - sonst
+        bleibt sie einseitig und an jeder Zellgrenze entsteht eine sichtbare Naht.
+
+    'tile_bboxes' ist [(pfad, minx, miny, maxx, maxy), ...]. Zurueck kommen die
+    Jobs fuer _raster_cell_worker; Zellen ohne beitragende Kachel entfallen."""
+    buf = _raster_cell_buffer(gsd, None)
+    ox, oy = snap_bounds[0], snap_bounds[1]
+    all_minx = min(b[1] for b in tile_bboxes)
+    all_miny = min(b[2] for b in tile_bboxes)
+    all_maxx = max(b[3] for b in tile_bboxes)
+    all_maxy = max(b[4] for b in tile_bboxes)
+
+    jobs = []
+    for e_km in range(int(math.floor(all_minx / 1000.0)), int(math.ceil(all_maxx / 1000.0))):
+        for n_km in range(int(math.floor(all_miny / 1000.0)), int(math.ceil(all_maxy / 1000.0))):
+            cminx = max(e_km * 1000.0, snap_bounds[0])
+            cmaxx = min(e_km * 1000.0 + 1000.0, snap_bounds[2])
+            cminy = max(n_km * 1000.0, snap_bounds[1])
+            cmaxy = min(n_km * 1000.0 + 1000.0, snap_bounds[3])
+            if cmaxx <= cminx or cmaxy <= cminy:
+                continue
+            # Auf das globale, gesnappte GSD-Raster legen, damit sich die
+            # Zell-Raster luecken- und ueberlappungsfrei mosaikieren lassen. Das
+            # Epsilon faengt Float-Rauschen ab (sonst gelegentlich eine
+            # Pixelspalte Ueberlappung).
+            rb = (ox + math.floor((cminx - ox) / gsd + 1e-6) * gsd,
+                  oy + math.floor((cminy - oy) / gsd + 1e-6) * gsd,
+                  ox + math.ceil((cmaxx - ox) / gsd - 1e-6) * gsd,
+                  oy + math.ceil((cmaxy - oy) / gsd - 1e-6) * gsd)
+            cell_tiles = [b[0] for b in tile_bboxes
+                          if not (b[3] <= rb[0] - buf or b[1] >= rb[2] + buf or
+                                  b[4] <= rb[1] - buf or b[2] >= rb[3] + buf)]
+            if not cell_tiles:
+                continue
+            jobs.append({"cell": f"{e_km}_{n_km}", "raster_bounds": rb,
+                         "tiles": cell_tiles, "srs": srs})
+    return jobs
+
+
+def _process_dsm(cfg: dict) -> None:
+    from osgeo import gdal, ogr
+
+    jahr              = str(cfg["jahr"]).strip()
+    area              = str(cfg["area"]).strip()
+    input_dir         = cfg["input_dir"]
+    output_dir_raster = cfg["output_dir_raster"]
+    clip_shape_path   = cfg["clip_shape_path"]
+    gsd_raster        = float(cfg["gsd"])
+    # Nur fuer die Benennung und den SRS-Tag der Reader - gerastert wird in beiden
+    # Faellen identisch (die Hoehe wird nirgends umgerechnet, siehe _mosaic_las_raster).
+    height_ref        = str(cfg.get("height_ref", "LHN95")).strip().upper()
+    staging_dir       = cfg["staging_dir"]
+    num_workers       = int(cfg.get("num_workers", 6))
+    keep_staging      = bool(cfg.get("keep_staging", False))
+    pdal_exe          = cfg["pdal_exe"]
+
+    def _log(msg: str) -> None:
+        print(msg, flush=True)
+
+    if height_ref not in ("LHN95", "LN02"):
+        raise ValueError(f"Hoehenbezug '{height_ref}' unbekannt - erwartet LHN95 oder LN02.")
+    if not pdal_exe or not os.path.isfile(pdal_exe):
+        raise FileNotFoundError(
+            "pdal.exe wurde nicht gefunden. Bitte pdal (Teil von OSGeo4W/QGIS) "
+            "zum System-PATH hinzufuegen.")
+    if not clip_shape_path or not os.path.isfile(clip_shape_path):
+        raise FileNotFoundError(
+            f"AOI/Footprint-Shape fuer die Raster-Maskierung nicht gefunden: {clip_shape_path}")
+
+    gdal.UseExceptions()
+    ogr.UseExceptions()
+
+    Path(output_dir_raster).mkdir(parents=True, exist_ok=True)
+    run_dir = Path(staging_dir) / f"{area}_{jahr}_DSM"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    cells_dir = run_dir / "03_raster_cells"
+    cells_dir.mkdir(parents=True, exist_ok=True)
+    _log(f"Staging-Ordner: {run_dir}")
+    _log(f"PDAL           : {pdal_exe}")
+
+    last_emit = {"t": 0.0, "p": -1.0}
+
+    def _progress(complete, message, unknown=None):
+        try:
+            if complete is None:
+                return 1
+            pct = float(complete)
+            now = time.time()
+            if (now - last_emit["t"]) >= 1.0 or (pct - last_emit["p"]) >= 0.005:
+                print(f"PROGRESS:{0.90 + pct * 0.10:.6f}", flush=True)
+                last_emit["t"] = now
+                last_emit["p"] = pct
+        except Exception:
+            pass
+        return 1
+
+    # --- Schritt 1: Input-Kacheln + Bounding Boxes (parallel, headerbasiert) ---
+    tiles = sorted(glob.glob(os.path.join(input_dir, "*.laz")) +
+                   glob.glob(os.path.join(input_dir, "*.las")))
+    if not tiles:
+        raise FileNotFoundError(f"Keine .laz/.las Kacheln gefunden in: {input_dir}")
+    _log(f"\nGefundene Input-Kacheln: {len(tiles)}")
+
+    _log("Lese Metadaten (Bounding Box) aller Kacheln...")
+    tile_bboxes = []
+    meta_errors = []
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        futures = [executor.submit(_tile_bbox_worker, (pdal_exe, t)) for t in tiles]
+        for i, fut in enumerate(as_completed(futures), 1):
+            path, minx, miny, maxx, maxy, _genc, err = fut.result()
+            if err:
+                meta_errors.append((path, err))
+            else:
+                tile_bboxes.append((path, minx, miny, maxx, maxy))
+            if i == len(tiles) or i % max(1, len(tiles) // 100) == 0:
+                print(f"PROGRESS:{(i / len(tiles)) * 0.10:.6f}", flush=True)
+
+    for p, e in meta_errors:
+        _log(f"  WARNUNG: Metadaten von {Path(p).name} nicht lesbar: {e}")
+    if not tile_bboxes:
+        raise RuntimeError("Keine gueltigen Kachel-Metadaten gefunden.")
+
+    all_minx = min(b[1] for b in tile_bboxes)
+    all_miny = min(b[2] for b in tile_bboxes)
+    all_maxx = max(b[3] for b in tile_bboxes)
+    all_maxy = max(b[4] for b in tile_bboxes)
+    _log(f"  Gesamt-Extent Input: {all_minx:.1f}, {all_miny:.1f} - "
+         f"{all_maxx:.1f}, {all_maxy:.1f}")
+
+    # --- Schritt 2: Zielnamen und gesnapptes Zielgitter ---
+    gsd_label = f"{round(gsd_raster * 100)}cm"
+    raster_name = f"{jahr}_{area}_DSM_{gsd_label}_LV95_{height_ref}.tif"
+    hillshade_name = f"{jahr}_{area}_hillshade_{gsd_label}_LV95_{height_ref}.tif"
+    raster_out_path = str(Path(output_dir_raster) / raster_name)
+    hillshade_out_path = str(Path(output_dir_raster) / hillshade_name)
+    # Pixelursprung auf ein sauberes GSD-Vielfaches snappen (keine AOI-Kante im Grid)
+    snap_bounds = ((all_minx // gsd_raster) * gsd_raster,
+                   (all_miny // gsd_raster) * gsd_raster,
+                   math.ceil(all_maxx / gsd_raster) * gsd_raster,
+                   math.ceil(all_maxy / gsd_raster) * gsd_raster)
+    src_srs = LAS_LN02_SRS if height_ref == "LN02" else LAS_INPUT_SRS
+
+    _log(f"\nRaster-Aufloesung   : {format(gsd_raster, 'g')} m")
+    _log(f"Hoehenbezug         : {height_ref}  (nur Benennung und SRS-Tag der Reader - "
+         f"die Z-Werte werden nirgends umgerechnet)")
+    _log(f"SRS der Eingabe     : {src_srs}  (den Readern aufgezwungen)")
+    _log(f"Raster-Benennung    : {raster_name}  (+ .tfw)")
+    _log(f"Hillshade-Benennung : {hillshade_name}  (+ .tfw)")
+    _log(f"AOI/Footprint-Shape : {clip_shape_path}")
+
+    # --- Schritt 3: 1km-Zellen aus dem Extent ableiten ---
+    jobs = _dsm_cell_jobs(tile_bboxes, snap_bounds, gsd_raster, src_srs)
+    if not jobs:
+        raise RuntimeError("Keine Zelle mit Punkten - Input-Ordner pruefen.")
+    _log(f"\nStarte parallele Verarbeitung: {len(jobs)} DSM-Zelle(n) auf "
+         f"{num_workers} Prozess(en)\n")
+
+    # --- Schritt 4: Zellen parallel rastern, Fehler seriell wiederholen ---
+    written = empty = errors = done = 0
+    failed = []
+    progress_start, progress_span = 0.10, 0.80
+
+    def _handle(cell, res, prefix) -> bool:
+        nonlocal written, empty
+        if res[0] == "written":
+            written += 1
+            _log(f"  {prefix} DSM-Zelle {cell}")
+            return True
+        if res[0] == "empty":
+            empty += 1
+            _log(f"  {prefix} DSM-Zelle {cell} - uebersprungen (keine Punkte)")
+            return True
+        return False
+
+    tasks = [(job["cell"], (job, str(run_dir), str(cells_dir), pdal_exe, None, gsd_raster))
+             for job in jobs]
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        futures = {executor.submit(_raster_cell_worker, args): (cell, args)
+                   for cell, args in tasks}
+        for fut in as_completed(futures):
+            cell, args = futures[fut]
+            res = fut.result()
+            done += 1
+            prefix = f"[{done}/{len(tasks)}]"
+            if not _handle(cell, res, prefix):
+                # Noch nicht als Fehler zaehlen: ein abgestuerzter pdal-Prozess ist
+                # meist Speicherdruck durch die parallelen Jobs - wird unten seriell
+                # wiederholt.
+                failed.append((cell, args))
+                _log(f"  {prefix} FEHLER bei DSM-Zelle {cell} "
+                     f"(Wiederholung folgt): {res[2]}")
+            print(f"PROGRESS:{progress_start + (done / len(tasks)) * progress_span:.6f}",
+                  flush=True)
+
+    if failed:
+        _log(f"\nWiederhole {len(failed)} fehlgeschlagene(n) Job(s) seriell "
+             f"(ein pdal-Prozess nach dem anderen)...")
+        for i, (cell, args) in enumerate(failed, 1):
+            res = _raster_cell_worker(args)
+            if not _handle(cell, res, f"[Retry {i}/{len(failed)}]"):
+                errors += 1
+                _log(f"  [Retry {i}/{len(failed)}] FEHLER bleibt bei DSM-Zelle "
+                     f"{cell}: {res[2]}")
+
+    # --- Schritt 5: Zell-Raster zum Gesamt-DSM mosaikieren, dann Hillshade ---
+    if errors:
+        _log(f"\nWARNUNG: {errors} DSM-Zelle(n) fehlgeschlagen - das Gesamt-Raster "
+             f"erhaelt dort Loecher (NoData). Siehe Fehler oben.")
+    cell_rasters = sorted(str(p) for p in cells_dir.glob("dsm_*.tif"))
+    if not cell_rasters:
+        raise RuntimeError("Keine DSM-Zelle wurde erzeugt - Gesamt-Raster nicht moeglich.")
+    _mosaic_las_raster(cell_rasters, run_dir, raster_out_path, hillshade_out_path,
+                        gsd_raster, clip_shape_path, snap_bounds, str(num_workers),
+                        _log, _progress)
+
+    if not keep_staging:
+        _log(f"\nRaeume Staging-Ordner auf: {run_dir}")
+        try:
+            shutil.rmtree(run_dir, ignore_errors=True)
+        except Exception:
+            pass
+    else:
+        _log(f"\nStaging-Dateien bleiben erhalten: {run_dir}")
+
+    _log(f"\nFertig. Raster: {raster_name}, Hillshade: {hillshade_name}\n"
+         f"DSM-Zellen: {written} gerastert, {empty} leer (0 Punkte).\n"
+         f"Fehler gesamt: {errors}.")
+    if errors:
+        raise RuntimeError(f"{errors} DSM-Zelle(n) konnten auch beim seriellen "
+                            f"Wiederholen nicht verarbeitet werden - siehe Log.")
+
+
 def main() -> None:
     if len(sys.argv) < 2:
         print("[FEHLER] Kein Konfigurationspfad uebergeben.", flush=True)
@@ -2588,6 +3066,8 @@ def main() -> None:
             _process_las(cfg)
         elif action == "process_las_ln02":
             _process_las_ln02(cfg)
+        elif action == "process_dsm":
+            _process_dsm(cfg)
         else:
             print(f"[FEHLER] Unbekannte Aktion: '{action}'", flush=True)
             sys.exit(1)

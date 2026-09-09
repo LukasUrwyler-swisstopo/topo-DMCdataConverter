@@ -1,25 +1,59 @@
 # DMC Werkzeuge
 
 Converter-Tool für rohe DMC-Daten aus RealityStudio (True-DOP und Punktwolken, technische
-200m-Kacheln) ins swisstopo-Format "ch.spezialbefliegungen" (GDWH-STAC-ready), als GUI mit
-drei Tabs:
-
-- **DMC - TIFFconverter** (GDAL) — clippt ein technisches DOP-Kachel-Mosaik auf eine manuell
-  erfasste gueltige Flaeche (Randverzerrungen entfernen) und schneidet es anschliessend
-  parallelisiert ins publikationsfaehige 1km x 1km-Grid um (Dateiname aus Attribut `NAME`).
-- **DMC - LASconverter [LHN95]** (PDAL) — croppt technische LAZ-Kacheln (Punktwolke) per
-  AOI-Shape, thinnt optional, schneidet sie parallelisiert ins 1km x 1km-Grid um (`.las`/`.laz`)
-  und rastert optional zusaetzlich ein Gesamt-DSM + Hillshade (`.tif`/`.tfw`) fuer die ganze
-  AOI. Hoehe bleibt LHN95 (kein Reframe im Tool — siehe unten); die `.las`-Ausgabe ist fuer den
-  nachgelagerten Reframe LHN95→LN02 via GeoSuite gedacht.
-- **DMC - LASconverter [LN02]** (PDAL) — nimmt die via GeoSuite nach LN02 reframten 1km-Kacheln
-  entgegen und bringt sie unveraendert (kein Thinning, kein Crop, keine Neu-Kachelung) in die
-  GDWH-taugliche Form: LAS 1.4 / Point Data Record Format 7 (PF6 + RGB),
-  `global_encoding` 17, `scale` 0.01, Offset = Kachelursprung, CRS-Tag LV95+LN02 als byte-exakte
-  Referenz-VLRs (wie `SB_DSM_PUNKTWOLKE`, dort aber PF6 — hier PF7, damit die DMC-Farbe erhalten
-  bleibt). Optional ebenfalls DSM + Hillshade.
-
+200m-Kacheln) ins swisstopo-Format „ch.spezialbefliegungen" (GDWH-STAC-ready). GUI mit vier Tabs;
 Struktur und Styling analog zu `topo-COGTIFFconverter`.
+
+## Was macht welcher Tab?
+
+| Tab | Input | Verarbeitung | Output |
+|---|---|---|---|
+| **DMC - TIFFconverter** | technische 200m-DOP-Kacheln (`.tif`) | Mosaik → Clip auf die gültige Fläche → Zuschnitt ins 1km-Grid | 1km-DOP-Kacheln (`.tif`) |
+| **DMC - LASconverter [LHN95]** | technische 200m-Punktwolken (`.laz`) | Kacheln je Gitterzelle mergen → Crop auf Zelle + AOI → optional ausdünnen | 1km-Kacheln `…_LV95_LHN95.las` (LAS 1.4 / PF7, mit RGB)<br>optional DSM + Hillshade |
+| **DMC - LASconverter [LN02]** | die von GeoSuite nach LN02 reframten 1km-Kacheln | requantisieren → CRS-VLRs byte-exakt injizieren → vollständig validieren | 1km-Kacheln `…_LV95_LN02.laz` (GDWH-tauglich)<br>optional `.vpc` für QGIS, DSM + Hillshade |
+| **Create DSM-Raster** | beliebiger Ordner mit `.las`/`.laz` | zellweise IDW-Rasterung → mosaikieren → Löcher füllen → AOI-Maske → Hillshade | ein DSM + ein Hillshade (`.tif` + `.tfw`) |
+
+### Reihenfolge bei den Punktwolken
+
+Die beiden LASconverter-Tabs gehören zusammen — dazwischen liegt ein Schritt **ausserhalb**
+dieses Tools:
+
+```
+technische 200m-LAZ  (RealityStudio)
+      │
+      ▼   Tab [LHN95]        AOI-Crop · Thinning · 1km-Grid
+…_LV95_LHN95.las             LAS 1.4 / PF7, mit RGB
+      │
+      ▼   GeoSuite / REFRAME     ←  ausserhalb dieses Tools, transformiert NUR die Höhe
+…_LV95_LN02.las
+      │
+      ▼   Tab [LN02]         GDWH-Header · CRS-VLRs · Validierung
+…_LV95_LN02.laz              →  Lieferung
+```
+
+Das DOP läuft unabhängig davon über den **TIFFconverter**. **Create DSM-Raster** ist ein Zusatz,
+den man auf jeden fertigen Kachelordner ansetzen kann — unabhängig von den anderen Tabs.
+
+### Was die Tabs bewusst NICHT tun
+
+- **Kein Reframe LHN95→LN02.** Die Höhentransformation macht ausschliesslich GeoSuite/REFRAME;
+  im Tool gibt es bewusst kein `filters.reprojection` zwischen den Höhenrahmen.
+- **Kein Re-Tiling, kein Thinning, kein Crop im Tab [LN02].** Dort ist der Input bereits das
+  fertige 1km-Grid; verändert werden nur Header und CRS-Tags.
+- **Keine Höhenumrechnung beim Rastern.** Die Z-Werte werden nirgends angefasst.
+- **Keine Klassifizierung, keine STAC-Metadaten.** Letztere macht `topo-importDATAtoGDWH-STAC`.
+
+### Details weiter unten
+
+Jeder Tab hat unten ein eigenes Kapitel mit allen Schritten, Zielwerten und den fachlichen
+Absicherungen — zum Nachvollziehen, nicht zum Bedienen:
+
+- [Details: TIFFconverter](#details-tiffconverter)
+- [Details: LASconverter \[LHN95\]](#details-lasconverter-lhn95)
+- [Details: LASconverter \[LN02\]](#details-lasconverter-ln02)
+- [Details: Create DSM-Raster](#details-create-dsm-raster)
+- [Architektur](#architektur) · [Voraussetzungen](#voraussetzungen) ·
+  [Koordinatensystem](#koordinatensystem) · [Tests](#tests)
 
 ## GUI starten
 
@@ -36,7 +70,10 @@ ueber die Schaltflaeche **Aendern…** manuell gesetzt werden und wird in
 
 ---
 
-## Pipeline — Tab "DMC - TIFFconverter"
+## Details: TIFFconverter
+
+Verarbeitet technische 200m-DOP-Kacheln (`.tif`) via GDAL: aus dem Kachel-Mosaik wird die
+gültige Fläche ausgeschnitten und das Ergebnis parallelisiert ins 1km-Grid zerlegt.
 
 1. **Projekt-Parameter**: Jahr, AREA/AOI-Name, GSD (z.B. `10cm`) — ergeben zusammen mit dem
    Attribut `NAME` des Grid-Shapes die Ausgabebenennung:
@@ -87,7 +124,7 @@ automatisch geloescht (`.tif` + `.tfw`).
 
 ---
 
-## Pipeline — Tab "DMC - LASconverter [LHN95]"
+## Details: LASconverter [LHN95]
 
 Verarbeitet technische 200m-LAZ-Kacheln (Punktwolke, Koordinatensystem CH1903+/LV95 + LHN95)
 via [PDAL](https://pdal.io/) (nicht GDAL — GDAL kennt keine Punktwolken). `pdal.exe` wird
@@ -231,7 +268,7 @@ als `.las` oder `.laz` geschrieben wird, entscheidet sich rein an der Dateiendun
 
 ---
 
-## Pipeline — Tab "DMC - LASconverter [LN02]"
+## Details: LASconverter [LN02]
 
 Der nachgelagerte Schritt zum Tab **[LHN95]**. Dessen `.las`-Kacheln werden extern mit
 **GeoSuite/REFRAME** von LHN95 nach LN02 reframt (nur die Höhe, X/Y bleiben LV95); dieser Tab
@@ -264,20 +301,23 @@ Raster-Maskierung gebraucht und ist nur sichtbar, wenn die Raster-Option aktiv i
    GDWH-Auslieferungsformat analog `SB_DSM_PUNKTWOLKE`). Muss ein anderer Ordner als der Input
    sein; die Quelldateien werden nie verändert.
 
-4. **Output-Ordner (DSM-Raster)** und **Footprint / AOI-Shape**: nur sichtbar bei aktivierter
+4. **Create Virtual Point Cloud (VPC)**: legt `_vpc\\<JAHR>_<AREA>_LV95_LN02.vpc` im
+   Output-Ordner an — siehe „Virtual Point Cloud" unten. Unabhängig von der Raster-Option.
+
+5. **Output-Ordner (DSM-Raster)** und **Footprint / AOI-Shape**: nur sichtbar bei aktivierter
    Raster-Option. DSM und Hillshade landen als je ein Gesamtbild (`.tif` + `.tfw`) im selben
    Ordner, per Cutline maskiert (DSM NoData `-3.4028235e+38`, Hillshade NoData `255`) — exakt
    wie im Tab [LHN95].
 
-5. **Datei-Info**: zeigt zusätzlich **LAS-Version/Point-Format**, **Farbe (RGB)** und
+6. **Datei-Info**: zeigt zusätzlich **LAS-Version/Point-Format**, **Farbe (RGB)** und
    **global_encoding** der Quelle. Steht dort bereits `LAS 1.4 / PF7` und `17`, ist die Kachel
    schon im Zielformat und wird nur kopiert statt konvertiert. Steht bei Farbe `nein`, hat die
    Quelle kein RGB-Feld — dann kommt aus dem Lauf eine Warnung pro Kachel.
 
-6. **Staging & Parallelisierung**: analog den anderen Tabs, eigener Unterordner
+7. **Staging & Parallelisierung**: analog den anderen Tabs, eigener Unterordner
    (`<AREA>_<JAHR>_LN02`).
 
-7. **DMC LAS KONVERTIEREN [LN02]** starten.
+8. **DMC LAS KONVERTIEREN [LN02]** starten.
 
 ### Zielformat der Punktwolken-Kacheln
 
@@ -331,6 +371,42 @@ wenn eine angeforderte Dimension nicht existiert.
 > **still auf PF6 zurückdrehen** — die Farbe wäre dann doch wieder weg. Dort braucht es ein
 > zweites Zielprofil, sonst endet die Kette wieder farblos.
 
+### Virtual Point Cloud (VPC) — alle Kacheln als eine Ebene in QGIS
+
+Bei aktivierter Option entsteht `_vpc\\<JAHR>_<AREA>_LV95_LN02.vpc`: eine JSON-Datei
+(STAC-FeatureCollection), die alle fertigen Kacheln zu **einer** Punktwolken-Ebene zusammenfasst
+— das Punktwolken-Gegenstück zum Raster-VRT. Es wird **nichts kopiert und nichts umgerechnet**;
+die Datei verweist mit **relativen Pfaden** (`../<kachel>.laz`) auf die Kacheln daneben, der
+Ordner lässt sich also verschieben oder kopieren, ohne dass sie bricht.
+
+Gelesen wird sie von **QGIS ab 3.32**. **ArcGIS Pro liest kein VPC** — dafür bräuchte es ein
+LAS-Dataset (`.lasd`), das ausschliesslich `arcpy` erzeugen kann; im OSGeo4W-Python des Runners
+gibt es kein arcpy, deshalb ist dieser Weg bewusst nicht umgesetzt.
+
+Die Kachel-Fakten (Punktanzahl, 3D-BBox) werden **aus den Headern der fertigen Ausgabedateien**
+gelesen — parallel und ohne die Punktdaten anzufassen, bei `.laz` also ohne Dekompression. Damit
+beschreibt die VPC nachweislich das, was im Ordner liegt, statt das, was der Lauf zu schreiben
+glaubte; unverändert kopierte Kacheln sind ebenso erfasst wie konvertierte.
+
+Das Format ist an einer mit `pdal_wrench build_vpc` erzeugten Referenz nachgemessen und gegen den
+QGIS-Provider (3.44) gegengelesen. Zwei Dinge sind dabei nicht verhandelbar:
+
+| Feld | warum |
+|---|---|
+| `proj:wkt2` | Fehlt es, lehnt QGIS die Datei ab (`isValid() == False`). |
+| `geometry` / `bbox` in **WGS84** | STAC-Konvention. Mit LV95-Werten darin lädt QGIS die Ebene **ohne Fehlermeldung**, liefert aber einen unendlichen Extent — man sieht nichts und nichts weist darauf hin. Die Landeskoordinaten gehören nach `proj:bbox`. |
+
+`pc:schemas`, `stac_extensions` und `proj:geometry` sind dagegen optional (geprüft) und bleiben
+weg — die Dimensionsliste stünde sonst für jede Kachel identisch in der Datei.
+
+Zwei Details am Rand: `proj:wkt2` trägt bewusst **nur** das horizontale `EPSG:2056` — die VPC ist
+eine Kartenebene, der Höhenbezug (LN02) steckt in den CRS-VLRs der Kacheln selbst. Und
+`pc:type` ist `eopc` (*electro-optical point cloud*), nicht `lidar`: die DMC-Wolken sind
+photogrammetrisch abgeleitet.
+
+Die VPC ist ein **Ansichtsprodukt neben der Lieferung**. Schlägt ihr Schreiben fehl, gibt es eine
+Warnung im Log, aber der Lauf bleibt erfolgreich — die Kacheln sind das Produkt.
+
 ### Warum die CRS-Tags byte-exakt injiziert werden
 
 Die zwei CRS-VLRs (GeoTIFF-KeyDirectory `34735` + OGC-WKT `2112`) werden **nicht** von PDAL
@@ -346,6 +422,27 @@ angenommen:
   (LN02/5728) ganz weg.
 - PDALs eigene `writers.las`-Option `vlrs` verwirft VLRs mit `user_id "LASF_Projection"` still.
 
+**Es müssen ALLE mitgeschleppten CRS-VLRs weichen, nicht nur die mit `user_id`
+`LASF_Projection`.** PDALs `writers.las` schreibt denselben WKT nämlich **zweimal** — an einer
+erzeugten Kachel nachgemessen:
+
+| `user_id` | `record_id` | Beschreibung |
+|---|---|---|
+| `LASF_Projection` | 2112 | *OGC Transformation Record* |
+| `liblas` | 2112 | *OGR variant of OpenGIS WKT SRS* |
+
+Beide enthalten `PROJCS["CH1903+ / LV95"...]` — **rein horizontal, ohne LN02**. Würde nur die
+erste Variante entfernt, trüge jede ausgelieferte Kachel zwei widersprechende Aussagen zum
+Raumbezug, und der `liblas`-Zwilling stünde in der Datei sogar **vor** der autoritativen Angabe:
+ein Leser, der schlicht den ersten VLR mit `record_id` 2112 nimmt, bekäme LV95 ohne Höhenbezug.
+Entfernt wird deshalb jeder VLR, der einen Raumbezug deklariert (`LASF_Projection` komplett,
+dazu `liblas` mit `record_id` 2111/2112/34735–34737). Der `laszip encoded`-VLR (22204) ist
+ausdrücklich ausgenommen — ohne ihn lässt sich eine `.laz` nicht mehr dekomprimieren.
+
+Damit eine künftige Schreiber-Variante nicht wieder still durchrutscht, ist das zusätzlich in
+der Validierung verriegelt: findet sich im Ziel neben den zwei Referenz-VLRs noch ein
+CRS-führender VLR, ist die Kachel ein **harter Fehler**, keine Warnung.
+
 Bei `.laz`-Ausgabe wird zusätzlich zur Header-Verschiebung die **LASzip chunk table start
 position** korrigiert (int64 am Anfang des Punktbereichs). Ohne diese Korrektur bleibt die Datei
 für `pdal info --metadata` lesbar, aber jeder echte Dekompressions-Durchlauf bricht mit
@@ -358,8 +455,9 @@ für `pdal info --metadata` lesbar, aber jeder echte Dekompressions-Durchlauf br
   eine evtl. vorhandene Zieldatei unangetastet; die Quelle wird nie verändert.
 - **Nachkonversions-Validierung** je Kachel: Punktanzahl identisch, BBox identisch innerhalb
   1 cm, Header-Zielwerte (siehe Tabelle), beide CRS-VLRs vorhanden (VLR 2112 endet auf
-  Nullbyte), CRS auflösbar als 2056 + 5728 — und `5729`/`LHN95` kommen im Ziel-WKT **nicht** vor
-  (fängt ab, dass versehentlich nicht-reframte LHN95-Kacheln als LN02 getaggt werden).
+  Nullbyte), **kein weiterer CRS-VLR daneben**, CRS auflösbar als 2056 + 5728 — und
+  `5729`/`LHN95` kommen im Ziel-WKT **nicht** vor (fängt ab, dass versehentlich nicht-reframte
+  LHN95-Kacheln als LN02 getaggt werden).
 - **„Schon fertig“-Abkürzung nur mit Beweis**: eine Kachel wird unverändert kopiert statt
   konvertiert, wenn sie bereits das Zielprodukt ist. Geprüft wird dafür nicht nur
   Version/Punktformat/`global_encoding`/CRS, sondern auch `scale` **und** die byte-exakten
@@ -392,6 +490,62 @@ für `pdal info --metadata` lesbar, aber jeder echte Dekompressions-Durchlauf br
 
 ---
 
+## Details: Create DSM-Raster
+
+Der eigenständige Raster-Build: derselbe DSM-/Hillshade-Weg wie die Raster-Option der beiden
+Konverter-Tabs, nur ohne deren Punktwolken-Verarbeitung. Gedacht für den Fall, dass die Kacheln
+schon fertig sind (oder von woanders kommen) und nur noch ein Raster gebraucht wird.
+
+1. **Projekt-Parameter**: Jahr, AREA/AOI-Name, **Höhenbezug** (LHN95 oder LN02) und
+   **Raster-Auflösung (GSD)**, Default `0.5` m. Daraus die Benennung:
+   ```
+   <JAHR>_<AREA>_DSM_<GSD>cm_LV95_<LHN95|LN02>.tif        (+ .tfw)
+   <JAHR>_<AREA>_hillshade_<GSD>cm_LV95_<LHN95|LN02>.tif  (+ .tfw)
+   ```
+   Der Höhenbezug steuert **nur die Benennung und den SRS-Tag der Reader** — die Z-Werte werden
+   nirgends umgerechnet. Beim Wählen des Input-Ordners werden Jahr, AREA und Höhenbezug aus dem
+   ersten Kachelnamen vorbelegt, sofern er der Konvention der Konverter-Tabs folgt; bei
+   Fremddaten bleibt alles wie eingetippt.
+
+2. **Input-Ordner (LAS/LAZ)**: alle `.las`/`.laz` im Ordner. Die Kachelung ist **beliebig** — die
+   Dateinamen müssen keiner Konvention folgen (anders als im Tab [LN02], wo der Kachelursprung
+   aus dem Namen kommt).
+
+3. **Output-Ordner (Raster)**: DSM und Hillshade als je ein `.tif` + `.tfw`.
+
+4. **Footprint / AOI-Shape**: Maskierung wie in den anderen Tabs — ausserhalb NoData, Extent
+   bleibt. Kein Crop der Punkte.
+
+5. **Staging & Parallelisierung**: eigener Unterordner (`<AREA>_<JAHR>_DSM`).
+
+### Zellschnitt — warum, und warum anders als in den Konverter-Tabs
+
+Gerastert wird zellweise und danach mosaikiert, aus demselben Grund wie überall im Projekt: ein
+Gesamt-Merge über alle Kacheln hält die komplette Punktwolke im Speicher und bringt `pdal.exe`
+bei grossen Projekten zum Absturz.
+
+Die Konverter-Tabs holen ihre Zellen aus dem Grid-Shape bzw. aus den Dateinamen — dort sind die
+Zellen ja zugleich die Ausgabegeometrie der Punktwolken-Kacheln. **Hier sind sie reine
+Arbeitspakete**, deshalb wird das 1km-Raster direkt aus dem Gesamt-Extent abgeleitet: kein
+Grid-Shape nötig, und die Kachelnamen dürfen beliebig sein. Das Ergebnis ist identisch, weil
+ohnehin mosaikiert wird.
+
+Zwei Eigenschaften, auf die es dabei ankommt (beide in `_dsm_cell_jobs`, mit Tests):
+
+- **Zellen werden auf den Datenbereich beschnitten.** Ohne das rastert eine Kachel, die nur in
+  einer Ecke ihrer Kilometerzelle liegt, trotzdem den ganzen Quadratkilometer — und das
+  anschliessende Füllen der NoData-Löcher läuft über eine riesige leere Fläche. An einem
+  Testdatensatz gemessen: **7,7 Mio. leere Pixel und über zwei Minuten statt 0 Pixel und
+  ~1 Sekunde**.
+- **Jede Zelle bekommt die Kacheln, die ihren *gepufferten* Ausschnitt berühren.** Der Puffer
+  hält die IDW-Nachbarschaft am Zellrand vollständig; ohne ihn bliebe sie einseitig und an jeder
+  Zellgrenze entstünde eine sichtbare Naht. Eine Kachel, die exakt auf einer Zellkante beginnt,
+  gehört deshalb zu **beiden** Nachbarzellen. Zellen ohne beitragende Kachel entfallen ganz.
+
+Mosaik, Löcherfüllung (klein interpoliert, gross bleibt NoData), AOI-Maskierung und Hillshade
+laufen anschliessend über dieselbe Funktion wie in den anderen Tabs — inklusive der dortigen
+Kontrollen (Pixelraster-Check, NoData-Kontrolle, Deckungsgleichheit DSM/Hillshade).
+
 ## Architektur
 
 ```
@@ -416,7 +570,15 @@ process_scripts/_osgeo_runner.py   (OSGeo4W Python, GDAL/OGR)
         │     ersten Schreibzugriff), Metadaten-Scan parallel
         │  2) Job-Pool: je Kachel Requantisierung auf LAS 1.4/PF7 + VLR-Byte-
         │     Injektion + Validierung (+ optional DSM-Zelle), Retry seriell
+        │  2b) optional .vpc aus den Headern der fertigen Kacheln (QGIS)
         │  3) Zell-Raster mosaikieren (VRT) -> Cutline-Clip -> Hillshade
+        │
+        │
+    Aktion "process_dsm"  (Tab "Create DSM-Raster"):
+        │  1) Metadaten-Scan aller Kacheln, parallel -> Gesamt-Extent
+        │  2) 1km-Arbeitszellen aus dem Extent, auf die Daten beschnitten
+        │  3) Zellen parallel rastern (IDW), Retry seriell
+        │  4) mosaikieren (VRT) -> Loecher fuellen -> Cutline-Clip -> Hillshade
         │
         │  stdout → live ins GUI-Log + Logdatei
         ▼

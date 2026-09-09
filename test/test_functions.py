@@ -202,6 +202,71 @@ def test_ln02_inject_reference_vlrs(tmp_path):
     assert b"ALT-LHN95-WKT" not in data
 
 
+def test_inject_strips_pdal_liblas_wkt_twin(tmp_path):
+    """PDALs writers.las schreibt denselben WKT ZWEIMAL: einmal als
+    'LASF_Projection'/2112 und einmal als 'liblas'/2112 ("OGR variant of OpenGIS
+    WKT SRS") - an einer erzeugten Kachel nachgemessen.
+
+    Der 'liblas'-Zwilling steht in der Datei VOR der autoritativen Angabe und
+    enthaelt nur den horizontalen Teil (LV95 ohne LN02). Bliebe er stehen, traege
+    jede ausgelieferte Kachel zwei widersprechende Aussagen zum Raumbezug, und ein
+    Leser, der schlicht den ersten 2112er nimmt, bekaeme die falsche.
+
+    Der laszip-VLR muss dagegen zwingend erhalten bleiben - ohne ihn ist eine .laz
+    nicht mehr dekomprimierbar."""
+    import struct
+    runner_mod = _runner()
+
+    src = tmp_path / "tile.las"
+    src.write_bytes(_fake_las([
+        ("liblas", 2112, b"OGR-VARIANTE-NUR-LV95"),
+        ("laszip encoded", 22204, b"LASZIP-VLR"),
+        ("LASF_Projection", 2112, b"ALT-LHN95-WKT"),
+    ]))
+
+    n_stripped = runner_mod._inject_reference_vlrs(str(src))
+    assert n_stripped == 2          # beide WKT-Varianten, nicht nur eine
+
+    data = src.read_bytes()
+    _hs, _offset, n_vlr = struct.unpack_from("<HII", data, 94)
+    assert n_vlr == 3               # laszip + die zwei Referenz-VLRs
+    assert b"OGR-VARIANTE-NUR-LV95" not in data
+    assert b"ALT-LHN95-WKT" not in data
+    assert b"LASZIP-VLR" in data    # bleibt - sonst waere die .laz unlesbar
+    assert b"LN02 height" in data
+
+
+def test_is_crs_vlr_trennt_raumbezug_von_nutzdaten():
+    """Was als CRS-VLR gilt, entscheidet ueber Entfernen oder Behalten - hier die
+    Grenzfaelle explizit."""
+    runner_mod = _runner()
+    assert runner_mod._is_crs_vlr("LASF_Projection", 2112)
+    assert runner_mod._is_crs_vlr("LASF_Projection", 34735)
+    assert runner_mod._is_crs_vlr("LASF_Projection", 999)   # Namensraum ist reserviert
+    assert runner_mod._is_crs_vlr("liblas", 2112)
+    assert not runner_mod._is_crs_vlr("liblas", 22204)
+    assert not runner_mod._is_crs_vlr("laszip encoded", 22204)
+    assert not runner_mod._is_crs_vlr("irgendwer", 2112)
+
+
+def test_ln02_validate_target_rejects_second_crs_vlr():
+    """Riegel gegen kuenftige Varianten: taucht neben der Referenz noch ein
+    CRS-VLR auf, ist die Kachel ein Fehler - nicht bloss eine Warnung. Eine zweite
+    Aussage zum Raumbezug faellt sonst niemandem auf."""
+    runner_mod = _runner()
+    src = _ln02_target_metadata(minor_version=2, dataformat_id=3, global_encoding=1)
+
+    md = _ln02_target_metadata()
+    md["vlr_2"] = {"user_id": "liblas", "record_id": 2112, "data": ""}
+    problems = runner_mod._validate_ln02_target(src, md)
+    assert any("liblas/2112" in p for p in problems)
+
+    # Der laszip-VLR ist kein Raumbezug und darf nicht anschlagen
+    md2 = _ln02_target_metadata()
+    md2["vlr_2"] = {"user_id": "laszip encoded", "record_id": 22204, "data": ""}
+    assert runner_mod._validate_ln02_target(src, md2) == []
+
+
 def test_ln02_inject_reference_vlrs_fixes_laz_chunk_table(tmp_path):
     """Bei LAZ muss zusaetzlich die 'chunk table start position' um die
     Verschiebung des VLR-Blocks korrigiert werden - sonst bricht jeder echte
@@ -446,8 +511,16 @@ def test_ln02_tab_name_preview():
         text = app._ln02_name_preview_lbl.cget("text")
         assert "2026_GUPPENFIRN_TIN_[thinnedout<NN>_]raw_<E>_<N>_LV95_LN02.laz" in text
         assert "DSM" not in text
+        assert ".vpc" not in text
         # Kein Thinning-Feld mehr - ausgeduennt wird ausschliesslich im Tab [LHN95]
         assert not hasattr(app, "_ln02_thin_var")
+
+        # VPC ist unabhaengig vom Raster zuschaltbar
+        app._ln02_create_vpc_var.set(True)
+        app._update_ln02_name_preview()
+        text = app._ln02_name_preview_lbl.cget("text")
+        assert "2026_GUPPENFIRN_LV95_LN02.vpc" in text
+        assert "DSM" not in text
 
         app._ln02_create_raster_var.set(True)
         app._ln02_gsd_var.set("0.5")
@@ -796,3 +869,202 @@ def test_ln02_copy_shortcut_only_for_finished_tiles():
     assert not runner_mod._ln02_is_already_migrated(dict(
         finished, srs={"json": {"components": [
             {"type": "ProjectedCRS", "id": {"authority": "EPSG", "code": 2056}}]}}))
+# ══════════════════════ Virtual Point Cloud (VPC) fuer QGIS ══════════════════════
+
+def test_vpc_feature_uses_wgs84_for_bbox_and_native_for_proj():
+    """Die entscheidende Eigenschaft der VPC: 'geometry'/'bbox' sind WGS84
+    (STAC-Konvention), die Landeskoordinaten stehen in 'proj:bbox'.
+
+    Das ist kein Formalismus - mit LV95-Werten in 'bbox' laedt QGIS die Ebene OHNE
+    Fehlermeldung, liefert aber einen unendlichen Extent: die Kacheln sind dann
+    unsichtbar und nichts weist darauf hin. Am QGIS-Provider (3.44) nachgemessen."""
+    runner_mod = _runner()
+
+    native = (2713000.0, 1206000.0, 1000.0, 2714000.0, 1207000.0, 1100.0)
+    ring = [(8.92, 46.99), (8.92, 47.00), (8.94, 47.00), (8.94, 46.99), (8.92, 46.99)]
+    feat = runner_mod._vpc_feature(
+        "2026_G_TIN_raw_2713_1206_LV95_LN02", "../2026_G_TIN_raw_2713_1206_LV95_LN02.laz",
+        4711, native, ring, "PROJCS[\"CH1903+ / LV95\"...]",
+        "application/vnd.laszip", "2026-09-09T10:00:00Z")
+
+    # bbox: horizontal WGS84 aus dem Ring, vertikal unveraendert in Metern
+    assert feat["bbox"] == [8.92, 46.99, 1000.0, 8.94, 47.00, 1100.0]
+    assert feat["geometry"]["coordinates"][0][0] == [8.92, 46.99]
+    # Landeskoordinaten NUR in proj:bbox - niemals in bbox
+    assert feat["properties"]["proj:bbox"] == list(native)
+    assert feat["bbox"][0] != native[0]
+    # Ohne proj:wkt2 lehnt QGIS die Datei ab
+    assert "CH1903+" in feat["properties"]["proj:wkt2"]
+    assert feat["assets"]["data"]["href"].startswith("../")
+    assert feat["properties"]["pc:count"] == 4711
+    # Photogrammetrisch abgeleitet - nicht 'lidar'
+    assert feat["properties"]["pc:type"] == "eopc"
+
+
+def test_vpc_document_is_a_feature_collection():
+    """QGIS erwartet eine GeoJSON/STAC-FeatureCollection."""
+    runner_mod = _runner()
+    doc = runner_mod._build_vpc([{"type": "Feature"}, {"type": "Feature"}])
+    assert doc["type"] == "FeatureCollection"
+    assert len(doc["features"]) == 2
+
+
+def test_vpc_is_optional_and_never_fails_the_run():
+    """Die VPC ist ein Ansichtsprodukt neben der Lieferung. Ein Fehler beim Schreiben
+    darf den Lauf nicht scheitern lassen - die Kacheln sind das Produkt."""
+    import inspect
+    runner_mod = _runner()
+
+    src = inspect.getsource(runner_mod._process_las_ln02)
+    assert "if create_vpc:" in src
+    # Der VPC-Block haengt in einem try/except und meldet nur eine WARNUNG
+    vpc_block = src.split("if create_vpc:", 1)[1].split("Schritt 6", 1)[0]
+    assert "except Exception" in vpc_block
+    assert "WARNUNG" in vpc_block
+    assert "raise" not in vpc_block
+
+
+def test_vpc_tile_worker_reports_errors_instead_of_raising(monkeypatch):
+    """Eine unlesbare Kachel darf den VPC-Lauf nicht abbrechen, sondern wird als
+    Fehler zurueckgemeldet und uebersprungen."""
+    runner_mod = _runner()
+
+    def boom(exe, path):
+        raise RuntimeError("kaputt")
+
+    monkeypatch.setattr(runner_mod, "_pdal_info_metadata", boom)
+    res = runner_mod._vpc_tile_worker(("pdal.exe", "x.laz"))
+    assert res[0] == "x.laz"
+    assert res[-1] == "kaputt"
+
+    monkeypatch.setattr(runner_mod, "_pdal_info_metadata", lambda exe, path: {
+        "count": 12, "minx": 1.0, "miny": 2.0, "minz": 3.0,
+        "maxx": 4.0, "maxy": 5.0, "maxz": 6.0})
+    res = runner_mod._vpc_tile_worker(("pdal.exe", "y.laz"))
+    assert res == ("y.laz", 12, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, None)
+# ══════════════════════ Tab "Create DSM-Raster" ══════════════════════
+
+def test_dsm_action_available():
+    """Die eigenstaendige Raster-Pipeline und ihre Bausteine muessen da sein."""
+    runner_mod = _runner()
+    for name in ("_process_dsm", "_dsm_cell_jobs", "_raster_cell_worker",
+                 "_mosaic_las_raster"):
+        assert callable(getattr(runner_mod, name)), name
+
+    import inspect
+    src = inspect.getsource(runner_mod.main)
+    assert '"process_dsm"' in src          # Aktion ist verdrahtet
+
+
+def test_dsm_cells_are_clipped_to_the_data_extent():
+    """Die Arbeitszellen werden auf den Datenbereich beschnitten. Ohne das rastert
+    eine Kachel, die nur in einer Ecke ihrer Kilometerzelle liegt, trotzdem den
+    ganzen Quadratkilometer - an einem Testdatensatz gemessen 7.7 Mio. leere Pixel
+    und ueber zwei Minuten Laufzeit statt rund einer Sekunde."""
+    runner_mod = _runner()
+
+    # Eine 200x200-m-Kachel mitten in der Zelle 2713_1206
+    tiles = [("a.laz", 2713800.0, 1206000.0, 2714000.0, 1206200.0)]
+    snap = (2713800.0, 1206000.0, 2714000.0, 1206200.0)
+    jobs = runner_mod._dsm_cell_jobs(tiles, snap, 0.5, "EPSG:2056+5729")
+
+    assert len(jobs) == 1
+    rb = jobs[0]["raster_bounds"]
+    assert rb == snap                      # exakt der Datenbereich, nicht 1 km2
+    assert jobs[0]["srs"] == "EPSG:2056+5729"
+    assert jobs[0]["tiles"] == ["a.laz"]
+
+
+def test_dsm_cells_tile_without_gap_or_overlap():
+    """Ueber eine Kilometergrenze hinweg muessen die Zellen luecken- UND
+    ueberlappungsfrei aneinanderstossen - sonst hat das Mosaik eine Naht."""
+    runner_mod = _runner()
+
+    tiles = [("links.laz",  2713800.0, 1206000.0, 2714000.0, 1206200.0),
+             ("rechts.laz", 2714000.0, 1206000.0, 2714200.0, 1206200.0)]
+    snap = (2713800.0, 1206000.0, 2714200.0, 1206200.0)
+    jobs = runner_mod._dsm_cell_jobs(tiles, snap, 0.5, "EPSG:2056+5729")
+
+    assert {j["cell"] for j in jobs} == {"2713_1206", "2714_1206"}
+    links = next(j for j in jobs if j["cell"] == "2713_1206")["raster_bounds"]
+    rechts = next(j for j in jobs if j["cell"] == "2714_1206")["raster_bounds"]
+    # Rechte Kante der einen ist exakt die linke Kante der anderen
+    assert links[2] == rechts[0] == 2714000.0
+    # Zusammen decken sie den Datenbereich vollstaendig ab
+    assert (links[0], rechts[2]) == (snap[0], snap[2])
+
+    # Randkacheln kommen dank Puffer in BEIDEN Zellen vor - sonst bliebe die
+    # IDW-Nachbarschaft an der Naht einseitig.
+    assert "rechts.laz" in next(j for j in jobs if j["cell"] == "2713_1206")["tiles"]
+    assert "links.laz" in next(j for j in jobs if j["cell"] == "2714_1206")["tiles"]
+
+
+def test_dsm_cells_skip_empty_areas():
+    """Zellen ohne beitragende Kachel entfallen - bei verstreuten Kacheln waeren
+    das sonst hunderte leere Rasterjobs."""
+    runner_mod = _runner()
+
+    # Zwei Kacheln 3 km auseinander; die rechte beginnt 100 m INNERHALB ihrer Zelle,
+    # also klar ausserhalb des Puffers der Nachbarzelle 2715.
+    tiles = [("a.laz", 2713000.0, 1206000.0, 2713500.0, 1206500.0),
+             ("b.laz", 2716100.0, 1206000.0, 2716500.0, 1206500.0)]
+    snap = (2713000.0, 1206000.0, 2716500.0, 1206500.0)
+    jobs = runner_mod._dsm_cell_jobs(tiles, snap, 0.5, "EPSG:2056+5729")
+
+    # 2713, 2714, 2715, 2716 waeren moeglich - nur die zwei mit Daten bleiben
+    assert {j["cell"] for j in jobs} == {"2713_1206", "2716_1206"}
+
+    # Gegenprobe zum Puffer: beginnt die Kachel exakt auf der Zellkante, gehoert sie
+    # sehr wohl auch zur Nachbarzelle - deren Randpixel brauchen sie fuer eine
+    # vollstaendige IDW-Nachbarschaft. Die dazwischen liegende, wirklich leere Zelle
+    # entfaellt trotzdem.
+    tiles_kante = [("a.laz", 2713000.0, 1206000.0, 2713500.0, 1206500.0),
+                   ("b.laz", 2716000.0, 1206000.0, 2716500.0, 1206500.0)]
+    snap_kante = (2713000.0, 1206000.0, 2716500.0, 1206500.0)
+    cells = {j["cell"] for j in
+             runner_mod._dsm_cell_jobs(tiles_kante, snap_kante, 0.5, "EPSG:2056+5729")}
+    assert "2715_1206" in cells        # Kachel liegt exakt auf deren rechter Kante
+    assert "2714_1206" not in cells    # dazwischen: nichts zu rastern
+
+
+def test_dsm_tab_name_preview():
+    """Benennung im DSM-Tab: Jahr/AREA/GSD/Hoehenbezug aus den GUI-Feldern."""
+    gui_mod = load_module_from_path(
+        "gui_module",
+        os.path.join(PROJECT_ROOT, "GUI_DMCdataConverter.py"),
+    )
+    app = gui_mod.DMCConverterApp()
+    try:
+        tabs = [app._notebook.tab(i, "text") for i in range(app._notebook.index("end"))]
+        assert "Create DSM-Raster" in tabs
+
+        app._dsm_jahr_var.set("2026")
+        app._dsm_area_var.set("GUPPENFIRN")
+        app._dsm_gsd_var.set("0.5")
+        app._dsm_href_var.set("LN02")
+        text = app._dsm_name_preview_lbl.cget("text")
+        assert "2026_GUPPENFIRN_DSM_50cm_LV95_LN02.tif" in text
+        assert "2026_GUPPENFIRN_hillshade_50cm_LV95_LN02.tif" in text
+
+        # Hoehenbezug schlaegt bis in den Dateinamen durch
+        app._dsm_href_var.set("LHN95")
+        assert "LV95_LHN95.tif" in app._dsm_name_preview_lbl.cget("text")
+    finally:
+        app.destroy()
+
+
+def test_dsm_tab_reads_project_from_tile_name():
+    """Beim Waehlen des Input-Ordners werden Jahr, AREA und Hoehenbezug aus dem
+    ersten Kachelnamen vorbelegt - AREA darf dabei Unterstriche enthalten."""
+    gui_mod = load_module_from_path(
+        "gui_module",
+        os.path.join(PROJECT_ROOT, "GUI_DMCdataConverter.py"),
+    )
+    assert gui_mod._project_from_tile_name(
+        "2026_GUPPENFIRN_v2_TIN_thinnedout02_raw_2713_1206_LV95_LN02.laz"
+    ) == ("2026", "GUPPENFIRN_v2", "LN02")
+    assert gui_mod._project_from_tile_name(
+        "2026_G_TIN_raw_2713_1206_LV95_LHN95.las"
+    ) == ("2026", "G", "LHN95")
+    # Fremddaten: nichts vorbelegen statt etwas zu raten
+    assert gui_mod._project_from_tile_name("irgendeine_wolke.laz") is None
