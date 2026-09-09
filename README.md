@@ -22,7 +22,7 @@ ueber die Schaltflaeche **Aendern…** manuell gesetzt werden und wird in
 
 | Tab | Input | Verarbeitung | Output |
 |---|---|---|---|
-| **DMC - TIFFconverter** | technische 200m-DOP-Kacheln (`.tif`) | Mosaik → Clip auf die gültige Fläche → Zuschnitt ins 1km-Grid | 1km-DOP-Kacheln (`.tif`) |
+| **DMC - TIFFconverter** | technische 200m-DOP-Kacheln (`.tif`), meist 4-Band RGBN | Mosaik → optionaler Bandauszug (RGB / NRG) → Clip auf die gültige Fläche → Zuschnitt ins 1km-Grid | 1km-DOP-Kacheln (`.tif`)<br>4-Band RGBN (Standard) oder 3-Band RGB / NRG |
 | **DMC - LASconverter [LHN95]** | technische 200m-Punktwolken (`.laz`) | Kacheln je Gitterzelle mergen → Crop auf Zelle + AOI → optional ausdünnen | 1km-Kacheln `…_LV95_LHN95.las` (LAS 1.4 / PF7, mit RGB)<br>optional DSM + Hillshade |
 | **DMC - LASconverter [LN02]** | die von GeoSuite nach LN02 reframten 1km-Kacheln | requantisieren → CRS-VLRs byte-exakt injizieren → vollständig validieren | 1km-Kacheln `…_LV95_LN02.laz` (GDWH-tauglich)<br>optional `.vpc` für QGIS, DSM + Hillshade |
 | **Create DSM-Raster** | beliebiger Ordner mit `.las`/`.laz` | zellweise IDW-Rasterung → mosaikieren → Löcher füllen → AOI-Maske → Hillshade | ein DSM + ein Hillshade (`.tif` + `.tfw`) |
@@ -85,35 +85,62 @@ gültige Fläche ausgeschnitten und das Ergebnis parallelisiert ins 1km-Grid zer
    ```
    Beispiel: `2026_GUPPENFIRN_DOP_10cm_2713_1206_LV95.tif`
 
-2. **Input-Ordner**: Ordner mit den technischen 200m x 200m-Kacheln (`.tif` + `.tfw`).
+2. **Band-Ausgabe** (Auswahlfeld direkt unter der GSD-Eingabe): DMC-Orthophotos liegen
+   praktisch immer als **4-Band RGBN** vor (Rot, Gruen, Blau, Nahes Infrarot). Hier wird
+   gesteuert, welche Baender in die 1km-Kacheln geschrieben werden:
+
+   | Auswahl | Quellbaender | Ergebnis |
+   |---|---|---|
+   | **4-Band  (RGBN, unveraendert)** — *Standard* | 1, 2, 3, 4 | alle Baender der Quelle bleiben erhalten |
+   | **RGBN → RGB  (3-Band, Echtfarbe)** | 1, 2, 3 | Echtfarben-DOP ohne NIR |
+   | **RGBN → NRG  (3-Band, Falschfarben-Infrarot)** | 4, 1, 2 | CIR-Komposit: NIR → Rot, Rot → Gruen, Gruen → Blau |
+
+   - **Wird nichts gewaehlt, passiert nichts**: die Vorgabe ist „4-Band (RGBN, unveraendert)",
+     die Ausgabe hat dann exakt so viele Baender wie der Input.
+   - Die Auswahl ist **nur bei 4-Band-Input moeglich**. Beim Waehlen des Input-Ordners bzw.
+     ueber **Datei-Info aktualisieren** liest das GUI die Bandzahl der ersten Kachel; bei
+     weniger als 4 Baendern wird das Auswahlfeld gesperrt und auf „4-Band" zurueckgestellt.
+     Startet man einen Lauf trotzdem mit einem 3-Band-Input (z.B. gemischter Ordner), bricht
+     der Runner mit einer klaren Meldung ab, statt stillschweigend etwas Falsches zu schreiben.
+   - Der Bandauszug passiert **vor** dem Cutline-Clip und wird als VRT gebaut — das kopiert
+     keine Pixel. Warp und Grid-Zuschnitt arbeiten dadurch auf 3 statt 4 Baendern, also rund
+     ein Viertel weniger I/O.
+   - Die Ausgabe wird explizit mit `PHOTOMETRIC=RGB` und ColorInterp Rot/Gruen/Blau getaggt.
+     Das ist vor allem bei NRG wichtig: Band 4 eines RGBN-TIFF ist haeufig als `Alpha` oder
+     `Undefined` getaggt und wuerde sonst als Transparenzkanal in die Kachel wandern.
+   - **Der Dateiname aendert sich dadurch nicht.** Wer RGB und NRG desselben Gebiets
+     nebeneinander ablegen will, braucht getrennte Output-Ordner (oder einen abweichenden
+     AREA-Namen).
+
+3. **Input-Ordner**: Ordner mit den technischen 200m x 200m-Kacheln (`.tif` + `.tfw`).
    Enthaelt der Ordner bereits ein Mosaik-VRT (z.B. `True_Ortho.vrt`), wird dieses direkt
    uebernommen — sonst wird automatisch ein frisches VRT aus allen gefundenen `.tif`-Kacheln
    gebaut (`gdalbuildvrt`-Aequivalent).
 
-3. **Clip-Shape (gueltige Flaeche)**: Polygon-Shape, das die manuell erfasste gueltige Flaeche
+4. **Clip-Shape (gueltige Flaeche)**: Polygon-Shape, das die manuell erfasste gueltige Flaeche
    des Orthophotos beschreibt. Alles ausserhalb wird per Cutline-Clip (`gdal.Warp`) zu
    NoData — die Quellkacheln tragen bereits NoData=0 je Band, der Clip verwendet denselben Wert.
 
-4. **Grid-Shape (1km x 1km)**: Shapefile mit Attributfeld `NAME`, liefert Geometrie und
+5. **Grid-Shape (1km x 1km)**: Shapefile mit Attributfeld `NAME`, liefert Geometrie und
    Benennung der Ausgabekacheln. Standardmaessig vorausgefuellt mit dem mitgelieferten
    `swissGRID_1km2_shp/chGRID_1km2.shp`. Wird bei Bedarf automatisch nach EPSG:2056
    reprojiziert.
 
-5. **Staging & Parallelisierung**: Zwischenergebnisse (VRT, geclipptes Mosaik) werden in einem
+6. **Staging & Parallelisierung**: Zwischenergebnisse (VRT, Band-VRT, geclipptes Mosaik) werden in einem
    Staging-Ordner abgelegt (Standard `Y:\02_DMC_tempProcessingFolder`), damit mehrere Kerne
    parallel auf dieselbe geclippte Rasterquelle zugreifen koennen. **CPU-Kerne** steuert die
    Anzahl paralleler Prozesse fuer den Grid-Zuschnitt (Standard: 6). Nach erfolgreichem Lauf
    wird der projektspezifische Staging-Unterordner automatisch geloescht, sofern nicht
    **"Staging-Dateien behalten"** aktiviert ist.
 
-6. **Ausgabe-Format** (kein GUI-Feld, automatisch): klassisches TIFF (kein COG) +
+7. **Ausgabe-Format** (kein GUI-Feld, automatisch): klassisches TIFF (kein COG) +
    `.tfw`-Weltdatei je Ausgabekachel, Blockgroesse fix 256, NoData fix 0 (alle Baender
    gleichermassen). Die Kompression wird von der ersten gefundenen Input-Kachel automatisch
    uebernommen (LZW/DEFLATE/ZSTD/unkomprimiert) — nie verlustbehaftet: liegt eine Input-Kachel
    ausnahmsweise JPEG-komprimiert vor, weicht die Ausgabe auf LZW aus, damit sie nie schlechter
    als der Input wird.
 
-7. **DMC TIFF KONVERTIEREN** starten.
+8. **DMC TIFF KONVERTIEREN** starten.
 
 Vor dem Cutline-Clip prueft das Tool, ob der Pixelursprung des Mosaiks exakt auf ein Vielfaches
 der Pixelgroesse faellt (sauberes Pixelraster, z.B. bei 10cm GSD auf `.0/.1/.2/…`-Koordinaten).
@@ -559,6 +586,7 @@ GUI_DMCdataConverter.py            (Standard-Python, tkinter)
 process_scripts/_osgeo_runner.py   (OSGeo4W Python, GDAL/OGR)
     Aktion "process"      (Tab "DMC - TIFFconverter"):
         │  1) Mosaik-VRT (uebernommen oder frisch gebaut)
+        │  1b) optionaler Bandauszug RGBN -> RGB / NRG als VRT (band_mode)
         │  2) Cutline-Clip auf gueltige Flaeche  -> Staging
         │  3) Grid-Zuschnitt, parallelisiert (ProcessPoolExecutor)
         │

@@ -300,6 +300,24 @@ def _delete_tile_files(tif_path: str) -> None:
             pass
 
 
+# ─── Band-Ausgabe des TIFFconverters ───────────────────────────────────────────
+# Die DMC-Ausgangsdaten sind praktisch immer 4-Band (RGBN: Rot, Gruen, Blau, NIR).
+# Fuer die Publikation wird daraus je nach Produkt ein 3-Band-Auszug gebildet:
+#   rgb  -> Quellbaender 1,2,3  (Echtfarbe)
+#   nrg  -> Quellbaender 4,1,2  (Falschfarben-Infrarot, Standard-CIR-Reihenfolge)
+#   keep -> keine Auswahl, alle Baender der Quelle bleiben erhalten (Default)
+BAND_MODES = {
+    "keep": None,
+    "rgb":  [1, 2, 3],
+    "nrg":  [4, 1, 2],
+}
+BAND_MODE_LABELS = {
+    "keep": "4-Band (RGBN, unveraendert)",
+    "rgb":  "RGBN -> RGB (3-Band, Echtfarbe)",
+    "nrg":  "RGBN -> NRG (3-Band, Falschfarben-Infrarot)",
+}
+
+
 # --- Schritt 1: Mosaik-Quelle ermitteln (bestehendes VRT oder frisch bauen) ---
 
 def _resolve_mosaic_source(input_dir: str, staging_run_dir: Path, log) -> str:
@@ -321,6 +339,69 @@ def _resolve_mosaic_source(input_dir: str, staging_run_dir: Path, log) -> str:
     vrt_ds = gdal.BuildVRT(str(vrt_path), tiles)
     if vrt_ds is None:
         raise RuntimeError("gdal.BuildVRT hat None zurueckgegeben - VRT-Erstellung fehlgeschlagen.")
+    vrt_ds.FlushCache()
+    vrt_ds = None
+    return str(vrt_path)
+
+
+# --- Schritt 1b: Band-Auswahl (nur bei 4-Band-Input RGBN) ---
+
+def _select_bands(mosaic_src: str, band_mode: str, staging_run_dir: Path, log) -> str:
+    """Reduziert eine 4-Band-Quelle (RGBN) per VRT auf drei Baender.
+
+    'rgb' -> Quellbaender 1,2,3 (echtfarbig)
+    'nrg' -> Quellbaender 4,1,2 (Falschfarben-Infrarot: NIR/Rot/Gruen)
+    'keep' -> unveraendert (Rueckgabe der Original-Quelle)
+
+    Der Auszug passiert bewusst VOR dem Cutline-Clip: der Warp-Schritt und alle
+    Kachel-Schreibvorgaenge arbeiten dadurch auf 3 statt 4 Baendern (rund ein
+    Viertel weniger I/O). Ein VRT ist dafuer kostenlos - es kopiert keine Pixel.
+    Die Farbinterpretation wird im VRT explizit auf Rot/Gruen/Blau gesetzt, damit
+    das Band 4 der Quelle (haeufig als 'Alpha' oder 'Undefined' getaggt) im
+    NRG-Auszug nicht als Transparenzkanal missverstanden wird.
+    """
+    from osgeo import gdal
+
+    if band_mode not in BAND_MODES:
+        raise ValueError(f"Unbekannte Band-Ausgabe: {band_mode!r} "
+                         f"(erlaubt: {', '.join(sorted(BAND_MODES))})")
+    band_list = BAND_MODES[band_mode]
+    if band_list is None:
+        log("\nBand-Ausgabe        : 4-Band unveraendert (keine Bandauswahl)")
+        return mosaic_src
+
+    src_ds = gdal.Open(mosaic_src, gdal.GA_ReadOnly)
+    if src_ds is None:
+        raise RuntimeError(f"Konnte Mosaik-Quelle fuer die Bandauswahl nicht oeffnen: {mosaic_src}")
+    band_count = src_ds.RasterCount
+    src_ds = None
+
+    if band_count < 4:
+        raise RuntimeError(
+            f"Band-Ausgabe '{BAND_MODE_LABELS[band_mode]}' verlangt einen 4-Band-Input (RGBN), "
+            f"die Quelle hat aber {band_count} Band/Baender.\n"
+            f"Bitte im Tab 'DMC - TIFFconverter' die Band-Ausgabe auf "
+            f"'{BAND_MODE_LABELS['keep']}' stellen."
+        )
+    if band_count > 4:
+        log(f"  WARNUNG          : Quelle hat {band_count} Baender - "
+            f"Baender 1-4 werden als R,G,B,N interpretiert.")
+
+    vrt_path = staging_run_dir / f"01b_bands_{band_mode}.vrt"
+    log(f"\nBand-Ausgabe        : {BAND_MODE_LABELS[band_mode]}")
+    log(f"  Quellbaender     : {' '.join(str(b) for b in band_list)} von {band_count}")
+    log(f"  Band-VRT         : {vrt_path}")
+
+    vrt_ds = gdal.Translate(str(vrt_path), mosaic_src,
+                            options=gdal.TranslateOptions(format="VRT", bandList=band_list))
+    if vrt_ds is None:
+        raise RuntimeError("gdal.Translate hat None zurueckgegeben - Bandauswahl fehlgeschlagen.")
+    try:
+        for idx, ci in enumerate((gdal.GCI_RedBand, gdal.GCI_GreenBand, gdal.GCI_BlueBand), start=1):
+            vrt_ds.GetRasterBand(idx).SetColorInterpretation(ci)
+    except Exception as e:
+        log(f"  WARNUNG          : ColorInterp im Band-VRT nicht setzbar ({e}) - "
+            f"die Ausgabe wird ueber PHOTOMETRIC=RGB dennoch korrekt getaggt.")
     vrt_ds.FlushCache()
     vrt_ds = None
     return str(vrt_path)
@@ -429,7 +510,7 @@ def _grid_tile_worker(args) -> tuple:
     """Wird in einem eigenen Prozess ausgefuehrt (ProcessPoolExecutor) - oeffnet das
     geclippte Zwischenraster read-only und schreibt genau eine Grid-Kachel."""
     (staged_path, minx, maxy, maxx, miny, out_path,
-     compress, blocksize, nodata_val) = args
+     compress, blocksize, nodata_val, photometric) = args
     from osgeo import gdal
     gdal.UseExceptions()
 
@@ -443,6 +524,11 @@ def _grid_tile_worker(args) -> tuple:
     ]
     if compress in ("LZW", "DEFLATE", "ZSTD"):
         creation_options.append("PREDICTOR=2")
+    if photometric:
+        # Nur bei aktiver Bandauswahl gesetzt: erzwingt Rot/Gruen/Blau statt einer
+        # aus der Quelle geerbten Interpretation (Band 4 eines RGBN-TIFF ist
+        # haeufig als 'Alpha' getaggt und wuerde sonst als Transparenz wandern).
+        creation_options.append(f"PHOTOMETRIC={photometric}")
 
     try:
         translate_options = gdal.TranslateOptions(
@@ -486,9 +572,14 @@ def _process(cfg: dict) -> None:
     blocksize        = cfg.get("blocksize", "256")
     nodata_val       = float(cfg.get("nodata", "0"))
     keep_staging     = bool(cfg.get("keep_staging", False))
+    band_mode        = str(cfg.get("band_mode", "keep")).strip().lower() or "keep"
 
     def _log(msg: str) -> None:
         print(msg, flush=True)
+
+    if band_mode not in BAND_MODES:
+        raise ValueError(f"Unbekannte Band-Ausgabe: {band_mode!r} "
+                         f"(erlaubt: {', '.join(sorted(BAND_MODES))})")
 
     gdal.UseExceptions()
     ogr.UseExceptions()
@@ -517,6 +608,7 @@ def _process(cfg: dict) -> None:
     # --- Schritt 1: Mosaik-Quelle + Kompression von den Input-Kacheln uebernehmen ---
     compress = _detect_source_compression(input_dir, _log)
     mosaic_src = _resolve_mosaic_source(input_dir, run_dir, _log)
+    mosaic_src = _select_bands(mosaic_src, band_mode, run_dir, _log)
     px_w, px_h = _check_pixel_alignment(mosaic_src, _log)
 
     # --- Schritt 2: Cutline-Clip ---
@@ -578,9 +670,14 @@ def _process(cfg: dict) -> None:
     total = layer.GetFeatureCount()
     _log(f"\nGefundene Grid-Kacheln (ueberlappend mit geclipptem Mosaik): {total}")
     _log(f"Ausgabe-Benennung   : {jahr}_{area}_DOP_{gsd}_<NAME>_LV95.tif")
+    _log(f"Band-Ausgabe        : {BAND_MODE_LABELS[band_mode]}")
     _log(f"Kompression         : {compress} (von Input-Kacheln uebernommen, verlustfrei)")
     _log(f"Blockgroesse        : {blocksize}")
     _log(f"Parallele Prozesse  : {num_workers}")
+
+    # PHOTOMETRIC nur bei aktiver Bandauswahl erzwingen - ohne Auswahl bleibt die
+    # Ausgabe exakt so getaggt wie die Quelle.
+    photometric = "RGB" if BAND_MODES[band_mode] else None
 
     jobs = []
     skipped = 0
@@ -606,7 +703,7 @@ def _process(cfg: dict) -> None:
 
         out_path = str(Path(output_dir) / tile_name)
         jobs.append((str(staged_path), minx, maxy, maxx, miny, out_path,
-                     compress, blocksize, nodata_val))
+                     compress, blocksize, nodata_val, photometric))
 
     shp_ds = None
 

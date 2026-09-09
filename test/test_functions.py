@@ -65,6 +65,94 @@ def test_tiff_tab_name_preview():
         assert "2026_GUPPENFIRN_DOP_10cm_<NAME>_LV95.tif" in text
     finally:
         app.destroy()
+
+
+def test_tiff_tab_band_selection():
+    """Band-Ausgabe im TIFFconverter: Default ist 4-Band (unveraendert), die
+    3-Band-Auszuege bilden auf die Runner-Schluessel 'rgb'/'nrg' ab."""
+    gui_mod = load_module_from_path(
+        "gui_module",
+        os.path.join(PROJECT_ROOT, "GUI_DMCdataConverter.py"),
+    )
+    app = gui_mod.DMCConverterApp()
+    try:
+        # Ohne Auswahl bleibt der Input unangetastet
+        assert app._band_var.get() == gui_mod.BAND_KEEP
+        assert app._band_mode() == "keep"
+
+        app._band_var.set(gui_mod.BAND_RGB)
+        assert app._band_mode() == "rgb"
+        assert "RGB" in app._name_preview_lbl.cget("text")
+
+        app._band_var.set(gui_mod.BAND_NRG)
+        assert app._band_mode() == "nrg"
+        assert "NRG" in app._name_preview_lbl.cget("text")
+
+        # 4-Band-Input: Auswahl bleibt bedienbar
+        app._apply_band_availability(4)
+        assert str(app._band_combo.cget("state")) == "readonly"
+        assert app._band_mode() == "nrg"
+
+        # 3-Band-Input: Auswahl sperren und auf 4-Band/unveraendert zuruecksetzen,
+        # sonst liefe der Job erst im Runner in einen Fehler
+        app._apply_band_availability(3)
+        assert str(app._band_combo.cget("state")) == "disabled"
+        assert app._band_mode() == "keep"
+        assert "3 Band" in app._band_hint_lbl.cget("text")
+
+        # Unbekannte Bandzahl (keine Datei-Info): frei waehlbar
+        app._apply_band_availability(None)
+        assert str(app._band_combo.cget("state")) == "readonly"
+    finally:
+        app.destroy()
+
+
+def test_band_modes_match_between_gui_and_runner():
+    """Die GUI-Schluessel muessen exakt die Modi des Runners treffen - sonst
+    bricht der Job erst im Subprocess ab."""
+    gui_mod = load_module_from_path(
+        "gui_module",
+        os.path.join(PROJECT_ROOT, "GUI_DMCdataConverter.py"),
+    )
+    runner_mod = load_module_from_path(
+        "runner_module",
+        os.path.join(PROJECT_ROOT, "process_scripts", "_osgeo_runner.py"),
+    )
+    assert set(gui_mod.BAND_MODE_KEYS.values()) == set(runner_mod.BAND_MODES)
+    # RGB = Quellbaender 1,2,3  |  NRG = Quellbaender 4,1,2 (NIR, Rot, Gruen)
+    assert runner_mod.BAND_MODES == {"keep": None, "rgb": [1, 2, 3], "nrg": [4, 1, 2]}
+    assert callable(runner_mod._select_bands)
+
+
+def test_band_selection_needs_four_band_input(tmp_path, monkeypatch):
+    """Ein 3-Band-Input mit angeforderter Bandauswahl muss mit klarer Meldung
+    abbrechen statt stillschweigend etwas Falsches zu schreiben."""
+    import types
+
+    runner_mod = load_module_from_path(
+        "runner_module",
+        os.path.join(PROJECT_ROOT, "process_scripts", "_osgeo_runner.py"),
+    )
+
+    class _FakeDS:
+        RasterCount = 3
+
+    fake_gdal = types.SimpleNamespace(
+        GA_ReadOnly=0,
+        Open=lambda path, mode: _FakeDS(),
+    )
+    monkeypatch.setitem(__import__("sys").modules, "osgeo",
+                        types.SimpleNamespace(gdal=fake_gdal))
+
+    logged = []
+    try:
+        runner_mod._select_bands("mosaic.vrt", "rgb", tmp_path, logged.append)
+        raise AssertionError("Bandauswahl haette scheitern muessen")
+    except RuntimeError as e:
+        assert "4-Band" in str(e)
+
+    # 'keep' laesst die Quelle unangetastet (kein VRT, kein Oeffnen noetig)
+    assert runner_mod._select_bands("mosaic.vrt", "keep", tmp_path, logged.append) == "mosaic.vrt"
 def test_las_raster_is_built_cellwise():
     """Der Raster-Build muss zellweise laufen (kein Gesamt-Merge ueber alle Kacheln,
     der bei grossen Projekten den Arbeitsspeicher sprengt)."""

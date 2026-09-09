@@ -52,6 +52,27 @@ CONFIG_FILE          = os.path.join(PROCESS_SCRIPTS_DIR, "_dmc_config.json")
 DEFAULT_GRID_SHAPE   = os.path.join(SCRIPT_DIR, "swissGRID_1km2_shp", "chGRID_1km2.shp")
 DEFAULT_STAGING_DIR  = r"Y:\02_DMC_tempProcessingFolder"
 
+# ─── Band-Ausgabe (Tab "DMC - TIFFconverter") ────────────────────────────────
+# DMC-Ausgangsdaten sind praktisch immer 4-Band (RGBN: Rot, Gruen, Blau, NIR).
+# Fuer die Publikation wird daraus optional ein 3-Band-Auszug gebildet. Die
+# Schluessel entsprechen 1:1 _osgeo_runner.BAND_MODES.
+BAND_KEEP = "4-Band  (RGBN, unveraendert)"
+BAND_RGB  = "RGBN → RGB  (3-Band, Echtfarbe)"
+BAND_NRG  = "RGBN → NRG  (3-Band, Falschfarben-Infrarot)"
+BAND_CHOICES   = [BAND_KEEP, BAND_RGB, BAND_NRG]
+BAND_MODE_KEYS = {BAND_KEEP: "keep", BAND_RGB: "rgb", BAND_NRG: "nrg"}
+BAND_PREVIEW_TEXT = {
+    "keep": "alle Baender der Quelle (bei RGBN: 4-Band)",
+    "rgb":  "3-Band RGB  –  Quellbaender 1,2,3",
+    "nrg":  "3-Band NRG  –  Quellbaender 4,1,2  (NIR, Rot, Gruen)",
+}
+BAND_HINT_UNKNOWN = ("Ohne Datei-Info frei waehlbar - die 3-Band-Auszuege setzen einen "
+                     "4-Band-Input (RGBN) voraus.")
+BAND_HINT_4BAND   = ("4-Band-Input erkannt  |  RGB = Baender 1,2,3  |  "
+                     "NRG = Baender 4,1,2 (NIR, Rot, Gruen)")
+BAND_HINT_NOT4    = ("Input hat {count} Band/Baender - eine Bandauswahl ist nur bei "
+                     "4-Band-Input (RGBN) moeglich.")
+
 
 # ─── OSGeo4W Python Erkennung (identisch zu topo-COGTIFFconverter) ───────────
 def _detect_osgeo_python() -> str:
@@ -1381,13 +1402,23 @@ class DMCConverterApp(tk.Tk):
         h3.grid(row=2, column=2, sticky="w", padx=(8, 0))
         self._dim_labels.append(h3)
 
+        lbl4 = ttk.Label(sec, text="Band-Ausgabe:", font=("Segoe UI", 9, "bold"))
+        lbl4.grid(row=3, column=0, sticky="w", pady=3)
+        self._band_var = tk.StringVar(value=BAND_KEEP)
+        self._band_combo = ttk.Combobox(sec, textvariable=self._band_var,
+                                         values=BAND_CHOICES, state="readonly", width=38)
+        self._band_combo.grid(row=3, column=1, columnspan=2, sticky="w", padx=(8, 0), pady=3)
+        self._band_hint_lbl = ttk.Label(sec, text=BAND_HINT_UNKNOWN, font=("", 8), justify="left")
+        self._band_hint_lbl.grid(row=4, column=1, columnspan=2, sticky="w", padx=(8, 0))
+        self._dim_labels.append(self._band_hint_lbl)
+
         name_lbl = ttk.Label(sec, text="Ausgabe-Benennung:", font=("Segoe UI", 9, "bold"))
-        name_lbl.grid(row=3, column=0, sticky="nw", pady=(8, 3))
-        self._name_preview_lbl = ttk.Label(sec, text="–", font=("Courier New", 9))
-        self._name_preview_lbl.grid(row=3, column=1, columnspan=2, sticky="w", padx=(8, 0), pady=(8, 3))
+        name_lbl.grid(row=5, column=0, sticky="nw", pady=(8, 3))
+        self._name_preview_lbl = ttk.Label(sec, text="–", font=("Courier New", 9), justify="left")
+        self._name_preview_lbl.grid(row=5, column=1, columnspan=2, sticky="w", padx=(8, 0), pady=(8, 3))
         self._accent_labels.append(self._name_preview_lbl)
 
-        for var in (self._jahr_var, self._area_var, self._gsd_var):
+        for var in (self._jahr_var, self._area_var, self._gsd_var, self._band_var):
             var.trace_add("write", lambda *_: self._update_name_preview())
         self._update_name_preview()
 
@@ -1396,7 +1427,33 @@ class DMCConverterApp(tk.Tk):
         area = self._area_var.get().strip() or "AREA"
         gsd  = self._gsd_var.get().strip() or "GSD"
         self._name_preview_lbl.config(
-            text=f"{jahr}_{area}_DOP_{gsd}_<NAME>_LV95.tif  (+ .tfw)")
+            text=f"{jahr}_{area}_DOP_{gsd}_<NAME>_LV95.tif  (+ .tfw)"
+                 f"\nBaender: {BAND_PREVIEW_TEXT[self._band_mode()]}")
+
+    def _band_mode(self) -> str:
+        """Combobox-Beschriftung -> Runner-Schluessel ('keep' | 'rgb' | 'nrg')."""
+        return BAND_MODE_KEYS.get(self._band_var.get(), "keep")
+
+    def _apply_band_availability(self, band_count) -> None:
+        """Die 3-Band-Auszuege setzen einen 4-Band-Input (RGBN) voraus. Passt der
+        erkannte Input nicht dazu, wird die Auswahl gesperrt und auf '4-Band'
+        zurueckgesetzt - sonst laeuft der Job erst im Runner in einen Fehler.
+        band_count=None bedeutet 'unbekannt' (keine Datei-Info gelesen)."""
+        try:
+            count = int(band_count)
+        except (TypeError, ValueError):
+            count = None
+
+        if count is None:
+            self._band_combo.config(state="readonly")
+            self._band_hint_lbl.config(text=BAND_HINT_UNKNOWN)
+        elif count >= 4:
+            self._band_combo.config(state="readonly")
+            self._band_hint_lbl.config(text=BAND_HINT_4BAND)
+        else:
+            self._band_var.set(BAND_KEEP)
+            self._band_combo.config(state="disabled")
+            self._band_hint_lbl.config(text=BAND_HINT_NOT4.format(count=count))
 
     def _build_dateien(self, parent):
         sec = ttk.LabelFrame(parent, text="Ordner & Shapes", padding=10,
@@ -1700,6 +1757,7 @@ class DMCConverterApp(tk.Tk):
         def _reset():
             for attr in info_attrs:
                 getattr(self, attr).config(text="–")
+            self._apply_band_availability(None)
 
         if not src_dir or not os.path.isdir(src_dir):
             _reset()
@@ -1732,6 +1790,7 @@ class DMCConverterApp(tk.Tk):
                 ci_parts = ["B{}:{}".format(i+1, c) for i, c in enumerate(ci)]
                 self._info_bands.config(text=str(info.get("bands")))
                 self._info_colorinterp.config(text="  ".join(ci_parts))
+                self._apply_band_availability(info.get("bands"))
                 self._info_res.config(text="{} × {} px".format(info.get('width'), info.get('height')))
                 self._info_bitdepth.config(text=_format_bitdepth(info))
                 comp   = info.get("compression", "–")
@@ -2146,6 +2205,7 @@ class DMCConverterApp(tk.Tk):
             "staging_dir":      self._staging_var.get().strip(),
             "num_workers":      int(self._workers_var.get()),
             "keep_staging":     bool(self._keep_staging_var.get()),
+            "band_mode":        self._band_mode(),
         }
 
         self._running = True
