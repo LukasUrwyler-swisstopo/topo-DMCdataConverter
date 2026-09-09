@@ -4,6 +4,19 @@ Converter-Tool für rohe DMC-Daten aus RealityStudio (True-DOP und Punktwolken, 
 200m-Kacheln) ins swisstopo-Format „ch.spezialbefliegungen" (GDWH-STAC-ready). GUI mit vier Tabs;
 Struktur und Styling analog zu `topo-COGTIFFconverter`.
 
+## GUI starten
+
+```bash
+python GUI_DMCdataConverter.py
+```
+
+<img width="635" height="764" alt="image" src="https://github.com/user-attachments/assets/1cac941f-ceaf-44b9-bade-fc79a711d6c9" />
+
+
+Beim ersten Start erkennt das GUI automatisch die OSGeo4W/QGIS-Installation. Der Pfad kann
+ueber die Schaltflaeche **Aendern…** manuell gesetzt werden und wird in
+`process_scripts/_dmc_config.json` gespeichert.
+
 ## Was macht welcher Tab?
 
 | Tab | Input | Verarbeitung | Output |
@@ -55,18 +68,7 @@ Absicherungen — zum Nachvollziehen, nicht zum Bedienen:
 - [Architektur](#architektur) · [Voraussetzungen](#voraussetzungen) ·
   [Koordinatensystem](#koordinatensystem) · [Tests](#tests)
 
-## GUI starten
 
-```bash
-python GUI_DMCdataConverter.py
-```
-
-<img width="635" height="764" alt="image" src="https://github.com/user-attachments/assets/1cac941f-ceaf-44b9-bade-fc79a711d6c9" />
-
-
-Beim ersten Start erkennt das GUI automatisch die OSGeo4W/QGIS-Installation. Der Pfad kann
-ueber die Schaltflaeche **Aendern…** manuell gesetzt werden und wird in
-`process_scripts/_dmc_config.json` gespeichert.
 
 ---
 
