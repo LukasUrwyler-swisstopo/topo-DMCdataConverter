@@ -10,7 +10,7 @@ Struktur und Styling analog zu `topo-COGTIFFconverter`.
 python GUI_DMCdataConverter.py
 ```
 
-<img width="855" height="1386" alt="image" src="https://github.com/user-attachments/assets/1118d9c9-4098-4e85-a1af-1316d6fb9918" />
+<img width="551" height="692" alt="image" src="https://github.com/user-attachments/assets/03fdd7fb-4cad-4014-a6f4-8a6bdbb99109" />
 
 
 
