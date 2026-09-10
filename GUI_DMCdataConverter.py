@@ -1,9 +1,9 @@
 """
 GUI_DMCdataConverter.py - DMC Werkzeuge GUI
-Tkinter-Oberflaeche mit drei Tabs:
+Tkinter-Oberflaeche mit sechs Tabs:
   - "DMC - TIFFconverter"       : technische 200m-DOP-Tiles clippen (gueltige
                                    Flaeche) und in 1km x 1km-Tiles zerlegen
-                                   (parallelisiert)
+                                   (parallelisiert), optional ein QC-Mosaik (COG)
   - "DMC - LASconverter [LHN95]": technische 200m-LAZ-Tiles per AOI croppen,
                                    optional thinnen, in 1km x 1km-Tiles zerlegen
                                    (.las/.laz) und optional zu einem Gesamt-DSM-
@@ -13,10 +13,14 @@ Tkinter-Oberflaeche mit drei Tabs:
                                    in die GDWH-taugliche LAS-1.4-Form bringen (PF7
                                    mit RGB, global_encoding 17, scale 0.01, Offset =
                                    Tile-Ursprung, byte-exakte LV95/LN02-CRS-VLRs),
-                                   optional eine Virtual Point Cloud (.vpc) fuer QGIS
+                                   optional ein QC-COPC der ganzen AOI (Sichtkontrolle)
                                    und optional ebenfalls DSM + Hillshade rastern
   - "Create DSM-Raster"          : DSM + Hillshade aus einem beliebigen Ordner mit
                                    LAS/LAZ-Kacheln - ohne Punktwolken-Verarbeitung
+  - "Create COGTIFF"             : EIN COG aus einem beliebigen Ordner mit TIFF-
+                                   Kacheln (Mosaik, Bandauswahl, Kompression)
+  - "Create COPC"                : EIN COPC aus einem beliebigen Ordner mit LAS/LAZ-
+                                   Kacheln (Merge via untwine)
 Styling analog zu topo-COGTIFFconverter / GUI_cogtiffConverter.py.
 
 Das GUI laeuft mit Standard-Python (kein osgeo erforderlich).
@@ -66,12 +70,9 @@ BAND_PREVIEW_TEXT = {
     "rgb":  "3-Band RGB  –  Quellbaender 1,2,3",
     "nrg":  "3-Band NRG  –  Quellbaender 4,1,2  (NIR, Rot, Gruen)",
 }
-BAND_HINT_UNKNOWN = ("Ohne Datei-Info frei waehlbar - die 3-Band-Auszuege setzen einen "
-                     "4-Band-Input (RGBN) voraus.")
-BAND_HINT_4BAND   = ("4-Band-Input erkannt  |  RGB = Baender 1,2,3  |  "
-                     "NRG = Baender 4,1,2 (NIR, Rot, Gruen)")
-BAND_HINT_NOT4    = ("Input hat {count} Band/Baender - eine Bandauswahl ist nur bei "
-                     "4-Band-Input (RGBN) moeglich.")
+BAND_HINT_UNKNOWN = "RGB-/NRG-Auszug nur bei 4-Band-Input (RGBN)"
+BAND_HINT_4BAND   = "4-Band erkannt  |  RGB = 1,2,3  |  NRG = 4,1,2"
+BAND_HINT_NOT4    = "Input hat {count} Band/Baender - Auswahl nur bei 4-Band (RGBN)"
 
 
 # ─── OSGeo4W Python Erkennung (identisch zu topo-COGTIFFconverter) ───────────
@@ -109,32 +110,44 @@ def _detect_osgeo_python() -> str:
     return next((p for p in kandidaten if Path(p).is_file()), "")
 
 
-def _detect_pdal_exe(osgeo_python: str = "") -> str:
-    """Gibt den Pfad zur pdal.exe zurueck (PATH, OSGEO4W_ROOT, QGIS-Installationen).
-    Kein eigenes Config-/GUI-Feld - Autodetektion analog zum OSGeo4W-Python."""
+def _detect_osgeo_exe(name: str, osgeo_python: str = "") -> str:
+    """Sucht ein Kommandozeilen-Werkzeug aus dem OSGeo4W-/QGIS-Umfeld: PATH, neben dem
+    OSGeo4W-Python, dann OSGEO4W_ROOT, Standard-OSGeo4W und QGIS-Installationen (je
+    'bin' und 'apps/qgis*/bin'). Kein eigenes Config-/GUI-Feld."""
     import shutil as _shutil
-    found = _shutil.which("pdal")
+    found = _shutil.which(name)
     if found:
         return found
 
+    exe = f"{name}.exe"
     kandidaten: List[str] = []
     if osgeo_python and os.path.isfile(osgeo_python):
-        kandidaten.append(str(Path(os.path.dirname(osgeo_python)) / "pdal.exe"))
+        kandidaten.append(str(Path(os.path.dirname(osgeo_python)) / exe))
 
+    roots: List[str] = []
     osgeo_root = os.environ.get("OSGEO4W_ROOT")
     if osgeo_root:
-        kandidaten.append(str(Path(osgeo_root) / "bin" / "pdal.exe"))
-    kandidaten += [
-        r"C:\OSGeo4W\bin\pdal.exe",
-        r"C:\OSGeo4W64\bin\pdal.exe",
-    ]
-    for pat in [
-        r"C:\Program Files\QGIS*\bin\pdal.exe",
-        r"C:\Program Files (x86)\QGIS*\bin\pdal.exe",
-    ]:
-        kandidaten.extend(sorted(_glob.glob(pat), reverse=True))
+        roots.append(osgeo_root)
+    roots += [r"C:\OSGeo4W", r"C:\OSGeo4W64"]
+    for pat in [r"C:\Program Files\QGIS*", r"C:\Program Files (x86)\QGIS*"]:
+        roots.extend(sorted(_glob.glob(pat), reverse=True))
+    for root in roots:
+        kandidaten.append(str(Path(root) / "bin" / exe))
+        kandidaten.extend(sorted(_glob.glob(str(Path(root) / "apps" / "qgis*" / "bin" / exe)),
+                                 reverse=True))
 
     return next((p for p in kandidaten if Path(p).is_file()), "")
+
+
+def _detect_pdal_exe(osgeo_python: str = "") -> str:
+    """Pfad zur pdal.exe (Punktwolken-Verarbeitung)."""
+    return _detect_osgeo_exe("pdal", osgeo_python)
+
+
+def _detect_untwine_exe(osgeo_python: str = "") -> str:
+    """Pfad zur untwine.exe (Hobu) - baut das QC-COPC im Tab [LN02]. Liegt
+    normalerweise im bin-Ordner der QGIS-Installation."""
+    return _detect_osgeo_exe("untwine", osgeo_python)
 
 
 def _detect_python_home(python_exe: str) -> str:
@@ -302,6 +315,32 @@ def _pc_size(meta: dict, path: str) -> str:
     return f"{Path(path).stat().st_size / (1024 ** 2):.1f} MB"
 
 
+# ─── Ausgabenamen (Tabs "Create COGTIFF" / "Create COPC") ─────────────────────
+# Entspricht _osgeo_runner.COG_COMPRESSIONS (Auswahl wie im Mosaik-Tab von
+# topo-COGTIFFconverter).
+COG_COMPRESSIONS = ["JPEG", "DEFLATE", "LZW", "ZSTD", "NONE"]
+
+
+def _normalize_cog_path(path: str) -> str:
+    """Ausgabe-COG: Endung .tif ergaenzen, falls keine TIFF-Endung angegeben ist."""
+    path = path.strip()
+    if path and not path.lower().endswith((".tif", ".tiff")):
+        path += ".tif"
+    return path
+
+
+def _normalize_copc_path(path: str) -> str:
+    """Ausgabe-COPC: muss auf .copc.laz enden - an dieser Konvention erkennen QGIS und
+    PDAL das Format. '.laz'/'.las' wird zu '.copc.laz', sonst wird ergaenzt."""
+    path = path.strip()
+    low = path.lower()
+    if not path or low.endswith(".copc.laz"):
+        return path
+    if low.endswith((".laz", ".las")):
+        return path[:-4] + ".copc.laz"
+    return path + ".copc.laz"
+
+
 # ─── Haupt-App ─────────────────────────────────────────────────────────────────
 class DMCConverterApp(tk.Tk):
 
@@ -310,7 +349,7 @@ class DMCConverterApp(tk.Tk):
         self.title("DMC Werkzeuge")
         screen_h = self.winfo_screenheight()
         win_h    = min(880, screen_h - 80)
-        self.geometry(f"860x{win_h}")
+        self.geometry(f"900x{win_h}")
         self.minsize(700, min(760, win_h))
         self.resizable(True, True)
 
@@ -321,11 +360,13 @@ class DMCConverterApp(tk.Tk):
         self._dim_labels    = []
         self._accent_labels = []
         self._hint_labels   = []
+        self._scroll_areas  = []   # (Canvas, Frame) aller Scroll-Flaechen
 
         self._osgeo_python = _detect_osgeo_python()
         self._osgeo_lbl    = None
         self._osgeo_status = None
         self._pdal_exe     = _detect_pdal_exe(self._osgeo_python)
+        self._untwine_exe  = _detect_untwine_exe(self._osgeo_python)
         self._active_start_btn = None
 
         self._build_ui()
@@ -372,15 +413,21 @@ class DMCConverterApp(tk.Tk):
         tab_las  = ttk.Frame(self._notebook)
         tab_ln02 = ttk.Frame(self._notebook)
         tab_dsm  = ttk.Frame(self._notebook)
+        tab_cog  = ttk.Frame(self._notebook)
+        tab_copc = ttk.Frame(self._notebook)
         self._notebook.add(tab_tiff, text="DMC - TIFFconverter")
         self._notebook.add(tab_las,  text="DMC - LASconverter [LHN95]")
         self._notebook.add(tab_ln02, text="DMC - LASconverter [LN02]")
         self._notebook.add(tab_dsm,  text="Create DSM-Raster")
+        self._notebook.add(tab_cog,  text="Create COGTIFF")
+        self._notebook.add(tab_copc, text="Create COPC")
 
         self._build_tiff_tab(tab_tiff)
         self._build_las_tab(tab_las)
         self._build_ln02_tab(tab_ln02)
         self._build_dsm_tab(tab_dsm)
+        self._build_cog_tab(tab_cog)
+        self._build_copc_tab(tab_copc)
 
         # Log
         ttk.Separator(self).pack(fill="x", padx=12, pady=4)
@@ -422,6 +469,7 @@ class DMCConverterApp(tk.Tk):
                     lambda e: canvas.itemconfig(win_id, width=e.width))
         setattr(self, canvas_attr, canvas)
         setattr(self, frame_attr, sf)
+        self._scroll_areas.append((canvas, sf))
         return sf
 
     def _build_group_header(self, parent, text):
@@ -481,7 +529,7 @@ class DMCConverterApp(tk.Tk):
                      state="readonly", width=14
                      ).grid(row=2, column=1, sticky="w", padx=(8, 0), pady=(10, 3))
         self._las_thin_var.trace_add("write", lambda *_: self._update_las_name_preview())
-        h_thin = ttk.Label(sec, text="Mindestabstand zwischen Punkten nach Reduktion (Poisson-Disk-Sampling)", font=("", 8))
+        h_thin = ttk.Label(sec, text="Mindestpunktabstand nach dem Ausduennen (Poisson-Disk)", font=("", 8))
         h_thin.grid(row=3, column=0, columnspan=3, sticky="w")
         self._dim_labels.append(h_thin)
 
@@ -490,9 +538,7 @@ class DMCConverterApp(tk.Tk):
                          variable=self._las_create_raster_var,
                          command=self._on_las_create_raster_toggle
                          ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(10, 0))
-        h_rast = ttk.Label(sec, text="Alle Tiles mergen -> IDW-Raster (DSM) -> Loecher bis 900 m2 interpoliert, "
-                                      "groessere bleiben NoData\n-> per AOI maskiert -> Hillshade daraus "
-                                      "(im AOI lochfrei, NoData=255 nur ausserhalb)",
+        h_rast = ttk.Label(sec, text="Tiles -> DSM (IDW) -> Loecher bis 900 m2 gefuellt -> AOI-Maske -> Hillshade",
                             font=("", 8), justify="left")
         h_rast.grid(row=5, column=0, columnspan=3, sticky="w", padx=(20, 0))
         self._dim_labels.append(h_rast)
@@ -581,7 +627,7 @@ class DMCConverterApp(tk.Tk):
         ttk.Button(sec, text="Ordner…", command=self._browse_las_input
                     ).grid(row=row, column=2, pady=3)
         row += 1
-        h = ttk.Label(sec, text="technical - Tiles (.laz), Koordinatensystem CH1903+/LV95 + LHN95", font=("", 8))
+        h = ttk.Label(sec, text="technical Tiles (.laz), LV95 + LHN95", font=("", 8))
         h.grid(row=row, column=1, sticky="w", padx=(8, 0))
         self._dim_labels.append(h)
         row += 1
@@ -602,9 +648,8 @@ class DMCConverterApp(tk.Tk):
                      values=["las", "laz"], state="readonly", width=6
                      ).pack(side="left", padx=(8, 8))
         self._las_out_format_var.trace_add("write", lambda *_: self._update_las_name_preview())
-        h = ttk.Label(fmt_row, text="1km-Grid-Tiles als LAS 1.4 / PF7 (mit RGB), CRS-Tag EPSG:2056\n"
-                                     "GeoSuite/REFRAME (LHN95->LN02) liest das seit dem LAS-1.4-Update "
-                                     "und behaelt die Farbe",
+        h = ttk.Label(fmt_row, text="LAS 1.4 / PF7 mit RGB, EPSG:2056 - Eingabe fuer GeoSuite/REFRAME\n"
+                                    "'laz' spart rund 80 % Platz, Daten identisch",
                        font=("", 8), justify="left")
         h.pack(side="left")
         self._dim_labels.append(h)
@@ -634,8 +679,7 @@ class DMCConverterApp(tk.Tk):
         ttk.Button(sec, text="Datei…", command=self._browse_las_clip_shape
                     ).grid(row=row, column=2, pady=(8, 3))
         row += 1
-        h = ttk.Label(sec, text="LAZ: alles ausserhalb wird aus der Punktwolke entfernt (Crop)  |  "
-                                 "Raster: alles ausserhalb wird NoData", font=("", 8))
+        h = ttk.Label(sec, text="Punktwolke: Crop  |  Raster: ausserhalb NoData", font=("", 8))
         h.grid(row=row, column=1, sticky="w", padx=(8, 0))
         self._dim_labels.append(h)
         row += 1
@@ -648,7 +692,7 @@ class DMCConverterApp(tk.Tk):
         ttk.Button(sec, text="Datei…", command=self._browse_las_grid_shape
                     ).grid(row=row, column=2, pady=(8, 3))
         row += 1
-        h = ttk.Label(sec, text="Nur fuer die LAZ-Ausgabe (Attributfeld 'NAME')  |  gilt fuer EPSG:2056",
+        h = ttk.Label(sec, text="Feld 'NAME' = Tile-Bezeichnung  |  EPSG:2056",
                        font=("", 8))
         h.grid(row=row, column=1, sticky="w", padx=(8, 0))
         self._dim_labels.append(h)
@@ -677,7 +721,7 @@ class DMCConverterApp(tk.Tk):
             self._accent_labels.append(val)
 
         info_hint = ttk.Label(sec,
-            text="Metadaten der ersten gefundenen Tile im Input-Ordner (stellvertretend fuer alle Tiles), via pdal info",
+            text="Aus dem ersten Tile im Input-Ordner (pdal info)",
             font=("", 8))
         info_hint.grid(row=len(fields), column=0, columnspan=2, sticky="w", pady=(4, 0))
         self._dim_labels.append(info_hint)
@@ -699,7 +743,7 @@ class DMCConverterApp(tk.Tk):
                    ).grid(row=0, column=1, sticky="ew", padx=(8, 4), pady=3)
         ttk.Button(sec, text="Ordner…", command=self._browse_las_staging
                     ).grid(row=0, column=2, pady=3)
-        h = ttk.Label(sec, text="Zwischendateien (PDAL-Pipelines, Rohraster) fuer die Verarbeitung", font=("", 8))
+        h = ttk.Label(sec, text="Zwischendateien (PDAL-Pipelines, Rohraster)", font=("", 8))
         h.grid(row=1, column=1, sticky="w", padx=(8, 0))
         self._dim_labels.append(h)
 
@@ -743,11 +787,7 @@ class DMCConverterApp(tk.Tk):
         sec.pack(fill="x", pady=(0, 6))
         sec.columnconfigure(1, weight=0)
 
-        intro = ttk.Label(sec, text="Nachgelagert zum Tab [LHN95]: dessen .las-Tiles, nachdem sie mit "
-                                     "GeoSuite/REFRAME\nvon LHN95 nach LN02 reframt wurden. Kein Reframe, "
-                                     "kein Re-Tiling, kein Punktwolken-Crop\nim Tool - nur die "
-                                     "GDWH-Metadaten (LAS 1.4 / PF7 mit RGB / global_encoding 17 / "
-                                     "LV95_LN02).",
+        intro = ttk.Label(sec, text="Setzt auf den nach LN02 reframten Tiles nur die GDWH-Metadaten - kein Reframe, kein Crop",
                            font=("", 8), justify="left")
         intro.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
         self._dim_labels.append(intro)
@@ -767,29 +807,22 @@ class DMCConverterApp(tk.Tk):
         h2.grid(row=2, column=2, sticky="w", padx=(8, 0))
         self._dim_labels.append(h2)
 
-        self._ln02_create_vpc_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(sec, text="Create Virtual Point Cloud (VPC)  (alle Tiles als EINE Ebene in QGIS)",
-                         variable=self._ln02_create_vpc_var,
+        self._ln02_create_copc_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(sec, text="Create COPC  (QC: alle Tiles als EINE Punktwolke, nur zur Kontrolle)",
+                         variable=self._ln02_create_copc_var,
                          command=self._update_ln02_name_preview
                          ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(10, 0))
-        h_vpc = ttk.Label(sec, text="Legt '_vpc\\<JAHR>_<AREA>_LV95_LN02.vpc' im Output-Ordner an: eine "
-                                     "JSON-Datei, die alle\nfertigen Kacheln mit relativen Pfaden "
-                                     "zusammenfasst - das Punktwolken-Gegenstueck zum Raster-VRT.\n"
-                                     "Es wird nichts kopiert und nichts umgerechnet. QGIS ab 3.32 liest das "
-                                     "nativ, ArcGIS Pro NICHT\n(dort braucht es ein LAS-Dataset, das nur "
-                                     "arcpy erzeugen kann).",
-                           font=("", 8), justify="left")
-        h_vpc.grid(row=4, column=0, columnspan=3, sticky="w", padx=(20, 0))
-        self._dim_labels.append(h_vpc)
+        h_copc = ttk.Label(sec, text="Via untwine aus den fertigen Tiles - in QGIS auf jeder Zoomstufe sichtbar",
+                            font=("", 8), justify="left")
+        h_copc.grid(row=4, column=0, columnspan=3, sticky="w", padx=(20, 0))
+        self._dim_labels.append(h_copc)
 
         self._ln02_create_raster_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(sec, text="Create DSM-Raster from LAS/LAZ  (ein Gesamt-TIFF+TFW fuer die AOI)",
                          variable=self._ln02_create_raster_var,
                          command=self._on_ln02_create_raster_toggle
                          ).grid(row=5, column=0, columnspan=3, sticky="w", pady=(10, 0))
-        h_rast = ttk.Label(sec, text="Alle Tiles -> IDW-Raster (DSM) -> Loecher bis 900 m2 interpoliert, "
-                                      "groessere bleiben NoData\n-> per AOI maskiert -> Hillshade daraus "
-                                      "(im AOI lochfrei, NoData=255 nur ausserhalb)",
+        h_rast = ttk.Label(sec, text="Tiles -> DSM (IDW) -> Loecher bis 900 m2 gefuellt -> AOI-Maske -> Hillshade",
                             font=("", 8), justify="left")
         h_rast.grid(row=6, column=0, columnspan=3, sticky="w", padx=(20, 0))
         self._dim_labels.append(h_rast)
@@ -817,22 +850,15 @@ class DMCConverterApp(tk.Tk):
                                           padx=(8, 0), pady=(10, 3))
         self._accent_labels.append(self._ln02_name_preview_lbl)
 
-        h_name = ttk.Label(sec, text="[thinnedout<NN>_] und <E>_<N> werden aus dem Input-Dateinamen "
-                                      "uebernommen -\nausgeduennt wurde bereits im Tab [LHN95], "
-                                      "hier wird nichts mehr veraendert.", font=("", 8), justify="left")
+        h_name = ttk.Label(sec, text="[thinnedout<NN>_] und <E>_<N> kommen aus dem Input-Dateinamen", font=("", 8), justify="left")
         h_name.grid(row=9, column=1, columnspan=2, sticky="w", padx=(8, 0))
         self._dim_labels.append(h_name)
 
         meta_lbl = ttk.Label(sec, text="Ziel-Metadaten:", font=("Segoe UI", 9, "bold"))
         meta_lbl.grid(row=10, column=0, sticky="nw", pady=(6, 3))
         meta_val = ttk.Label(sec, justify="left", font=("", 8),
-                              text="LAS 1.4, Point Data Record Format 7 (PF6 + RGB), "
-                                   "global_encoding 17, "
-                                   "scale 0.01,\nOffset = Tile-Ursprung (aus dem Dateinamen), "
-                                   "CRS-Tag LV95 + LN02 (EPSG:2056+5728)\n"
-                                   "als byte-exakte Referenz-VLRs 34735 + 2112\n"
-                                   "(wie SB_DSM_PUNKTWOLKE, dort aber PF6 - hier PF7, damit die "
-                                   "DMC-Farbe erhalten bleibt)")
+                              text="LAS 1.4 / PF7 (mit RGB), global_encoding 17, scale 0.01, Offset = Tile-Ursprung\n"
+                                   "CRS LV95 + LN02 (EPSG:2056+5728) als byte-exakte VLRs 34735 + 2112")
         meta_val.grid(row=10, column=1, columnspan=2, sticky="w", padx=(8, 0), pady=(6, 3))
         self._dim_labels.append(meta_val)
 
@@ -863,8 +889,8 @@ class DMCConverterApp(tk.Tk):
         ext = out_format.get() if out_format is not None else "laz"
         text = (f"Punktwolke (pro 1km-Tile):  "
                 f"{jahr}_{area}_TIN_[thinnedout<NN>_]raw_<E>_<N>_LV95_LN02.{ext}")
-        if getattr(self, "_ln02_create_vpc_var", None) and self._ln02_create_vpc_var.get():
-            text += f"\nVirtual Point Cloud (QGIS):   _vpc\\{jahr}_{area}_LV95_LN02.vpc"
+        if getattr(self, "_ln02_create_copc_var", None) and self._ln02_create_copc_var.get():
+            text += f"\nQC-Punktwolke (COPC):         copc_QC\\{jahr}_{area}_checkData_LV95_LN02.copc.laz"
         if getattr(self, "_ln02_create_raster_var", None) and self._ln02_create_raster_var.get():
             try:
                 gsd_label = f"{round(float(self._ln02_gsd_var.get().strip().replace('m', '')) * 100)}cm"
@@ -889,9 +915,7 @@ class DMCConverterApp(tk.Tk):
         ttk.Button(sec, text="Ordner…", command=self._browse_ln02_input
                     ).grid(row=row, column=2, pady=3)
         row += 1
-        h = ttk.Label(sec, text="1km-Tiles (.las/.laz) nach dem GeoSuite-Reframe, CH1903+/LV95 + LN02.\n"
-                                 "Dateiname muss auf '_<E>_<N>_LV95_<LHN95|LN02>' enden - daraus kommt "
-                                 "der Tile-Ursprung.", font=("", 8), justify="left")
+        h = ttk.Label(sec, text="Name muss auf _<E>_<N>_LV95_<LHN95|LN02>.las/.laz enden (daraus der Tile-Ursprung)", font=("", 8), justify="left")
         h.grid(row=row, column=1, sticky="w", padx=(8, 0))
         self._dim_labels.append(h)
         row += 1
@@ -912,7 +936,7 @@ class DMCConverterApp(tk.Tk):
                      values=["las", "laz"], state="readonly", width=6
                      ).pack(side="left", padx=(8, 8))
         self._ln02_out_format_var.trace_add("write", lambda *_: self._update_ln02_name_preview())
-        h = ttk.Label(fmt_row, text="Default 'laz' (GDWH-Auslieferungsformat, analog SB_DSM_PUNKTWOLKE)",
+        h = ttk.Label(fmt_row, text="'laz' = GDWH-Auslieferungsformat",
                        font=("", 8))
         h.pack(side="left")
         self._dim_labels.append(h)
@@ -930,7 +954,7 @@ class DMCConverterApp(tk.Tk):
         ttk.Button(self._ln02_out_raster_frame, text="Ordner…",
                     command=self._browse_ln02_output_raster).grid(row=0, column=2)
         h = ttk.Label(self._ln02_out_raster_frame,
-                       text="Ein Gesamt-.tif/.tfw (DSM) + ein Hillshade-.tif/.tfw fuer die AOI",
+                       text="DSM + Hillshade, je ein .tif/.tfw fuer die AOI",
                        font=("", 8))
         h.grid(row=1, column=1, sticky="w", padx=(8, 0))
         self._dim_labels.append(h)
@@ -948,9 +972,7 @@ class DMCConverterApp(tk.Tk):
         ttk.Button(self._ln02_clip_frame, text="Datei…",
                     command=self._browse_ln02_clip_shape).grid(row=0, column=2)
         h = ttk.Label(self._ln02_clip_frame,
-                       text="Nur fuer das Raster: alles ausserhalb wird NoData (DSM -3.4028235e+38, "
-                            "Hillshade 255).\nDie Punktwolken-Tiles sind bereits im Tab [LHN95] "
-                            "gecroppt und werden hier nicht angetastet.", font=("", 8), justify="left")
+                       text="Nur fuer das Raster: ausserhalb -> NoData. Die Punktwolke wird nicht gecroppt.", font=("", 8), justify="left")
         h.grid(row=1, column=1, sticky="w", padx=(8, 0))
         self._dim_labels.append(h)
         self._on_ln02_create_raster_toggle()
@@ -981,11 +1003,7 @@ class DMCConverterApp(tk.Tk):
             self._accent_labels.append(val)
 
         info_hint = ttk.Label(sec,
-            text="Metadaten des ersten gefundenen Tiles im Input-Ordner (stellvertretend fuer alle), "
-                 "via pdal info.\nZeigt LAS-Version/Point-Format und global_encoding der QUELLE - "
-                 "'LAS 1.4 / PF7' + '17' heisst: bereits im Zielformat.\n"
-                 "Fehlt der Quelle die Farbe (PF ohne RGB), bleiben die RGB-Werte im "
-                 "Endprodukt 0 - der Lauf warnt dann pro Kachel.",
+            text="Aus dem ersten Tile (pdal info)  |  'LAS 1.4 / PF7' + '17' = schon im Zielformat",
             font=("", 8), justify="left")
         info_hint.grid(row=len(fields), column=0, columnspan=2, sticky="w", pady=(4, 0))
         self._dim_labels.append(info_hint)
@@ -1007,7 +1025,7 @@ class DMCConverterApp(tk.Tk):
                    ).grid(row=0, column=1, sticky="ew", padx=(8, 4), pady=3)
         ttk.Button(sec, text="Ordner…", command=self._browse_ln02_staging
                     ).grid(row=0, column=2, pady=3)
-        h = ttk.Label(sec, text="Zwischendateien (PDAL-Pipelines, Zell-Rohraster) fuer die Verarbeitung",
+        h = ttk.Label(sec, text="Zwischendateien (PDAL-Pipelines, Zell-Raster)",
                        font=("", 8))
         h.grid(row=1, column=1, sticky="w", padx=(8, 0))
         self._dim_labels.append(h)
@@ -1049,10 +1067,7 @@ class DMCConverterApp(tk.Tk):
         sec.pack(fill="x", pady=(0, 6))
         sec.columnconfigure(1, weight=1)
 
-        intro = ttk.Label(sec, text="Rastert einen beliebigen Ordner mit LAS/LAZ-Kacheln zu EINEM "
-                                     "DSM + Hillshade.\nKeine Punktwolken-Verarbeitung: kein Re-Tiling, "
-                                     "kein Thinning, kein Crop der Punkte -\nund die Hoehen werden "
-                                     "nirgends umgerechnet.",
+        intro = ttk.Label(sec, text="Beliebige LAS/LAZ-Kacheln -> EIN DSM + Hillshade. Punkte und Hoehen bleiben unveraendert.",
                            font=("", 8), justify="left")
         intro.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
         self._dim_labels.append(intro)
@@ -1081,9 +1096,7 @@ class DMCConverterApp(tk.Tk):
         ttk.Combobox(sec, textvariable=self._dsm_href_var, values=["LHN95", "LN02"],
                      state="readonly", width=10
                      ).grid(row=3, column=1, sticky="w", padx=(8, 0), pady=3)
-        h3 = ttk.Label(sec, text="Steuert NUR die Benennung und den SRS-Tag der Reader - "
-                                  "die Z-Werte bleiben unangetastet.\nWird aus dem ersten "
-                                  "Kachelnamen vorbelegt, sofern er der Konvention folgt.",
+        h3 = ttk.Label(sec, text="Nur Benennung + SRS-Tag, Z bleibt unveraendert. Vorbelegt aus dem Kachelnamen.",
                         font=("", 8), justify="left")
         h3.grid(row=4, column=1, columnspan=2, sticky="w", padx=(8, 0))
         self._dim_labels.append(h3)
@@ -1139,9 +1152,7 @@ class DMCConverterApp(tk.Tk):
                    ).grid(row=0, column=1, sticky="ew", padx=(8, 4), pady=3)
         ttk.Button(sec, text="Ordner\u2026", command=self._browse_dsm_input
                     ).grid(row=0, column=2, pady=3)
-        h = ttk.Label(sec, text="Alle .las/.laz im Ordner werden verwendet. Die Kachelung ist "
-                                 "beliebig -\nintern wird zellweise gerastert und danach zu einem "
-                                 "Gesamtbild mosaikiert.",
+        h = ttk.Label(sec, text="Alle .las/.laz im Ordner, Kachelung beliebig",
                        font=("", 8), justify="left")
         h.grid(row=1, column=1, columnspan=2, sticky="w", padx=(8, 0))
         self._dim_labels.append(h)
@@ -1153,7 +1164,7 @@ class DMCConverterApp(tk.Tk):
                    ).grid(row=2, column=1, sticky="ew", padx=(8, 4), pady=(8, 3))
         ttk.Button(sec, text="Ordner\u2026", command=self._browse_dsm_output
                     ).grid(row=2, column=2, pady=(8, 3))
-        h2 = ttk.Label(sec, text="DSM und Hillshade landen als je ein .tif + .tfw im selben Ordner",
+        h2 = ttk.Label(sec, text="DSM + Hillshade, je ein .tif/.tfw",
                         font=("", 8))
         h2.grid(row=3, column=1, sticky="w", padx=(8, 0))
         self._dim_labels.append(h2)
@@ -1165,8 +1176,7 @@ class DMCConverterApp(tk.Tk):
                    ).grid(row=4, column=1, sticky="ew", padx=(8, 4), pady=(8, 3))
         ttk.Button(sec, text="Datei\u2026", command=self._browse_dsm_clip_shape
                     ).grid(row=4, column=2, pady=(8, 3))
-        h3 = ttk.Label(sec, text="Maskierung (kein Crop der Punkte): ausserhalb -> NoData, "
-                                  "Extent bleibt.\nDSM NoData = -3.4028235e+38, Hillshade NoData = 255.",
+        h3 = ttk.Label(sec, text="Ausserhalb -> NoData (DSM -3.4028235e+38, Hillshade 255), kein Crop der Punkte",
                         font=("", 8), justify="left")
         h3.grid(row=5, column=1, columnspan=2, sticky="w", padx=(8, 0))
         self._dim_labels.append(h3)
@@ -1184,7 +1194,7 @@ class DMCConverterApp(tk.Tk):
                    ).grid(row=0, column=1, sticky="ew", padx=(8, 4), pady=3)
         ttk.Button(sec, text="Ordner\u2026", command=self._browse_dsm_staging
                     ).grid(row=0, column=2, pady=3)
-        h = ttk.Label(sec, text="Zwischendateien (PDAL-Pipelines, Zell-Rohraster) fuer die Verarbeitung",
+        h = ttk.Label(sec, text="Zwischendateien (PDAL-Pipelines, Zell-Raster)",
                        font=("", 8))
         h.grid(row=1, column=1, sticky="w", padx=(8, 0))
         self._dim_labels.append(h)
@@ -1347,6 +1357,403 @@ class DMCConverterApp(tk.Tk):
             daemon=True
         ).start()
 
+    # ── Gemeinsame Helfer (Tabs "Create COGTIFF" / "Create COPC") ─────────────
+    def _browse_dir_into(self, var, title: str) -> bool:
+        """Ordner-Dialog, Ergebnis in 'var'. True, wenn ein Ordner gewaehlt wurde."""
+        current = var.get().strip()
+        kwargs = {"title": title}
+        if current and os.path.isdir(current):
+            kwargs["initialdir"] = current
+        path = filedialog.askdirectory(**kwargs)
+        if not path:
+            return False
+        var.set(path.replace("/", "\\"))
+        return True
+
+    def _show_errors(self, errors: list) -> bool:
+        """Zeigt gesammelte Eingabefehler; True, wenn es keine gibt."""
+        if not errors:
+            return True
+        from tkinter import messagebox
+        messagebox.showerror("Eingabe-Fehler",
+                              "\n\n".join(f"\u2022 {e}" for e in errors), parent=self)
+        return False
+
+    def _launch(self, cfg: dict, start_btn, vorgang: str, log_stem: str) -> None:
+        """Gemeinsamer Start fuer die Tabs 'Create COGTIFF' und 'Create COPC'."""
+        self._running = True
+        self._active_start_btn = start_btn
+        start_btn.config(state="disabled")
+        self._progress_frame.pack(fill="x", padx=12, pady=(0, 4), before=self._btn_row)
+        self._progress_bar.start(10)
+        self._clear_log()
+        self._log(f"=== {vorgang} gestartet ===\n\n")
+        threading.Thread(target=self._run_thread, args=(cfg, log_stem, vorgang),
+                         daemon=True).start()
+
+    # ── Tab: Create COGTIFF ───────────────────────────────────────────────────
+    def _build_cog_tab(self, parent):
+        sf = self._build_scrollable(parent, "_canvas_cog", "_sf_cog")
+
+        self._build_group_header(sf, "Dateien")
+        self._build_cog_dateien(sf)
+
+        self._build_group_header(sf, "Ausgabe")
+        self._build_cog_ausgabe(sf)
+
+        self._build_group_header(sf, "Staging")
+        self._build_cog_staging(sf)
+
+        btn_row = ttk.Frame(parent)
+        btn_row.pack(fill="x", pady=(6, 0))
+        self._start_btn_cog = ttk.Button(btn_row, text="\u25b6   COGTIFF ERSTELLEN",
+                                          command=self._start_cog)
+        self._start_btn_cog.pack(side="right", ipadx=22, ipady=7)
+
+    def _build_cog_dateien(self, parent):
+        sec = ttk.LabelFrame(parent, text="Input & Output", padding=10,
+                              style="Section.TLabelframe")
+        sec.pack(fill="x", pady=(0, 6))
+        sec.columnconfigure(1, weight=1)
+
+        intro = ttk.Label(sec, text="Beliebige TIFF-Kacheln -> EIN COGTIFF (Mosaik). Kein Clip, kein Grid-Zuschnitt.",
+                           font=("", 8), justify="left")
+        intro.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
+        self._dim_labels.append(intro)
+
+        lbl = ttk.Label(sec, text="Input-Ordner (TIFF-Tiles):", font=("Segoe UI", 9, "bold"))
+        lbl.grid(row=1, column=0, sticky="w", pady=3)
+        self._cog_in_var = tk.StringVar()
+        ttk.Entry(sec, textvariable=self._cog_in_var
+                   ).grid(row=1, column=1, sticky="ew", padx=(8, 4), pady=3)
+        ttk.Button(sec, text="Ordner\u2026", command=self._browse_cog_input
+                    ).grid(row=1, column=2, pady=3)
+        h = ttk.Label(sec, text="Alle .tif/.tiff im Ordner (+ .tfw), CRS von den Kacheln",
+                       font=("", 8))
+        h.grid(row=2, column=1, sticky="w", padx=(8, 0))
+        self._dim_labels.append(h)
+
+        lbl2 = ttk.Label(sec, text="Output-Datei (COGTIFF):", font=("Segoe UI", 9, "bold"))
+        lbl2.grid(row=3, column=0, sticky="w", pady=(8, 3))
+        self._cog_out_var = tk.StringVar()
+        ttk.Entry(sec, textvariable=self._cog_out_var
+                   ).grid(row=3, column=1, sticky="ew", padx=(8, 4), pady=(8, 3))
+        ttk.Button(sec, text="Datei\u2026", command=self._browse_cog_output
+                    ).grid(row=3, column=2, pady=(8, 3))
+        h2 = ttk.Label(sec, text="Pfad inkl. Dateiname, z.B. ...\\2026_GUPPENFIRN_DOP_10cm_LV95.tif",
+                        font=("", 8))
+        h2.grid(row=4, column=1, sticky="w", padx=(8, 0))
+        self._dim_labels.append(h2)
+
+    def _build_cog_ausgabe(self, parent):
+        sec = ttk.LabelFrame(parent, text="Baender & Kompression", padding=10,
+                              style="Section.TLabelframe")
+        sec.pack(fill="x", pady=(0, 6))
+        sec.columnconfigure(1, weight=1)
+
+        lbl0 = ttk.Label(sec, text="Input (erstes Tile):", font=("Segoe UI", 9, "bold"))
+        lbl0.grid(row=0, column=0, sticky="w", pady=3)
+        self._cog_info_lbl = ttk.Label(sec, text="\u2013", font=("Segoe UI", 9))
+        self._cog_info_lbl.grid(row=0, column=1, columnspan=2, sticky="w", padx=(8, 0), pady=3)
+        self._accent_labels.append(self._cog_info_lbl)
+
+        lbl = ttk.Label(sec, text="Band-Ausgabe:", font=("Segoe UI", 9, "bold"))
+        lbl.grid(row=1, column=0, sticky="w", pady=3)
+        self._cog_band_var = tk.StringVar(value=BAND_KEEP)
+        self._cog_band_combo = ttk.Combobox(sec, textvariable=self._cog_band_var,
+                                             values=BAND_CHOICES, state="readonly", width=38)
+        self._cog_band_combo.grid(row=1, column=1, columnspan=2, sticky="w", padx=(8, 0), pady=3)
+        self._cog_band_hint_lbl = ttk.Label(sec, text=BAND_HINT_UNKNOWN, font=("", 8))
+        self._cog_band_hint_lbl.grid(row=2, column=1, columnspan=2, sticky="w", padx=(8, 0))
+        self._dim_labels.append(self._cog_band_hint_lbl)
+
+        lbl2 = ttk.Label(sec, text="Kompression:", font=("Segoe UI", 9, "bold"))
+        lbl2.grid(row=3, column=0, sticky="w", pady=(8, 3))
+        self._cog_compress_var = tk.StringVar(value="JPEG")
+        ttk.Combobox(sec, textvariable=self._cog_compress_var, values=COG_COMPRESSIONS,
+                     state="readonly", width=10
+                     ).grid(row=3, column=1, sticky="w", padx=(8, 0), pady=(8, 3))
+
+        q_row = ttk.Frame(sec)
+        q_row.grid(row=4, column=1, columnspan=2, sticky="w", padx=(8, 0), pady=3)
+        ttk.Label(q_row, text="JPEG-Qualitaet:", font=("Segoe UI", 9, "bold")).pack(side="left")
+        self._cog_quality_var = tk.StringVar(value="90")
+        self._cog_quality_entry = ttk.Entry(q_row, textvariable=self._cog_quality_var, width=6)
+        self._cog_quality_entry.pack(side="left", padx=(8, 8))
+        h = ttk.Label(q_row, text="% (1-100)", font=("", 8))
+        h.pack(side="left")
+        self._dim_labels.append(h)
+
+        self._cog_compress_hint_lbl = ttk.Label(sec, text="", font=("", 8))
+        self._cog_compress_hint_lbl.grid(row=5, column=1, columnspan=2, sticky="w", padx=(8, 0))
+        self._dim_labels.append(self._cog_compress_hint_lbl)
+
+        self._cog_compress_var.trace_add("write", lambda *_: self._on_cog_compress_change())
+        self._on_cog_compress_change()
+
+    def _on_cog_compress_change(self):
+        """JPEG-Qualitaet nur bei JPEG editierbar; Hinweis zur NoData-Behandlung."""
+        jpeg = self._cog_compress_var.get().upper() == "JPEG"
+        self._cog_quality_entry.config(state="normal" if jpeg else "disabled")
+        self._cog_compress_hint_lbl.config(
+            text=("Verlustbehaftet, nur 8 bit  |  NoData als interne Maske, ohne Randsaeume"
+                  if jpeg else "Verlustfrei  |  der NoData-Wert der Kacheln bleibt erhalten"))
+
+    def _build_cog_staging(self, parent):
+        sec = ttk.LabelFrame(parent, text="Staging", padding=10,
+                              style="Section.TLabelframe")
+        sec.pack(fill="x", pady=(0, 6))
+        sec.columnconfigure(1, weight=1)
+
+        lbl = ttk.Label(sec, text="Staging-Ordner:", font=("Segoe UI", 9, "bold"))
+        lbl.grid(row=0, column=0, sticky="w", pady=3)
+        self._cog_staging_var = tk.StringVar(value=DEFAULT_STAGING_DIR)
+        ttk.Entry(sec, textvariable=self._cog_staging_var
+                   ).grid(row=0, column=1, sticky="ew", padx=(8, 4), pady=3)
+        ttk.Button(sec, text="Ordner\u2026",
+                    command=lambda: self._browse_dir_into(self._cog_staging_var,
+                                                          "Staging-Ordner auswaehlen")
+                    ).grid(row=0, column=2, pady=3)
+        h = ttk.Label(sec, text="Zwischendateien (VRT, bei JPEG ein Zwischenraster)",
+                       font=("", 8))
+        h.grid(row=1, column=1, sticky="w", padx=(8, 0))
+        self._dim_labels.append(h)
+
+        self._cog_keep_staging_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(sec, text="Staging-Dateien nach Abschluss behalten (nicht loeschen)",
+                         variable=self._cog_keep_staging_var
+                         ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(8, 0))
+
+    def _browse_cog_input(self):
+        if self._browse_dir_into(self._cog_in_var, "Input-Ordner (TIFF-Tiles) auswaehlen"):
+            self._refresh_cog_info()
+
+    def _browse_cog_output(self):
+        path = filedialog.asksaveasfilename(
+            title="Output-Datei (COGTIFF) festlegen", defaultextension=".tif",
+            filetypes=[("GeoTIFF", "*.tif *.tiff"), ("Alle Dateien", "*.*")])
+        if path:
+            self._cog_out_var.set(_normalize_cog_path(path.replace("/", "\\")))
+
+    def _refresh_cog_info(self):
+        """Bandzahl, Bit-Tiefe, CRS und NoData des ersten Tiles - steuert die
+        Bandauswahl (RGB/NRG nur bei 4-Band)."""
+        src_dir = self._cog_in_var.get().strip()
+        tiles = sorted({p for pat in ("*.tif", "*.tiff")
+                        for p in _glob.glob(os.path.join(src_dir, pat))}) if src_dir else []
+        widgets = (self._cog_band_combo, self._cog_band_var, self._cog_band_hint_lbl)
+        if not tiles:
+            self._cog_info_lbl.config(text="(keine Tiles gefunden)" if src_dir else "\u2013")
+            self._apply_band_availability(None, *widgets)
+            return
+        if not self._osgeo_python or not os.path.isfile(self._osgeo_python):
+            self._cog_info_lbl.config(text="OSGeo4W Python nicht gefunden - bitte Pfad setzen")
+            return
+        self._cog_info_lbl.config(text="wird gelesen\u2026")
+
+        def ui_info(info):
+            nd = info.get("nodata")
+            nd_txt = "\u2013" if nd is None else "{:g}".format(nd)
+            self._cog_info_lbl.config(text="{} Baender  |  {}  |  {}  |  NoData {}".format(
+                info.get("bands"), _format_bitdepth(info), info.get("crs", "\u2013"), nd_txt))
+            self._apply_band_availability(info.get("bands"), *widgets)
+
+        def ui_error(msg):
+            self._cog_info_lbl.config(text="Datei-Info nicht lesbar (Details im Log)")
+            self._log(f"Datei-Info Create COGTIFF: {msg}\n")
+            self._apply_band_availability(None, *widgets)
+
+        self._fetch_file_info_async(tiles[0], ui_info, ui_error)
+
+    def _validate_cog(self) -> bool:
+        errors = []
+        if not self._osgeo_python or not os.path.isfile(self._osgeo_python):
+            errors.append("OSGeo4W Python nicht gefunden.\n"
+                          "Bitte Pfad via 'Aendern\u2026' festlegen  (z.B. C:\\OSGeo4W\\bin\\python3.exe).")
+        in_dir = self._cog_in_var.get().strip()
+        if not in_dir:
+            errors.append("Input-Ordner fehlt.")
+        elif not os.path.isdir(in_dir):
+            errors.append(f"Input-Ordner nicht gefunden:\n  {in_dir}")
+        elif not [p for pat in ("*.tif", "*.tiff") for p in _glob.glob(os.path.join(in_dir, pat))]:
+            errors.append(f"Keine .tif/.tiff Kacheln im Input-Ordner:\n  {in_dir}")
+        out = _normalize_cog_path(self._cog_out_var.get())
+        if not out:
+            errors.append("Output-Datei (COGTIFF) fehlt.")
+        elif not os.path.isabs(out):
+            errors.append("Output-Datei bitte mit vollstaendigem Pfad angeben.")
+        if self._cog_compress_var.get().upper() == "JPEG":
+            try:
+                quality = int(self._cog_quality_var.get().strip().rstrip("%"))
+                if not 1 <= quality <= 100:
+                    raise ValueError
+            except Exception:
+                errors.append("JPEG-Qualitaet ungueltig (ganze Zahl von 1 bis 100, z.B. 90).")
+        if not self._cog_staging_var.get().strip():
+            errors.append("Staging-Ordner fehlt.")
+        return self._show_errors(errors)
+
+    def _start_cog(self):
+        if self._running or not self._validate_cog():
+            return
+        out = _normalize_cog_path(self._cog_out_var.get())
+        self._cog_out_var.set(out)
+        compress = self._cog_compress_var.get().upper()
+        cfg = {
+            "action":       "create_cog",
+            "input_dir":    self._cog_in_var.get().strip(),
+            "output_path":  out,
+            "band_mode":    BAND_MODE_KEYS.get(self._cog_band_var.get(), "keep"),
+            "compress":     compress,
+            "quality":      (int(self._cog_quality_var.get().strip().rstrip("%"))
+                             if compress == "JPEG" else 90),
+            "staging_dir":  self._cog_staging_var.get().strip(),
+            "keep_staging": bool(self._cog_keep_staging_var.get()),
+        }
+        self._launch(cfg, self._start_btn_cog, "Create COGTIFF", "COG_" + Path(out).stem)
+
+    # ── Tab: Create COPC ──────────────────────────────────────────────────────
+    def _build_copc_tab(self, parent):
+        sf = self._build_scrollable(parent, "_canvas_copc", "_sf_copc")
+
+        self._build_group_header(sf, "Dateien")
+        self._build_copc_dateien(sf)
+
+        self._build_group_header(sf, "Staging & Parallelisierung")
+        self._build_copc_staging(sf)
+
+        btn_row = ttk.Frame(parent)
+        btn_row.pack(fill="x", pady=(6, 0))
+        self._start_btn_copc = ttk.Button(btn_row, text="\u25b6   COPC ERSTELLEN",
+                                           command=self._start_copc)
+        self._start_btn_copc.pack(side="right", ipadx=22, ipady=7)
+
+    def _build_copc_dateien(self, parent):
+        sec = ttk.LabelFrame(parent, text="Input & Output", padding=10,
+                              style="Section.TLabelframe")
+        sec.pack(fill="x", pady=(0, 6))
+        sec.columnconfigure(1, weight=1)
+
+        intro = ttk.Label(sec, text="Beliebige LAS/LAZ-Kacheln -> EIN COPC (Merge via untwine). Keine Punktwolken-Verarbeitung.",
+                           font=("", 8), justify="left")
+        intro.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
+        self._dim_labels.append(intro)
+
+        lbl = ttk.Label(sec, text="Input-Ordner (LAS/LAZ):", font=("Segoe UI", 9, "bold"))
+        lbl.grid(row=1, column=0, sticky="w", pady=3)
+        self._copc_in_var = tk.StringVar()
+        ttk.Entry(sec, textvariable=self._copc_in_var
+                   ).grid(row=1, column=1, sticky="ew", padx=(8, 4), pady=3)
+        ttk.Button(sec, text="Ordner\u2026",
+                    command=lambda: self._browse_dir_into(self._copc_in_var,
+                                                          "Input-Ordner (LAS/LAZ) auswaehlen")
+                    ).grid(row=1, column=2, pady=3)
+        h = ttk.Label(sec, text="Alle .las/.laz im Ordner (meist .laz), CRS von den Kacheln",
+                       font=("", 8))
+        h.grid(row=2, column=1, sticky="w", padx=(8, 0))
+        self._dim_labels.append(h)
+
+        lbl2 = ttk.Label(sec, text="Output-Datei (COPC):", font=("Segoe UI", 9, "bold"))
+        lbl2.grid(row=3, column=0, sticky="w", pady=(8, 3))
+        self._copc_out_var = tk.StringVar()
+        ttk.Entry(sec, textvariable=self._copc_out_var
+                   ).grid(row=3, column=1, sticky="ew", padx=(8, 4), pady=(8, 3))
+        ttk.Button(sec, text="Datei\u2026", command=self._browse_copc_output
+                    ).grid(row=3, column=2, pady=(8, 3))
+        h2 = ttk.Label(sec, text="Pfad inkl. Dateiname, endet auf .copc.laz (wird sonst ergaenzt)",
+                        font=("", 8))
+        h2.grid(row=4, column=1, sticky="w", padx=(8, 0))
+        self._dim_labels.append(h2)
+
+    def _build_copc_staging(self, parent):
+        sec = ttk.LabelFrame(parent, text="Staging & Parallelisierung", padding=10,
+                              style="Section.TLabelframe")
+        sec.pack(fill="x", pady=(0, 6))
+        sec.columnconfigure(1, weight=1)
+
+        lbl = ttk.Label(sec, text="Staging-Ordner:", font=("Segoe UI", 9, "bold"))
+        lbl.grid(row=0, column=0, sticky="w", pady=3)
+        self._copc_staging_var = tk.StringVar(value=DEFAULT_STAGING_DIR)
+        ttk.Entry(sec, textvariable=self._copc_staging_var
+                   ).grid(row=0, column=1, sticky="ew", padx=(8, 4), pady=3)
+        ttk.Button(sec, text="Ordner\u2026",
+                    command=lambda: self._browse_dir_into(self._copc_staging_var,
+                                                          "Staging-Ordner auswaehlen")
+                    ).grid(row=0, column=2, pady=3)
+        h = ttk.Label(sec, text="Temp-Dateien von untwine", font=("", 8))
+        h.grid(row=1, column=1, sticky="w", padx=(8, 0))
+        self._dim_labels.append(h)
+
+        lbl2 = ttk.Label(sec, text="CPU-Kerne:", font=("Segoe UI", 9, "bold"))
+        lbl2.grid(row=2, column=0, sticky="w", pady=(8, 3))
+        cpu_max = max(1, os.cpu_count() or 8)
+        self._copc_workers_var = tk.StringVar(value=str(min(6, cpu_max)))
+        tk.Spinbox(sec, from_=1, to=cpu_max, textvariable=self._copc_workers_var, width=6
+                   ).grid(row=2, column=1, sticky="w", padx=(8, 0), pady=(8, 3))
+
+        self._copc_keep_staging_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(sec, text="Staging-Dateien nach Abschluss behalten (nicht loeschen)",
+                         variable=self._copc_keep_staging_var
+                         ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 0))
+
+    def _browse_copc_output(self):
+        path = filedialog.asksaveasfilename(
+            title="Output-Datei (COPC) festlegen", defaultextension=".copc.laz",
+            filetypes=[("COPC", "*.copc.laz"), ("LAZ", "*.laz"), ("Alle Dateien", "*.*")])
+        if path:
+            self._copc_out_var.set(_normalize_copc_path(path.replace("/", "\\")))
+
+    def _validate_copc(self) -> bool:
+        errors = []
+        if not self._osgeo_python or not os.path.isfile(self._osgeo_python):
+            errors.append("OSGeo4W Python nicht gefunden.\n"
+                          "Bitte Pfad via 'Aendern\u2026' festlegen  (z.B. C:\\OSGeo4W\\bin\\python3.exe).")
+        if not self._pdal_exe or not os.path.isfile(self._pdal_exe):
+            errors.append("pdal.exe wurde nicht gefunden (prueft die Kachel-Header).\n"
+                          "Bitte pdal (Teil von OSGeo4W/QGIS) zum System-PATH hinzufuegen.")
+        if not self._untwine_exe or not os.path.isfile(self._untwine_exe):
+            errors.append("untwine.exe wurde nicht gefunden (baut das COPC).\n"
+                          "Liegt normalerweise im bin-Ordner der QGIS-Installation - diesen "
+                          "zum System-PATH hinzufuegen.")
+        in_dir = self._copc_in_var.get().strip()
+        if not in_dir:
+            errors.append("Input-Ordner fehlt.")
+        elif not os.path.isdir(in_dir):
+            errors.append(f"Input-Ordner nicht gefunden:\n  {in_dir}")
+        elif not [p for pat in ("*.las", "*.laz") for p in _glob.glob(os.path.join(in_dir, pat))]:
+            errors.append(f"Keine .las/.laz Kacheln im Input-Ordner:\n  {in_dir}")
+        out = _normalize_copc_path(self._copc_out_var.get())
+        if not out:
+            errors.append("Output-Datei (COPC) fehlt.")
+        elif not os.path.isabs(out):
+            errors.append("Output-Datei bitte mit vollstaendigem Pfad angeben.")
+        if not self._copc_staging_var.get().strip():
+            errors.append("Staging-Ordner fehlt.")
+        try:
+            if int(self._copc_workers_var.get()) < 1:
+                raise ValueError
+        except Exception:
+            errors.append("CPU-Kerne ungueltig.")
+        return self._show_errors(errors)
+
+    def _start_copc(self):
+        if self._running or not self._validate_copc():
+            return
+        out = _normalize_copc_path(self._copc_out_var.get())
+        self._copc_out_var.set(out)
+        cfg = {
+            "action":       "create_copc",
+            "input_dir":    self._copc_in_var.get().strip(),
+            "output_path":  out,
+            "untwine_exe":  self._untwine_exe,
+            "pdal_exe":     self._pdal_exe,
+            "staging_dir":  self._copc_staging_var.get().strip(),
+            "num_workers":  int(self._copc_workers_var.get()),
+            "keep_staging": bool(self._copc_keep_staging_var.get()),
+        }
+        self._launch(cfg, self._start_btn_copc, "Create COPC",
+                     "COPC_" + Path(out).name[:-len(".copc.laz")])
+
     # ── Tab: DMC - TIFFconverter ───────────────────────────────────────────────
     def _build_tiff_tab(self, parent):
         self.bind_class("TCombobox", "<MouseWheel>", self._fwd_wheel)
@@ -1412,48 +1819,79 @@ class DMCConverterApp(tk.Tk):
         self._band_hint_lbl.grid(row=4, column=1, columnspan=2, sticky="w", padx=(8, 0))
         self._dim_labels.append(self._band_hint_lbl)
 
+        self._create_cog_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(sec, text="Create COGTIFF  (QC: alle Tiles als EIN Mosaik, nur zur Kontrolle)",
+                         variable=self._create_cog_var, command=self._on_create_cog_toggle
+                         ).grid(row=5, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        self._cog_frame = ttk.Frame(sec)
+        self._cog_frame.grid(row=6, column=0, columnspan=3, sticky="w", padx=(20, 0), pady=(4, 0))
+        ttk.Label(self._cog_frame, text="JPEG-Qualitaet:", font=("Segoe UI", 9, "bold")
+                   ).pack(side="left")
+        self._cog_quality_var = tk.StringVar(value="90")
+        ttk.Entry(self._cog_frame, textvariable=self._cog_quality_var, width=6
+                   ).pack(side="left", padx=(8, 8))
+        h_cog = ttk.Label(self._cog_frame, text="% (1-100)  |  NoData als interne Maske, ohne Randsaeume",
+                           font=("", 8))
+        h_cog.pack(side="left")
+        self._dim_labels.append(h_cog)
+
         name_lbl = ttk.Label(sec, text="Ausgabe-Benennung:", font=("Segoe UI", 9, "bold"))
-        name_lbl.grid(row=5, column=0, sticky="nw", pady=(8, 3))
+        name_lbl.grid(row=7, column=0, sticky="nw", pady=(8, 3))
         self._name_preview_lbl = ttk.Label(sec, text="–", font=("Courier New", 9), justify="left")
-        self._name_preview_lbl.grid(row=5, column=1, columnspan=2, sticky="w", padx=(8, 0), pady=(8, 3))
+        self._name_preview_lbl.grid(row=7, column=1, columnspan=2, sticky="w", padx=(8, 0), pady=(8, 3))
         self._accent_labels.append(self._name_preview_lbl)
 
         for var in (self._jahr_var, self._area_var, self._gsd_var, self._band_var):
             var.trace_add("write", lambda *_: self._update_name_preview())
+        self._on_create_cog_toggle()
+
+    def _on_create_cog_toggle(self):
+        """JPEG-Qualitaet nur zeigen, wenn das QC-Mosaik gebaut wird."""
+        if self._create_cog_var.get():
+            self._cog_frame.grid()
+        else:
+            self._cog_frame.grid_remove()
         self._update_name_preview()
 
     def _update_name_preview(self):
         jahr = self._jahr_var.get().strip() or "JAHR"
         area = self._area_var.get().strip() or "AREA"
         gsd  = self._gsd_var.get().strip() or "GSD"
-        self._name_preview_lbl.config(
-            text=f"{jahr}_{area}_DOP_{gsd}_<NAME>_LV95.tif  (+ .tfw)"
-                 f"\nBaender: {BAND_PREVIEW_TEXT[self._band_mode()]}")
+        text = (f"{jahr}_{area}_DOP_{gsd}_<NAME>_LV95.tif  (+ .tfw)"
+                f"\nBaender: {BAND_PREVIEW_TEXT[self._band_mode()]}")
+        if getattr(self, "_create_cog_var", None) and self._create_cog_var.get():
+            text += f"\nQC-Mosaik (COG): cog_QC\\{jahr}_{area}_DOP_{gsd}_checkData_LV95.tif"
+        self._name_preview_lbl.config(text=text)
 
     def _band_mode(self) -> str:
         """Combobox-Beschriftung -> Runner-Schluessel ('keep' | 'rgb' | 'nrg')."""
         return BAND_MODE_KEYS.get(self._band_var.get(), "keep")
 
-    def _apply_band_availability(self, band_count) -> None:
+    def _apply_band_availability(self, band_count, combo=None, var=None, hint=None) -> None:
         """Die 3-Band-Auszuege setzen einen 4-Band-Input (RGBN) voraus. Passt der
         erkannte Input nicht dazu, wird die Auswahl gesperrt und auf '4-Band'
         zurueckgesetzt - sonst laeuft der Job erst im Runner in einen Fehler.
-        band_count=None bedeutet 'unbekannt' (keine Datei-Info gelesen)."""
+        band_count=None bedeutet 'unbekannt' (keine Datei-Info gelesen).
+        Ohne Widget-Angabe die des Tabs TIFFconverter; 'Create COGTIFF' uebergibt
+        seine eigenen."""
+        combo = combo or self._band_combo
+        var = var or self._band_var
+        hint = hint or self._band_hint_lbl
         try:
             count = int(band_count)
         except (TypeError, ValueError):
             count = None
 
         if count is None:
-            self._band_combo.config(state="readonly")
-            self._band_hint_lbl.config(text=BAND_HINT_UNKNOWN)
+            combo.config(state="readonly")
+            hint.config(text=BAND_HINT_UNKNOWN)
         elif count >= 4:
-            self._band_combo.config(state="readonly")
-            self._band_hint_lbl.config(text=BAND_HINT_4BAND)
+            combo.config(state="readonly")
+            hint.config(text=BAND_HINT_4BAND)
         else:
-            self._band_var.set(BAND_KEEP)
-            self._band_combo.config(state="disabled")
-            self._band_hint_lbl.config(text=BAND_HINT_NOT4.format(count=count))
+            var.set(BAND_KEEP)
+            combo.config(state="disabled")
+            hint.config(text=BAND_HINT_NOT4.format(count=count))
 
     def _build_dateien(self, parent):
         sec = ttk.LabelFrame(parent, text="Ordner & Shapes", padding=10,
@@ -1505,7 +1943,7 @@ class DMCConverterApp(tk.Tk):
         ttk.Button(sec, text="Datei…", command=self._browse_grid_shape
                     ).grid(row=row, column=2, pady=(8, 3))
         row += 1
-        h = ttk.Label(sec, text="Attributfeld 'NAME' liefert die Tile-Bezeichnung  |  Shape wird nach EPSG:2056 referenziert",
+        h = ttk.Label(sec, text="Feld 'NAME' = Tile-Bezeichnung  |  wird nach EPSG:2056 reprojiziert",
                        font=("", 8))
         h.grid(row=row, column=1, sticky="w", padx=(8, 0))
         self._dim_labels.append(h)
@@ -1534,7 +1972,7 @@ class DMCConverterApp(tk.Tk):
             self._accent_labels.append(val)
 
         info_hint = ttk.Label(sec,
-            text="Metadaten der ersten gefundenen Tile im Input-Ordner (stellvertretend fuer alle Tiles)",
+            text="Aus dem ersten Tile im Input-Ordner",
             font=("", 8))
         info_hint.grid(row=len(fields), column=0, columnspan=2, sticky="w", pady=(4, 0))
         self._dim_labels.append(info_hint)
@@ -1556,7 +1994,7 @@ class DMCConverterApp(tk.Tk):
                    ).grid(row=0, column=1, sticky="ew", padx=(8, 4), pady=3)
         ttk.Button(sec, text="Ordner…", command=self._browse_staging
                     ).grid(row=0, column=2, pady=3)
-        h = ttk.Label(sec, text="Zwischenraster (VRT, geclipptes Mosaik) fuer parallele Verarbeitung", font=("", 8))
+        h = ttk.Label(sec, text="Zwischenraster (VRT, geclipptes Mosaik)", font=("", 8))
         h.grid(row=1, column=1, sticky="w", padx=(8, 0))
         self._dim_labels.append(h)
 
@@ -1582,12 +2020,9 @@ class DMCConverterApp(tk.Tk):
     def _canvas_for_widget(self, widget):
         w = widget
         while w is not None:
-            if w in (getattr(self, "_canvas", None), getattr(self, "_sf", None)):
-                return getattr(self, "_canvas", None)
-            if w in (getattr(self, "_canvas_las", None), getattr(self, "_sf_las", None)):
-                return getattr(self, "_canvas_las", None)
-            if w in (getattr(self, "_canvas_ln02", None), getattr(self, "_sf_ln02", None)):
-                return getattr(self, "_canvas_ln02", None)
+            for canvas, frame in self._scroll_areas:
+                if w in (canvas, frame):
+                    return canvas
             w = w.master
         return None
 
@@ -2005,11 +2440,8 @@ class DMCConverterApp(tk.Tk):
         self.option_add("*TCombobox*Listbox.selectForeground", T["sel_fg"])
 
         self.configure(bg=T["root"])
-        self._canvas.configure(bg=T["panel"], highlightbackground=T["sep"])
-        if getattr(self, "_canvas_las", None) is not None:
-            self._canvas_las.configure(bg=T["panel"], highlightbackground=T["sep"])
-        if getattr(self, "_canvas_ln02", None) is not None:
-            self._canvas_ln02.configure(bg=T["panel"], highlightbackground=T["sep"])
+        for canvas, _frame in self._scroll_areas:
+            canvas.configure(bg=T["panel"], highlightbackground=T["sep"])
 
         self._hdr.configure(bg=T["hdr_bg"])
         self._hdr_lbl.configure(bg=T["hdr_bg"], fg=T["hdr_fg"])
@@ -2146,6 +2578,14 @@ class DMCConverterApp(tk.Tk):
         if not gsd:
             errors.append("GSD fehlt (z.B. 10cm).")
 
+        if self._create_cog_var.get():
+            try:
+                quality = int(self._cog_quality_var.get().strip().rstrip("%"))
+                if not 1 <= quality <= 100:
+                    raise ValueError
+            except Exception:
+                errors.append("JPEG-Qualitaet ungueltig (ganze Zahl von 1 bis 100, z.B. 90).")
+
         in_dir = self._in_var.get().strip()
         if not in_dir:
             errors.append("Input-Ordner fehlt.")
@@ -2206,6 +2646,9 @@ class DMCConverterApp(tk.Tk):
             "num_workers":      int(self._workers_var.get()),
             "keep_staging":     bool(self._keep_staging_var.get()),
             "band_mode":        self._band_mode(),
+            "create_cog":       bool(self._create_cog_var.get()),
+            "cog_quality":      (int(self._cog_quality_var.get().strip().rstrip("%"))
+                                 if self._create_cog_var.get() else 90),
         }
 
         self._running = True
@@ -2368,6 +2811,13 @@ class DMCConverterApp(tk.Tk):
                 "Bitte pdal (Teil von OSGeo4W/QGIS) zum System-PATH hinzufuegen."
             )
 
+        if self._ln02_create_copc_var.get() and (
+                not self._untwine_exe or not os.path.isfile(self._untwine_exe)):
+            errors.append(
+                "untwine.exe wurde nicht gefunden (wird fuer 'Create COPC' gebraucht).\n"
+                "Liegt normalerweise im bin-Ordner der QGIS-Installation - diesen zum "
+                "System-PATH hinzufuegen oder die Option abwaehlen.")
+
         jahr = self._ln02_jahr_var.get().strip()
         if not jahr or not jahr.isdigit():
             errors.append("Jahr fehlt oder ist ungueltig (numerisch erwartet, z.B. 2026).")
@@ -2439,7 +2889,8 @@ class DMCConverterApp(tk.Tk):
             "create_raster":       create_raster,
             "gsd":                 float(self._ln02_gsd_var.get().strip().replace("m", ""))
                                    if create_raster else None,
-            "create_vpc":          bool(self._ln02_create_vpc_var.get()),
+            "create_copc":         bool(self._ln02_create_copc_var.get()),
+            "untwine_exe":         self._untwine_exe,
             "input_dir":           self._ln02_in_var.get().strip(),
             "output_dir_las":      self._ln02_out_las_var.get().strip(),
             "output_dir_raster":   self._ln02_out_raster_var.get().strip() if create_raster else None,

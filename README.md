@@ -1,7 +1,7 @@
 # DMC Werkzeuge
 
 Converter-Tool für rohe DMC-Daten aus RealityStudio (True-DOP und Punktwolken, technische
-200m-Kacheln) ins swisstopo-Format „ch.spezialbefliegungen" (GDWH-STAC-ready). GUI mit vier Tabs;
+200m-Kacheln) ins swisstopo-Format „ch.spezialbefliegungen" (GDWH-STAC-ready). GUI mit sechs Tabs;
 Struktur und Styling analog zu `topo-COGTIFFconverter`.
 
 ## GUI starten
@@ -22,10 +22,12 @@ ueber die Schaltflaeche **Aendern…** manuell gesetzt werden und wird in
 
 | Tab | Input | Verarbeitung | Output |
 |---|---|---|---|
-| **DMC - TIFFconverter** | technische 200m-DOP-Kacheln (`.tif`), meist 4-Band RGBN | Mosaik → optionaler Bandauszug (RGB / NRG) → Clip auf die gültige Fläche → Zuschnitt ins 1km-Grid | 1km-DOP-Kacheln (`.tif`)<br>4-Band RGBN (Standard) oder 3-Band RGB / NRG |
-| **DMC - LASconverter [LHN95]** | technische 200m-Punktwolken (`.laz`) | Kacheln je Gitterzelle mergen → Crop auf Zelle + AOI → optional ausdünnen | 1km-Kacheln `…_LV95_LHN95.las` (LAS 1.4 / PF7, mit RGB)<br>optional DSM + Hillshade |
-| **DMC - LASconverter [LN02]** | die von GeoSuite nach LN02 reframten 1km-Kacheln | requantisieren → CRS-VLRs byte-exakt injizieren → vollständig validieren | 1km-Kacheln `…_LV95_LN02.laz` (GDWH-tauglich)<br>optional `.vpc` für QGIS, DSM + Hillshade |
+| **DMC - TIFFconverter** | technische 200m-DOP-Kacheln (`.tif`), meist 4-Band RGBN | Mosaik → optionaler Bandauszug (RGB / NRG) → Clip auf die gültige Fläche → Zuschnitt ins 1km-Grid | 1km-DOP-Kacheln (`.tif`)<br>4-Band RGBN (Standard) oder 3-Band RGB / NRG<br>optional QC-Mosaik der AOI (COG) |
+| **DMC - LASconverter [LHN95]** | technische 200m-Punktwolken (`.laz`) | Kacheln je Gitterzelle mergen → Crop auf Zelle + AOI → optional ausdünnen | 1km-Kacheln `…_LV95_LHN95.las` (LAS 1.4 / PF7, mit RGB; `.laz` wählbar)<br>optional DSM + Hillshade |
+| **DMC - LASconverter [LN02]** | die von GeoSuite nach LN02 reframten 1km-Kacheln (`.laz` oder `.las`) | requantisieren → CRS-VLRs byte-exakt injizieren → vollständig validieren | 1km-Kacheln `…_LV95_LN02.laz` (GDWH-tauglich)<br>optional QC-COPC der AOI, DSM + Hillshade |
 | **Create DSM-Raster** | beliebiger Ordner mit `.las`/`.laz` | zellweise IDW-Rasterung → mosaikieren → Löcher füllen → AOI-Maske → Hillshade | ein DSM + ein Hillshade (`.tif` + `.tfw`) |
+| **Create COGTIFF** | beliebiger Ordner mit `.tif`-Kacheln (+ `.tfw`) | VRT-Mosaik → optionaler Bandauszug (RGB / NRG) → COG → Prüfung | ein COGTIFF (Name frei wählbar) |
+| **Create COPC** | beliebiger Ordner mit `.las`/`.laz`-Kacheln | Merge via untwine → Prüfung | ein COPC `….copc.laz` (Name frei wählbar) |
 
 ### Reihenfolge bei den Punktwolken
 
@@ -36,7 +38,7 @@ dieses Tools:
 technische 200m-LAZ  (RealityStudio)
       │
       ▼   Tab [LHN95]        AOI-Crop · Thinning · 1km-Grid
-…_LV95_LHN95.las             LAS 1.4 / PF7, mit RGB
+…_LV95_LHN95.las             LAS 1.4 / PF7, mit RGB  (`.laz` wählbar)
       │
       ▼   GeoSuite / REFRAME     ←  ausserhalb dieses Tools, transformiert NUR die Höhe
 …_LV95_LN02.las
@@ -47,6 +49,8 @@ technische 200m-LAZ  (RealityStudio)
 
 Das DOP läuft unabhängig davon über den **TIFFconverter**. **Create DSM-Raster** ist ein Zusatz,
 den man auf jeden fertigen Kachelordner ansetzen kann — unabhängig von den anderen Tabs.
+Dasselbe gilt für **Create COGTIFF** und **Create COPC**: sie machen aus einem beliebigen
+Kachelordner genau ein Produkt, ohne die Converter-Funktionen.
 
 ### Was die Tabs bewusst NICHT tun
 
@@ -112,35 +116,41 @@ gültige Fläche ausgeschnitten und das Ergebnis parallelisiert ins 1km-Grid zer
      nebeneinander ablegen will, braucht getrennte Output-Ordner (oder einen abweichenden
      AREA-Namen).
 
-3. **Input-Ordner**: Ordner mit den technischen 200m x 200m-Kacheln (`.tif` + `.tfw`).
+3. **Create COGTIFF** (Checkbox unter der Band-Auswahl) + **JPEG-Qualität** (Default 90 %):
+   baut nach dem Zuschnitt zusätzlich **ein** Mosaik aller Kacheln der AOI als COG —
+   `cog_QC\<JAHR>_<AREA>_DOP_<GSD>_checkData_LV95.tif`. Nur zur Sichtkontrolle, siehe
+   „QC-Mosaik" unten.
+
+4. **Input-Ordner**: Ordner mit den technischen 200m x 200m-Kacheln (`.tif` + `.tfw`).
    Enthaelt der Ordner bereits ein Mosaik-VRT (z.B. `True_Ortho.vrt`), wird dieses direkt
    uebernommen — sonst wird automatisch ein frisches VRT aus allen gefundenen `.tif`-Kacheln
    gebaut (`gdalbuildvrt`-Aequivalent).
 
-4. **Clip-Shape (gueltige Flaeche)**: Polygon-Shape, das die manuell erfasste gueltige Flaeche
+5. **Clip-Shape (gueltige Flaeche)**: Polygon-Shape, das die manuell erfasste gueltige Flaeche
    des Orthophotos beschreibt. Alles ausserhalb wird per Cutline-Clip (`gdal.Warp`) zu
    NoData — die Quellkacheln tragen bereits NoData=0 je Band, der Clip verwendet denselben Wert.
 
-5. **Grid-Shape (1km x 1km)**: Shapefile mit Attributfeld `NAME`, liefert Geometrie und
+6. **Grid-Shape (1km x 1km)**: Shapefile mit Attributfeld `NAME`, liefert Geometrie und
    Benennung der Ausgabekacheln. Standardmaessig vorausgefuellt mit dem mitgelieferten
    `swissGRID_1km2_shp/chGRID_1km2.shp`. Wird bei Bedarf automatisch nach EPSG:2056
    reprojiziert.
 
-6. **Staging & Parallelisierung**: Zwischenergebnisse (VRT, Band-VRT, geclipptes Mosaik) werden in einem
+7. **Staging & Parallelisierung**: Zwischenergebnisse (VRT, Band-VRT, geclipptes Mosaik) werden in einem
    Staging-Ordner abgelegt (Standard `Y:\02_DMC_tempProcessingFolder`), damit mehrere Kerne
    parallel auf dieselbe geclippte Rasterquelle zugreifen koennen. **CPU-Kerne** steuert die
    Anzahl paralleler Prozesse fuer den Grid-Zuschnitt (Standard: 6). Nach erfolgreichem Lauf
    wird der projektspezifische Staging-Unterordner automatisch geloescht, sofern nicht
    **"Staging-Dateien behalten"** aktiviert ist.
 
-7. **Ausgabe-Format** (kein GUI-Feld, automatisch): klassisches TIFF (kein COG) +
+8. **Ausgabe-Format** (kein GUI-Feld, automatisch): klassisches TIFF (kein COG — das optionale
+   QC-Mosaik siehe Punkt 3) +
    `.tfw`-Weltdatei je Ausgabekachel, Blockgroesse fix 256, NoData fix 0 (alle Baender
    gleichermassen). Die Kompression wird von der ersten gefundenen Input-Kachel automatisch
    uebernommen (LZW/DEFLATE/ZSTD/unkomprimiert) — nie verlustbehaftet: liegt eine Input-Kachel
    ausnahmsweise JPEG-komprimiert vor, weicht die Ausgabe auf LZW aus, damit sie nie schlechter
    als der Input wird.
 
-8. **DMC TIFF KONVERTIEREN** starten.
+9. **DMC TIFF KONVERTIEREN** starten.
 
 Vor dem Cutline-Clip prueft das Tool, ob der Pixelursprung des Mosaiks exakt auf ein Vielfaches
 der Pixelgroesse faellt (sauberes Pixelraster, z.B. bei 10cm GSD auf `.0/.1/.2/…`-Koordinaten).
@@ -151,6 +161,30 @@ Grid-Zuschnitt behalten das Quell-Pixelraster explizit bei (kein implizites Resa
 Kacheln, die nach dem Zuschnitt zu 100% aus einem konstanten Wert bestehen (reines NoData,
 z.B. ausserhalb der gueltigen Flaeche oder ausserhalb des Befliegungsgebiets), werden
 automatisch geloescht (`.tif` + `.tfw`).
+
+### QC-Mosaik (Create COGTIFF) — nur zur Kontrolle
+
+Bei aktivierter Option entsteht nach dem Zuschnitt
+`cog_QC\<JAHR>_<AREA>_DOP_<GSD>_checkData_LV95.tif`: **ein** Mosaik aller Kacheln der AOI als
+Cloud Optimized GeoTIFF, zum schnellen Durchsehen in QGIS. Es ist kein Lieferprodukt —
+`checkData` im Namen, eigener Unterordner; die offizielle COG-Ableitung macht später das GDWH
+selbst aus den verlustfreien Kacheln.
+
+| | gesetzt | warum |
+|---|---|---|
+| Kompression | JPEG, Qualität aus dem GUI (Default 90 %), auch für die Overviews | klein genug zum Durchsehen; die Kacheln selbst bleiben verlustfrei |
+| Overviews | `AUTO`, Resampling `AVERAGE` | ruhige Übersichten beim Herauszoomen |
+| Blockgrösse | 256 | wie das Mosaik in `topo-COGTIFFconverter` |
+| NoData | **interne Maske** statt NoData-Wert | JPEG verändert die 0-Werte am Rand, ein NoData-Wert gäbe schwarze Säume; die 1-bit-Maske bleibt verlustfrei |
+| Band 4 (NIR) | als „undefiniert" deklariert | ein als Alpha markiertes Band 4 würde der COG-Treiber bei JPEG in eine Maske umwandeln (NIR weg), und QGIS zeigte das Bild halbtransparent |
+
+Die Maske entsteht zweistufig und blockweise wie in `topo-COGTIFFconverter`: VRT über die fertigen
+Kacheln → Zwischenraster (LZW) im Staging → Maske (ungültig nur, wenn **alle** Bänder den
+NoData-Wert tragen — eine dunkle Stelle mit 0 in nur einem Band bleibt sichtbar) → COG. So bleibt
+der Speicherbedarf auch bei grossen AOIs klein. Vor dem Ablegen wird das Ergebnis geprüft
+(COG-Layout, JPEG, Bandzahl, interne Maske, kein Alpha-Band); ein alter Stand wird vorher
+entfernt. Die Eingabe ist 8 bit (neue Kamera), JPEG passt also. Scheitert der Bau, gibt es eine
+Warnung im Log, der Lauf bleibt erfolgreich.
 
 ---
 
@@ -179,10 +213,15 @@ automatisch erkannt (PATH, OSGeo4W-/QGIS-Installationspfade), kein eigenes GUI-F
 2. **Input-Ordner**: Ordner mit den technischen 200m x 200m-LAZ-Kacheln.
 
 3. **Output-Ordner (Punktwolken-Kacheln)** + **Ausgabeformat** (Dropdown `las`/`laz`, Default
-   `las`): Ziel fuer die 1km-Grid-Kacheln. Default `las`, da die Weiterverarbeitung (Reframe
-   LHN95→LN02) via GeoSuite unkomprimiertes LAS erwartet. Geschrieben wird **LAS 1.4 / Point
-   Data Record Format 7** (PF6 + RGB) mit CRS-Tag `EPSG:2056` — siehe „GeoSuite-Kompatibilitaet"
-   unten.
+   `las`): Ziel fuer die 1km-Grid-Kacheln. Diese Kacheln sind die Eingabe fuer den
+   GeoSuite/REFRAME-Batch, der Default ist deshalb auf GeoSuite ausgerichtet: unkomprimiertes
+   LAS ist dort der Weg mit den wenigsten Komponenten (kein LASzip dazwischen). Seit dem Update
+   liest REFRAME LAS 1.4 PF6/PF7 auch als `laz` — die Punktdaten sind identisch (LASzip ist
+   verlustfrei), die Zwischenstufe braucht dann nur rund ein Fuenftel des Platzes. `laz` lohnt
+   sich, wenn Speicherplatz oder eine langsame Netzverbindung zum Reframe-Batch der Engpass ist;
+   rechnerisch schneller ist es nicht (Kompression und Dekompression kosten CPU). Geschrieben
+   wird in beiden Faellen **LAS 1.4 / Point Data Record Format 7** (PF6 + RGB) mit CRS-Tag
+   `EPSG:2056` — siehe „GeoSuite-Kompatibilitaet" unten.
 
 4. **Output-Ordner (DSM-Raster)**: nur sichtbar, wenn "Create DSM-Raster from LAZ" aktiv ist.
    Ziel fuer das eine DSM-TIFF+TFW und das Hillshade-TIFF+TFW der AOI (beide im selben Ordner).
@@ -235,7 +274,7 @@ als `.las` oder `.laz` geschrieben wird, entscheidet sich rein an der Dateiendun
   in den Merge ein.
 - **Kein Reframe im Tool**: Hoehe bleibt LHN95. swisstopo selbst beschreibt die Transformation
   LHN95→LN02 als Naeherung ohne exakte Loesung (cm–dm-Genauigkeit, gebietsabhaengig) — dafuer
-  wird bewusst die amtliche GeoSuite/REFRAME-Software separat verwendet (`.las`-Output).
+  wird bewusst die amtliche GeoSuite/REFRAME-Software separat verwendet.
 - **`scale_x/y/z = 0.01`** fix in den Output-Kacheln gesetzt (Schweizer Konvention, keine
   uebertriebene Nachkommastellen-Praezision).
 - **Ausgabeformat der Zwischenausgabe**: die Tiles sind die Eingabe fuer den
@@ -250,6 +289,12 @@ als `.las` oder `.laz` geschrieben wird, entscheidet sich rein an der Dateiendun
   | `global_encoding` | 17 bzw. 16 — Bit 4 (WKT) immer, Bit 0 (GPS-Time-Typ) aus der Quelle |
   | `scale` / `offset` | 0.01 / Kachelursprung (aus dem Dateinamen geparst) |
   | CRS im Header | `EPSG:2056` — nur horizontal, kein Vertikal-Key |
+  | `compression` | **`laszip`** bei Ausgabeformat `laz`, nicht gesetzt bei `las` |
+
+  Auch die Kompression wird explizit gesetzt und nicht PDALs Endungs-Heuristik ueberlassen —
+  sonst haengt an einer undokumentierten Writer-Entscheidung, ob bei `laz` wirklich LASzip
+  herauskommt oder ein unkomprimiertes LAS mit `.laz`-Endung, das REFRAME als defekt ablehnt.
+  Der Tab [LN02] macht es an derselben Stelle genauso.
 
   **PF7 traegt die Farbe durch die ganze Kette.** Die DMC-Quelldaten aus Reality Studio sind PF2
   (RGB vorhanden, `GpsTime` nicht); PF7 ist PF6 + RGB und behaelt die Farbwerte, GeoSuite/REFRAME
@@ -275,6 +320,11 @@ als `.las` oder `.laz` geschrieben wird, entscheidet sich rein an der Dateiendun
   > und die Farbe wurde ueber einen zweiten, farbfuehrenden „PF7-Master" plus Index-Join im Tab
   > [LN02] gerettet. Mit dem Update ist dieser Umweg hinfaellig; Master und Join wurden ersatzlos
   > entfernt.
+  >
+  > **LAZ (Stand 10.09.2026):** Die neue GeoSuite-Version in der Firmenumgebung transformiert
+  > LAS 1.4 PF6/PF7 auch komprimiert (LHN95→LN02). Default der Zwischenausgabe bleibt bewusst
+  > `las`: die Daten sind identisch, `las` ist in GeoSuite aber der Weg mit den wenigsten
+  > Komponenten. `laz` ist waehlbar, wenn Platz der Engpass ist.
 
   **GPS-Time-Typ:** `global_encoding` Bit 0 sagt, wie die `GpsTime`-Werte zu lesen sind
   (0 = GPS Week Time, 1 = Adjusted Standard GPS Time). Das ist eine Eigenschaft der Daten, keine
@@ -300,7 +350,7 @@ als `.las` oder `.laz` geschrieben wird, entscheidet sich rein an der Dateiendun
 
 ## Details: LASconverter [LN02]
 
-Der nachgelagerte Schritt zum Tab **[LHN95]**. Dessen `.las`-Kacheln werden extern mit
+Der nachgelagerte Schritt zum Tab **[LHN95]**. Dessen `.laz`- bzw. `.las`-Kacheln werden extern mit
 **GeoSuite/REFRAME** von LHN95 nach LN02 reframt (nur die Höhe, X/Y bleiben LV95); dieser Tab
 bringt das Ergebnis anschliessend in die GDWH-taugliche Form — strukturell kongruent zu
 swissSURFACE3D bzw. `SB_DSM_PUNKTWOLKE` (Projekt `topo-importDATAtoGDWH-STAC`).
@@ -331,8 +381,8 @@ Raster-Maskierung gebraucht und ist nur sichtbar, wenn die Raster-Option aktiv i
    GDWH-Auslieferungsformat analog `SB_DSM_PUNKTWOLKE`). Muss ein anderer Ordner als der Input
    sein; die Quelldateien werden nie verändert.
 
-4. **Create Virtual Point Cloud (VPC)**: legt `_vpc\\<JAHR>_<AREA>_LV95_LN02.vpc` im
-   Output-Ordner an — siehe „Virtual Point Cloud" unten. Unabhängig von der Raster-Option.
+4. **Create COPC**: legt `copc_QC\<JAHR>_<AREA>_checkData_LV95_LN02.copc.laz` im Output-Ordner
+   an — siehe „QC-COPC" unten. Unabhängig von der Raster-Option.
 
 5. **Output-Ordner (DSM-Raster)** und **Footprint / AOI-Shape**: nur sichtbar bei aktivierter
    Raster-Option. DSM und Hillshade landen als je ein Gesamtbild (`.tif` + `.tfw`) im selben
@@ -401,41 +451,34 @@ wenn eine angeforderte Dimension nicht existiert.
 > **still auf PF6 zurückdrehen** — die Farbe wäre dann doch wieder weg. Dort braucht es ein
 > zweites Zielprofil, sonst endet die Kette wieder farblos.
 
-### Virtual Point Cloud (VPC) — alle Kacheln als eine Ebene in QGIS
+### QC-COPC — die ganze AOI als eine Punktwolke (nur zur Kontrolle)
 
-Bei aktivierter Option entsteht `_vpc\\<JAHR>_<AREA>_LV95_LN02.vpc`: eine JSON-Datei
-(STAC-FeatureCollection), die alle fertigen Kacheln zu **einer** Punktwolken-Ebene zusammenfasst
-— das Punktwolken-Gegenstück zum Raster-VRT. Es wird **nichts kopiert und nichts umgerechnet**;
-die Datei verweist mit **relativen Pfaden** (`../<kachel>.laz`) auf die Kacheln daneben, der
-Ordner lässt sich also verschieben oder kopieren, ohne dass sie bricht.
+Bei aktivierter Option **Create COPC** entsteht nach der Konversion
+`copc_QC\<JAHR>_<AREA>_checkData_LV95_LN02.copc.laz`: **eine** COPC-Datei (Cloud Optimized
+Point Cloud) mit allen Kacheln der AOI. Sie dient ausschliesslich der Sichtkontrolle — daher
+`checkData` im Namen und der eigene Unterordner. Geliefert werden weiterhin die Kacheln.
 
-Gelesen wird sie von **QGIS ab 3.32**. **ArcGIS Pro liest kein VPC** — dafür bräuchte es ein
-LAS-Dataset (`.lasd`), das ausschliesslich `arcpy` erzeugen kann; im OSGeo4W-Python des Runners
-gibt es kein arcpy, deshalb ist dieser Weg bewusst nicht umgesetzt.
+- **Warum COPC statt der früheren VPC:** Eine Virtual Point Cloud ohne Übersicht zeigt QGIS
+  herausgezoomt nur als Kachel-Umrisse, Punkte erst beim Hineinzoomen (QGIS-Handbuch,
+  *Virtual Point Clouds*: Anzeige-Modi „Show Extents Only" / „Show Overview Only"). Ein COPC
+  trägt seine Übersichtsstufen selbst (Octree) — QGIS zeigt auf jeder Zoomstufe Punkte.
+- **Aus den fertigen Kacheln:** Eingelesen werden die Kacheln der AOI im Output-Ordner
+  (`<JAHR>_<AREA>_TIN_*_LV95_LN02.<ext>`), also genau das Gelieferte.
+- **Mit untwine statt PDAL:** `untwine` (Hobu, liegt QGIS bei) arbeitet mit Temp-Dateien, statt
+  alles im Arbeitsspeicher zu halten; ein Gesamt-Merge in einem einzigen `pdal.exe`-Prozess ist
+  bei grossen Projekten schon abgestürzt (`0xC0000409`, siehe Voraussetzungen). Die Kacheln
+  gehen **einzeln** an untwine (je `-i`, als Dateiname relativ zum Kachelordner) — ein Ordner
+  als Input würde alles einlesen, was dort sonst noch liegt. Das CRS wird explizit gesetzt
+  (`--a_srs EPSG:2056+5728`), die Temp-Dateien landen im Staging-Ordner.
+- **Geprüft, bevor es abgelegt wird:** Punktanzahl = Summe der Kachel-Header, CRS =
+  EPSG:2056+5728. Erst dann wird die Datei an ihren Platz geschoben. Ein alter Stand wird vorher
+  entfernt, damit nie eine veraltete Kontrolle liegen bleibt.
+- **Scheitert der Bau,** gibt es eine Warnung im Log, der Lauf bleibt erfolgreich — die Kacheln
+  sind das Produkt.
 
-Die Kachel-Fakten (Punktanzahl, 3D-BBox) werden **aus den Headern der fertigen Ausgabedateien**
-gelesen — parallel und ohne die Punktdaten anzufassen, bei `.laz` also ohne Dekompression. Damit
-beschreibt die VPC nachweislich das, was im Ordner liegt, statt das, was der Lauf zu schreiben
-glaubte; unverändert kopierte Kacheln sind ebenso erfasst wie konvertierte.
-
-Das Format ist an einer mit `pdal_wrench build_vpc` erzeugten Referenz nachgemessen und gegen den
-QGIS-Provider (3.44) gegengelesen. Zwei Dinge sind dabei nicht verhandelbar:
-
-| Feld | warum |
-|---|---|
-| `proj:wkt2` | Fehlt es, lehnt QGIS die Datei ab (`isValid() == False`). |
-| `geometry` / `bbox` in **WGS84** | STAC-Konvention. Mit LV95-Werten darin lädt QGIS die Ebene **ohne Fehlermeldung**, liefert aber einen unendlichen Extent — man sieht nichts und nichts weist darauf hin. Die Landeskoordinaten gehören nach `proj:bbox`. |
-
-`pc:schemas`, `stac_extensions` und `proj:geometry` sind dagegen optional (geprüft) und bleiben
-weg — die Dimensionsliste stünde sonst für jede Kachel identisch in der Datei.
-
-Zwei Details am Rand: `proj:wkt2` trägt bewusst **nur** das horizontale `EPSG:2056` — die VPC ist
-eine Kartenebene, der Höhenbezug (LN02) steckt in den CRS-VLRs der Kacheln selbst. Und
-`pc:type` ist `eopc` (*electro-optical point cloud*), nicht `lidar`: die DMC-Wolken sind
-photogrammetrisch abgeleitet.
-
-Die VPC ist ein **Ansichtsprodukt neben der Lieferung**. Schlägt ihr Schreiben fehl, gibt es eine
-Warnung im Log, aber der Lauf bleibt erfolgreich — die Kacheln sind das Produkt.
+Die byte-exakten CRS-VLRs der Kacheln trägt das COPC bewusst nicht: COPC schreibt einen eigenen
+Info-VLR an erster Stelle vor, das CRS setzt untwine selbst. Für die Sichtkontrolle genügt das —
+als Lieferprodukt wäre das COPC so nicht GDWH-konform.
 
 ### Warum die CRS-Tags byte-exakt injiziert werden
 
@@ -494,7 +537,22 @@ für `pdal info --metadata` lesbar, aber jeder echte Dekompressions-Durchlauf br
   Referenz-VLRs. Grund: seit auch die Zwischenstufe LAS 1.4/PF7 ist, unterscheidet sich eine
   GeoSuite-Ausgabe vom fertigen Produkt nur noch an `scale`/`offset` und den CRS-Tags — ohne
   diese beiden Kontrollen könnte eine reframte Kachel mit GeoSuites CRS-Tags durchgereicht
-  werden statt mit den autoritativen.
+  werden statt mit den autoritativen. Geprüft wird die Abkürzung nur bei gleicher Endung von
+  Quelle und Ziel: im Default (`.las` aus GeoSuite, `.laz` hinaus) greift sie nie, bei
+  `.laz`-Input (seit dem GeoSuite-Update möglich) wird sie pro Kachel geprüft. Am Ergebnis
+  ändert das nichts — eine GeoSuite-Ausgabe trägt die byte-exakten Referenz-VLRs nie und wird
+  immer konvertiert. Greifen kann die Abkürzung nur bei einem erneuten Lauf über bereits
+  fertige Kacheln.
+
+- **Der Container spielt keine Rolle für den Aufwand**: `.laz`-Input erspart dem Tab [LN02]
+  keinen Arbeitsschritt. Es gibt hier kein separates „LAS→LAZ umrechnen“, das man überspringen
+  könnte — die Kompression ist eine Option des einen `writers.las`-Durchlaufs, der ohnehin
+  laufen muss (Requantisierung auf `scale` 0.01 / Offset = Kachelursprung, PF7,
+  `global_encoding` 17, autoritative CRS-VLRs). Diesen Durchlauf zu überspringen hiesse,
+  GeoSuites `scale`/`offset` und CRS-Tags auszuliefern — also gerade nicht GDWH-konform. Was
+  `.laz` bringt, liegt ausschliesslich beim Platz- und Netzwerkbedarf der Zwischenstufe; die
+  Laufzeit im Tab [LN02] steigt sogar minimal, weil die Quelle beim Lesen dekomprimiert werden
+  muss.
 - **GPS-Time-Typ**: Das Zielformat verlangt `global_encoding` 17, also Bit 0 gesetzt
   (Adjusted Standard GPS Time). Ob das gegenueber der Quelle eine Aussage veraendert, wird an den
   DATEN gemessen statt pauschal gewarnt: die `filters.stats`-Stage misst `GpsTime` im ohnehin
@@ -576,6 +634,59 @@ Mosaik, Löcherfüllung (klein interpoliert, gross bleibt NoData), AOI-Maskierun
 laufen anschliessend über dieselbe Funktion wie in den anderen Tabs — inklusive der dortigen
 Kontrollen (Pixelraster-Check, NoData-Kontrolle, Deckungsgleichheit DSM/Hillshade).
 
+## Details: Create COGTIFF
+
+Macht aus einem **beliebigen** Ordner mit TIFF-Kacheln (`.tif`/`.tiff`, meist mit `.tfw`) **ein**
+Cloud Optimized GeoTIFF — ohne Converter-Funktionen: kein Clip, kein Grid-Zuschnitt, keine
+Umbenennung. Technisch dieselbe Funktion wie das QC-Mosaik im TIFFconverter, nur mit wählbaren
+Einstellungen.
+
+1. **Input-Ordner**: alle `.tif`/`.tiff` darin werden mosaikiert. Beim Wählen liest das GUI das
+   erste Tile (Bandzahl, Bit-Tiefe, CRS, NoData) und sperrt die Bandauswahl bei weniger als 4
+   Bändern.
+2. **Output-Datei**: vollständiger Pfad inklusive Dateiname; fehlt die Endung, wird `.tif`
+   ergänzt. Liegt die Datei im Input-Ordner, geht ein alter Stand nicht ins neue Mosaik ein.
+3. **Band-Ausgabe**: RGBN (unverändert), RGB (1,2,3) oder NRG (4,1,2) — wie im TIFFconverter.
+4. **Kompression**: JPEG (Default, Qualität 90 %, änderbar), DEFLATE, LZW, ZSTD oder NONE — die
+   Auswahl aus dem Mosaik-Tab von `topo-COGTIFFconverter`.
+   - **JPEG**: nur 8 bit (sonst Abbruch mit klarer Meldung). NoData wird zur **internen Maske**
+     (ungültig nur, wenn alle Bänder den NoData-Wert tragen), damit keine schwarzen Säume
+     entstehen.
+   - **DEFLATE / LZW / ZSTD**: verlustfrei mit `PREDICTOR=2`; der NoData-Wert der Kacheln bleibt
+     als NoData-Wert erhalten.
+5. **Staging-Ordner**: für das VRT und — bei JPEG — das Zwischenraster der Maske.
+
+**CRS**: von den Kacheln übernommen. Tragen sie verschiedene CRS, bricht der Lauf ab. Trägt keine
+eines (reine `.tif` + `.tfw` — die Weltdatei kennt kein CRS), wird EPSG:2056 gesetzt, mit Warnung
+im Log.
+
+**Das VRT braucht es danach nicht mehr.** Es ist nur das Rezept für das Mosaik (welche Kachel wo
+liegt); das COG enthält alle Pixel und die Overviews selbst. Das VRT liegt deshalb im Staging und
+wird nach dem Lauf gelöscht.
+
+Profil und Prüfung wie beim QC-Mosaik: Overviews `AUTO` / `AVERAGE`, Blockgrösse 256, Band 4 als
+„undefiniert" (nie Alpha). Die Temp-Datei kommt erst nach bestandener Prüfung (COG-Layout,
+Kompression, Bandzahl, ggf. Maske, kein Alpha-Band) an ihren Platz.
+
+## Details: Create COPC
+
+Macht aus einem **beliebigen** Ordner mit LAS/LAZ-Kacheln (meist `.laz`) **ein** COPC — ohne
+Punktwolken-Verarbeitung, nur der Merge via `untwine`. Technisch dieselbe Funktion wie das QC-COPC
+im Tab [LN02].
+
+1. **Input-Ordner**: alle `.las`/`.laz` darin. Liegen dort schon `.copc.laz`, werden sie
+   mitgemerged (Warnung im Log); die Ausgabedatei selbst ist immer ausgenommen.
+2. **Output-Datei**: vollständiger Pfad inklusive Dateiname, muss auf `.copc.laz` enden — `.laz`
+   wird zu `.copc.laz`, sonst wird ergänzt.
+3. **Staging & CPU-Kerne**: Temp-Dateien und Threads von untwine, parallele Header-Prüfung.
+
+**CRS**: von den Kacheln übernommen — horizontal und, falls getaggt, vertikal (z.B.
+`EPSG:2056+5728` für Kacheln aus Tab [LN02], `EPSG:2056` für die aus Tab [LHN95]) — und untwine
+explizit mitgegeben. Verschiedene CRS → Abbruch; keine Kachel mit CRS → EPSG:2056 mit Warnung.
+
+**Geprüft**, bevor die Datei abgelegt wird: Punktanzahl = Summe der Kachel-Header, CRS wie
+übernommen. Braucht `untwine.exe` und `pdal.exe` (siehe Voraussetzungen).
+
 ## Architektur
 
 ```
@@ -589,6 +700,7 @@ process_scripts/_osgeo_runner.py   (OSGeo4W Python, GDAL/OGR)
         │  1b) optionaler Bandauszug RGBN -> RGB / NRG als VRT (band_mode)
         │  2) Cutline-Clip auf gueltige Flaeche  -> Staging
         │  3) Grid-Zuschnitt, parallelisiert (ProcessPoolExecutor)
+        │  4) optional QC-Mosaik (COG) aus den fertigen Kacheln
         │
     Aktion "process_las"  (Tab "DMC - LASconverter [LHN95]"):
         │  1) Metadaten-Scan aller Kacheln, parallel (ProcessPoolExecutor)
@@ -601,7 +713,7 @@ process_scripts/_osgeo_runner.py   (OSGeo4W Python, GDAL/OGR)
         │     ersten Schreibzugriff), Metadaten-Scan parallel
         │  2) Job-Pool: je Kachel Requantisierung auf LAS 1.4/PF7 + VLR-Byte-
         │     Injektion + Validierung (+ optional DSM-Zelle), Retry seriell
-        │  2b) optional .vpc aus den Headern der fertigen Kacheln (QGIS)
+        │  2b) optional QC-COPC der AOI aus den fertigen Kacheln (untwine)
         │  3) Zell-Raster mosaikieren (VRT) -> Cutline-Clip -> Hillshade
         │
         │
@@ -610,6 +722,13 @@ process_scripts/_osgeo_runner.py   (OSGeo4W Python, GDAL/OGR)
         │  2) 1km-Arbeitszellen aus dem Extent, auf die Daten beschnitten
         │  3) Zellen parallel rastern (IDW), Retry seriell
         │  4) mosaikieren (VRT) -> Loecher fuellen -> Cutline-Clip -> Hillshade
+        │
+    Aktion "create_cog"   (Tab "Create COGTIFF"):
+        │  VRT ueber die Kacheln -> optional Bandauszug -> COG (bei JPEG + NoData:
+        │  Zwischenraster + interne Maske) -> Pruefung
+        │
+    Aktion "create_copc"  (Tab "Create COPC"):
+        │  Kachel-Header parallel (Punkte, CRS) -> untwine -> Pruefung
         │
         │  stdout → live ins GUI-Log + Logdatei
         ▼
@@ -635,6 +754,9 @@ JSON-Pipelines — orchestriert vom selben OSGeo4W-Python-Prozess.
   (wird automatisch erkannt, kein eigenes GUI-Feld). Entwickelt gegen PDAL 2.8 — beim ersten
   Lauf lohnt sich ein Blick ins Log auf die "Pixelraster-Check"-Zeile beim Raster-Build
   (prueft, ob `writers.gdal` die angeforderten `bounds` in dieser PDAL-Version unterstuetzt).
+- **COPC (QC-Option im Tab [LN02], Tab „Create COPC"):** `untwine.exe` (Hobu) — liegt normalerweise im
+  `bin`-Ordner der QGIS-Installation und wird wie `pdal.exe` automatisch gesucht (PATH,
+  OSGeo4W, QGIS-Installationen). Fehlt es, meldet das GUI das vor dem Start.
 - **Arbeitsspeicher:** `filters.merge`/`filters.sample` halten die Punkte im RAM. Deshalb wird
   bewusst zellweise gerechnet statt einmal ueber das ganze Projekt — ein Gesamt-Merge ueber
   >1000 Input-Kacheln laesst `pdal.exe` hart abstuerzen (Windows-Exitcode `3221226505` =
@@ -660,4 +782,5 @@ als Höhenbezug — er taggt die extern reframten Kacheln, transformiert aber se
 python -m pytest -q
 ```
 
-Leichtgewichtige Import-/Sanity-Checks (keine GDAL-Operationen, laufen auch ohne OSGeo4W).
+Leichtgewichtige Import-/Sanity-Checks; die wenigen Tests mit echten GDAL-Operationen werden
+ohne OSGeo4W übersprungen.

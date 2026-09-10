@@ -137,32 +137,26 @@ LN02_BBOX_TOLERANCE_M = 0.01   # zulaessige BBox-Abweichung Quelle vs. Ziel nach
 # byte-exakten Referenz-VLRs (siehe _inject_reference_vlrs).
 LAS_LN02_SRS = "EPSG:2056+5728"
 
-# ─── Virtual Point Cloud (VPC) fuer QGIS ───────────────────────────────────────
-# Eine .vpc ist das Punktwolken-Gegenstueck zum Raster-VRT: eine JSON-Datei (STAC-
-# FeatureCollection), die alle Kacheln zu EINER Ebene zusammenfasst. QGIS liest das
-# ab 3.32 nativ. Reines Ansichtsprodukt - es wird nichts kopiert und nichts
-# umgerechnet, die Datei verweist nur relativ auf die Kacheln daneben.
-#
-# ArcGIS Pro liest KEIN VPC. Dafuer braucht es ein LAS-Dataset (.lasd), das nur
-# arcpy erzeugen kann - hier bewusst nicht umgesetzt (kein arcpy im OSGeo4W-Python).
-#
-# Das Format ist an einer mit 'pdal_wrench build_vpc' erzeugten Referenz-VPC
-# nachgemessen und gegen den QGIS-Provider gegengelesen (QGIS 3.44). Dabei gilt:
-#   - 'proj:wkt2' MUSS gesetzt sein, sonst lehnt QGIS die Datei ab.
-#   - 'geometry'/'bbox' sind WGS84 (STAC-Konvention), die Landeskoordinaten stehen
-#     in 'proj:bbox'. Mit LV95 in 'bbox' laedt QGIS die Ebene zwar OHNE Fehler,
-#     liefert aber einen unendlichen Extent - man sieht nichts. Genau deshalb steht
-#     die Umrechnung nach WGS84 unten und nicht "spaeter vielleicht".
-#   - 'pc:schemas', 'stac_extensions' und 'proj:geometry' sind optional (geprueft).
-VPC_SUBDIR = "_vpc"
-VPC_STAC_VERSION = "1.0.0"
-VPC_STAC_EXTENSIONS = [
-    "https://stac-extensions.github.io/pointcloud/v1.0.0/schema.json",
-    "https://stac-extensions.github.io/projection/v1.1.0/schema.json",
-]
-# STAC-Pointcloud-Typ: 'eopc' = electro-optical point cloud. Fachlich korrekt fuer
-# photogrammetrisch abgeleitete Wolken (DMC/Reality Studio) - 'lidar' waere falsch.
-VPC_POINTCLOUD_TYPE = "eopc"
+# ─── QC-Ansichtsprodukte (COPC / COG) ─────────────────────────────────────────
+# Reine Sichtkontrolle der Ausgabe, KEINE Lieferprodukte: je EINE Datei fuer die
+# ganze AOI, in einem eigenen Unterordner des Output-Ordners und mit 'checkData' im
+# Namen. Gebaut wird aus den fertigen Ausgabe-Kacheln, damit die Ansicht genau das
+# Gelieferte zeigt. Ein Fehler hier laesst den Lauf nicht scheitern.
+QC_NAME_TOKEN = "checkData"
+
+# COPC (Tab [LN02]): alle Kacheln als EINE Punktwolke. COPC traegt seine
+# Uebersichtsstufen selbst (Octree) - QGIS zeigt damit auf jeder Zoomstufe Punkte,
+# nicht nur die Kachel-Umrisse wie eine VPC ohne Uebersicht. Gebaut mit untwine
+# (Hobu, liegt QGIS bei): arbeitet mit Temp-Dateien statt allem im Arbeitsspeicher -
+# ein Gesamt-Merge in EINEM pdal.exe-Prozess ist bei grossen Projekten schon
+# abgestuerzt (0xC0000409).
+COPC_QC_SUBDIR = "copc_QC"
+
+# COG (Tab TIFFconverter): Mosaik aller Kacheln, JPEG-komprimiert. Profil wie das
+# Mosaik im Projekt topo-COGTIFFconverter.
+COG_QC_SUBDIR = "cog_QC"
+COG_QC_BLOCKSIZE = 256
+COG_QC_OVERVIEW_RESAMPLING = "AVERAGE"
 
 # Kachelname-Muster fuer die deterministische Bestimmung des Kachelursprungs
 # (Offset), z.B. "2026_GUPPENFIRN_TIN_raw_2713_1206_LV95_LHN95.las" -> (2713, 1206).
@@ -557,6 +551,181 @@ def _grid_tile_worker(args) -> tuple:
         return ("error", out_path, str(e))
 
 
+def _tmp_path(path: str) -> str:
+    """Temp-Name neben der Zieldatei, mit derselben (Doppel-)Endung."""
+    if path.lower().endswith(".copc.laz"):
+        return path[:-len(".copc.laz")] + "_tmp.copc.laz"
+    stem, ext = os.path.splitext(path)
+    return f"{stem}_tmp{ext}"
+
+
+def _set_display_colour_interpretation(ds) -> None:
+    """Baender 1-3 als Rot/Gruen/Blau, alle weiteren als 'undefiniert'.
+
+    Wichtig fuer das QC-COG bei 4-Band (RGBN): Band 4 ist in der Quelle haeufig als
+    'Alpha' getaggt. Der COG-Treiber machte daraus bei JPEG eine 1-bit-Maske (das NIR
+    waere weg), und QGIS zeigte das Bild halbtransparent."""
+    from osgeo import gdal
+    if ds.RasterCount < 3:
+        return
+    for i, ci in enumerate((gdal.GCI_RedBand, gdal.GCI_GreenBand, gdal.GCI_BlueBand), 1):
+        ds.GetRasterBand(i).SetColorInterpretation(ci)
+    for i in range(4, ds.RasterCount + 1):
+        ds.GetRasterBand(i).SetColorInterpretation(gdal.GCI_Undefined)
+
+
+def _write_nodata_mask(ds, nodata_val: float, block: int = 2048) -> None:
+    """Interne Gueltigkeitsmaske, blockweise (speicherschonend auch fuer grosse AOIs).
+    Ein Pixel ist nur ungueltig, wenn ALLE Baender den NoData-Wert tragen - eine dunkle
+    Stelle mit 0 in nur einem Band bleibt sichtbar. Logik wie _write_nodata_mask in
+    topo-COGTIFFconverter."""
+    from osgeo import gdal
+    import numpy as np
+    gdal.SetConfigOption("GDAL_TIFF_INTERNAL_MASK", "YES")
+    ds.CreateMaskBand(gdal.GMF_PER_DATASET)
+    mask_band = ds.GetRasterBand(1).GetMaskBand()
+    for y in range(0, ds.RasterYSize, block):
+        ys = min(block, ds.RasterYSize - y)
+        for x in range(0, ds.RasterXSize, block):
+            xs = min(block, ds.RasterXSize - x)
+            invalid = np.ones((ys, xs), dtype=bool)
+            for i in range(1, ds.RasterCount + 1):
+                invalid &= (ds.GetRasterBand(i).ReadAsArray(x, y, xs, ys) == nodata_val)
+            mask_band.WriteArray(np.where(invalid, 0, 255).astype("uint8"), x, y)
+
+
+def _cog_creation_options(compress: str, quality: int = 90) -> list:
+    """COG-Profil der Mosaike (wie das Mosaik in topo-COGTIFFconverter). QUALITY nur
+    bei JPEG, PREDICTOR=2 nur bei verlustfreier Kompression."""
+    c = str(compress).upper()
+    opts = [f"COMPRESS={c}", f"BLOCKSIZE={COG_QC_BLOCKSIZE}", "OVERVIEWS=AUTO",
+            f"OVERVIEW_RESAMPLING={COG_QC_OVERVIEW_RESAMPLING}",
+            "BIGTIFF=YES", "NUM_THREADS=ALL_CPUS"]
+    if c == "JPEG":
+        q = int(quality)
+        opts += [f"QUALITY={q}", f"OVERVIEW_QUALITY={q}"]
+    elif c in ("DEFLATE", "LZW", "ZSTD"):
+        opts.append("PREDICTOR=2")
+    return opts
+
+
+def _check_cog(path: str, band_count: int, compress: str, expect_mask: bool) -> list:
+    """Prueft ein fertiges COG. Leere Liste = in Ordnung."""
+    from osgeo import gdal
+    c = str(compress).upper()
+    ds = gdal.Open(path, gdal.GA_ReadOnly)
+    problems = []
+    if ds.GetMetadataItem("LAYOUT", "IMAGE_STRUCTURE") != "COG":
+        problems.append("kein COG-Layout")
+    found = (ds.GetMetadataItem("COMPRESSION", "IMAGE_STRUCTURE") or "").upper()
+    if c != "NONE" and c not in found:
+        problems.append(f"Kompression {found or 'keine'} statt {c}")
+    if ds.RasterCount != band_count:
+        problems.append(f"{ds.RasterCount} statt {band_count} Baender")
+    if expect_mask and not ds.GetRasterBand(1).GetMaskFlags() & gdal.GMF_PER_DATASET:
+        problems.append("keine interne Maske")
+    if any(ds.GetRasterBand(i).GetColorInterpretation() == gdal.GCI_AlphaBand
+           for i in range(1, ds.RasterCount + 1)):
+        problems.append("ein Band ist als Alpha getaggt")
+    ds = None
+    return problems
+
+
+def _write_cog_mosaic(tile_paths: list, cog_path: str, work_dir: Path, log, progress,
+                      band_mode: str = "keep", compress: str = "JPEG", quality: int = 90,
+                      nodata_val=None, srs: str = None) -> None:
+    """Mosaik aus Kacheln als EIN COG - fuer die QC-Option im Tab TIFFconverter und
+    fuer den Tab 'Create COGTIFF'.
+
+    Ablauf: VRT ueber die Kacheln -> optional Bandauszug (VRT) -> COG. Die VRTs sind
+    nur Zwischenschritte und werden danach geloescht - das COG enthaelt alle Pixel
+    und Overviews selbst.
+
+    Bei JPEG mit NoData zweistufig wie in topo-COGTIFFconverter: Zwischenraster (LZW,
+    ohne NoData-Tag) -> interne Maske blockweise -> COG. JPEG veraendert die 0-Werte
+    am Rand, ein NoData-Wert gaebe schwarze Saeume; die Maske ist verlustfrei. Neben
+    der Maske bleibt der NoData-Tag weg ('conflicting mask sources' - GDAL verwuerfe
+    die Maske). Verlustfreie Kompression behaelt den NoData-Tag der Kacheln.
+
+    Geschrieben wird in eine Temp-Datei, die erst nach bestandener Pruefung an ihren
+    Platz kommt; ein alter Stand wird vorher entfernt."""
+    from osgeo import gdal
+    if not tile_paths:
+        raise RuntimeError("keine Kacheln fuer das Mosaik gefunden")
+
+    compress = str(compress).upper()
+    Path(cog_path).parent.mkdir(parents=True, exist_ok=True)
+    tmp_cog = _tmp_path(cog_path)
+    for f in (cog_path, tmp_cog):
+        if os.path.isfile(f):
+            os.remove(f)
+    work_dir = Path(work_dir)
+    work_dir.mkdir(parents=True, exist_ok=True)
+    vrt_path = work_dir / "cog_mosaic.vrt"
+    band_vrt = work_dir / f"01b_bands_{band_mode}.vrt"
+    scratch_path = work_dir / "cog_scratch.tif"
+    use_mask = compress == "JPEG" and nodata_val is not None
+    srs_kw = {"outputSRS": srs} if srs else {}
+
+    try:
+        vrt_ds = gdal.BuildVRT(str(vrt_path), tile_paths)
+        if vrt_ds is None:
+            raise RuntimeError("gdal.BuildVRT hat None zurueckgegeben")
+        _set_display_colour_interpretation(vrt_ds)
+        vrt_ds = None
+        src = _select_bands(str(vrt_path), band_mode, work_dir, log)
+        src_ds = gdal.Open(src, gdal.GA_ReadOnly)
+        band_count = src_ds.RasterCount
+        src_ds = None
+
+        scratch_ds = None
+        if use_mask:
+            log("  1/3 Zwischenraster (LZW)")
+            scratch_ds = gdal.Translate(
+                str(scratch_path), src,
+                options=gdal.TranslateOptions(
+                    format="GTiff", noData="none",
+                    creationOptions=["TILED=YES", "BLOCKXSIZE=512", "BLOCKYSIZE=512",
+                                     "COMPRESS=LZW", "BIGTIFF=YES"], **srs_kw),
+                callback=progress)
+            if scratch_ds is None:
+                raise RuntimeError("gdal.Translate (Zwischenraster) hat None zurueckgegeben")
+            scratch_ds = None
+            log("  2/3 Maske (ungueltig, wenn alle Baender = NoData)")
+            scratch_ds = gdal.Open(str(scratch_path), gdal.GA_Update)
+            _write_nodata_mask(scratch_ds, nodata_val)
+            scratch_ds.FlushCache()
+            cog_src, step = scratch_ds, "3/3"
+        else:
+            cog_src, step = src, "1/1"
+
+        log(f"  {step} COG ({compress}"
+            + (f" {int(quality)} %" if compress == "JPEG" else "")
+            + f", Overviews {COG_QC_OVERVIEW_RESAMPLING})")
+        out_ds = gdal.Translate(
+            tmp_cog, cog_src,
+            options=gdal.TranslateOptions(
+                format="COG", creationOptions=_cog_creation_options(compress, quality),
+                **srs_kw),
+            callback=progress)
+        cog_src = scratch_ds = None
+        if out_ds is None:
+            raise RuntimeError("gdal.Translate (COG) hat None zurueckgegeben")
+        out_ds = None
+
+        problems = _check_cog(tmp_cog, band_count, compress, use_mask)
+        if problems:
+            raise RuntimeError("Pruefung fehlgeschlagen: " + "; ".join(problems))
+        os.replace(tmp_cog, cog_path)
+    finally:
+        for f in (tmp_cog, vrt_path, band_vrt, scratch_path, f"{scratch_path}.aux.xml"):
+            try:
+                if os.path.isfile(str(f)):
+                    os.remove(str(f))
+            except OSError:
+                pass
+
+
 def _process(cfg: dict) -> None:
     from osgeo import gdal, ogr, osr
 
@@ -573,6 +742,11 @@ def _process(cfg: dict) -> None:
     nodata_val       = float(cfg.get("nodata", "0"))
     keep_staging     = bool(cfg.get("keep_staging", False))
     band_mode        = str(cfg.get("band_mode", "keep")).strip().lower() or "keep"
+    # QC-Mosaik als COG - reine Sichtkontrolle neben der Lieferung.
+    create_cog       = bool(cfg.get("create_cog", False))
+    cog_quality      = int(cfg.get("cog_quality", 90))
+    if create_cog and not 1 <= cog_quality <= 100:
+        raise ValueError(f"JPEG-Qualitaet {cog_quality} ausserhalb von 1-100.")
 
     def _log(msg: str) -> None:
         print(msg, flush=True)
@@ -674,6 +848,10 @@ def _process(cfg: dict) -> None:
     _log(f"Kompression         : {compress} (von Input-Kacheln uebernommen, verlustfrei)")
     _log(f"Blockgroesse        : {blocksize}")
     _log(f"Parallele Prozesse  : {num_workers}")
+    cog_name = f"{jahr}_{area}_DOP_{gsd}_{QC_NAME_TOKEN}_LV95.tif"
+    _log(f"QC-COG              : "
+         + (f"AKTIV - {COG_QC_SUBDIR}/{cog_name} (JPEG {cog_quality} %)"
+            if create_cog else "inaktiv"))
 
     # PHOTOMETRIC nur bei aktiver Bandauswahl erzwingen - ohne Auswahl bleibt die
     # Ausgabe exakt so getaggt wie die Quelle.
@@ -735,6 +913,24 @@ def _process(cfg: dict) -> None:
                 _log(f"  [{done}/{len(jobs)}] FEHLER bei {tile_name}: {err}")
             print(f"PROGRESS:{done/len(jobs):.6f}", flush=True)
 
+    # --- Schritt 5: QC-COG (ein Mosaik fuer die ganze AOI) ---
+    # Aus den fertigen Kacheln im Output-Ordner, damit die Ansicht zeigt, was
+    # tatsaechlich ausgeliefert wird. Ein Fehler hier laesst den Lauf nicht
+    # scheitern - die Kacheln sind das Produkt, das Mosaik nur die Kontrolle.
+    if create_cog and written:
+        pattern = glob.escape(f"{jahr}_{area}_DOP_{gsd}_") + "*_LV95.tif"
+        cog_tiles = sorted(glob.glob(os.path.join(output_dir, pattern)))
+        cog_path = str(Path(output_dir) / COG_QC_SUBDIR / cog_name)
+        _log(f"\nQC-COG: Mosaik aus {len(cog_tiles)} Kachel(n)")
+        try:
+            _write_cog_mosaic(cog_tiles, cog_path, run_dir, _log, _progress,
+                              compress="JPEG", quality=cog_quality,
+                              nodata_val=nodata_val, srs="EPSG:2056")
+            _log(f"  Geschrieben und geprueft: {cog_path}")
+        except Exception as e:
+            _log(f"  WARNUNG: QC-COG nicht geschrieben ({e}) - die Kacheln selbst "
+                 f"sind davon nicht betroffen.")
+
     if not keep_staging:
         _log(f"\nRaeume Staging-Ordner auf: {run_dir}")
         try:
@@ -752,6 +948,149 @@ def _process(cfg: dict) -> None:
         raise RuntimeError(f"{errors} Kachel(n) konnten nicht geschrieben werden - siehe Log.")
 
 
+# ─── Tab "Create COGTIFF" (eigenstaendig) ─────────────────────────────────────
+# Beliebige TIFF-Kacheln (+ .tfw) -> EIN COG. Keine Converter-Funktionen: kein
+# Clip, kein Grid-Zuschnitt - nur Mosaik, optionaler Bandauszug und Kompression.
+COG_COMPRESSIONS = ("JPEG", "DEFLATE", "LZW", "ZSTD", "NONE")
+
+
+def _srs_key(srs) -> str:
+    """Vergleichbarer Schluessel eines CRS: 'EPSG:<code>', sonst das WKT."""
+    s = srs.Clone()
+    try:
+        s.AutoIdentifyEPSG()
+    except Exception:
+        pass
+    code = s.GetAuthorityCode(None)
+    return f"EPSG:{code}" if code else s.ExportToWkt()
+
+
+def _resolve_tiles_srs(tile_paths: list, log) -> str:
+    """CRS fuer das Mosaik, von den Kacheln uebernommen.
+
+    Verschiedene CRS -> Fehler. Keine Kachel mit CRS (typisch fuer .tif + .tfw - die
+    Weltdatei kennt kein CRS) -> EPSG:2056 mit Warnung. Nur einige mit CRS -> dieses
+    fuer alle, mit Warnung."""
+    from osgeo import gdal
+    keys, missing = [], 0
+    for path in tile_paths:
+        ds = gdal.Open(path, gdal.GA_ReadOnly)
+        srs = ds.GetSpatialRef()
+        ds = None
+        if srs is None:
+            missing += 1
+        else:
+            key = _srs_key(srs)
+            if key not in keys:
+                keys.append(key)
+    if len(keys) > 1:
+        raise ValueError("Die Kacheln tragen verschiedene CRS: "
+                         + " | ".join(k[:60] for k in keys))
+    if not keys:
+        log("  WARNUNG: keine Kachel traegt ein CRS (nur .tfw?) - EPSG:2056 (LV95) "
+            "wird gesetzt.")
+        return "EPSG:2056"
+    if missing:
+        log(f"  WARNUNG: {missing} Kachel(n) ohne CRS - {keys[0][:60]} der uebrigen "
+            f"wird fuer alle gesetzt.")
+    return keys[0]
+
+
+def _first_tile_raster_facts(path: str) -> tuple:
+    """(Datentyp-Name, NoData-Wert von Band 1 oder None) der ersten Kachel."""
+    from osgeo import gdal
+    ds = gdal.Open(path, gdal.GA_ReadOnly)
+    band = ds.GetRasterBand(1)
+    facts = (gdal.GetDataTypeName(band.DataType), band.GetNoDataValue())
+    ds = None
+    return facts
+
+
+def _input_tiles(input_dir: str, patterns: tuple, output_path: str) -> list:
+    """Kacheln im Input-Ordner - ohne die Ausgabedatei und ihre Temp-Datei, falls sie
+    im selben Ordner liegen (sonst ginge ein alter Stand ins neue Produkt ein)."""
+    out = os.path.abspath(output_path)
+    exclude = {os.path.normcase(out), os.path.normcase(_tmp_path(out))}
+    found = {f for pat in patterns for f in glob.glob(os.path.join(input_dir, pat))}
+    return sorted(f for f in found if os.path.normcase(os.path.abspath(f)) not in exclude)
+
+
+def _create_cog(cfg: dict) -> None:
+    from osgeo import gdal
+    gdal.UseExceptions()
+
+    input_dir    = cfg["input_dir"]
+    output_path  = cfg["output_path"]
+    band_mode    = str(cfg.get("band_mode", "keep")).strip().lower() or "keep"
+    compress     = str(cfg.get("compress", "JPEG")).strip().upper()
+    quality      = int(cfg.get("quality", 90))
+    staging_dir  = cfg["staging_dir"]
+    keep_staging = bool(cfg.get("keep_staging", False))
+
+    def _log(msg: str) -> None:
+        print(msg, flush=True)
+
+    if band_mode not in BAND_MODES:
+        raise ValueError(f"Unbekannte Band-Ausgabe: {band_mode!r}")
+    if compress not in COG_COMPRESSIONS:
+        raise ValueError(f"Unbekannte Kompression: {compress!r} "
+                         f"(erlaubt: {', '.join(COG_COMPRESSIONS)})")
+    if compress == "JPEG" and not 1 <= quality <= 100:
+        raise ValueError(f"JPEG-Qualitaet {quality} ausserhalb von 1-100.")
+
+    tiles = _input_tiles(input_dir, ("*.tif", "*.tiff"), output_path)
+    if not tiles:
+        raise FileNotFoundError(f"Keine .tif/.tiff Kacheln gefunden in: {input_dir}")
+
+    last_emit = {"t": 0.0, "p": -1.0}
+
+    def _progress(complete, message, unknown=None):
+        try:
+            if complete is None:
+                return 1
+            pct = float(complete)
+            now = time.time()
+            if (now - last_emit["t"]) >= 1.0 or (pct - last_emit["p"]) >= 0.005:
+                print(f"PROGRESS:{pct:.6f}", flush=True)
+                last_emit["t"], last_emit["p"] = now, pct
+        except Exception:
+            pass
+        return 1
+
+    _log(f"Input       : {input_dir}  ({len(tiles)} Kachel(n))")
+    _log(f"Output      : {output_path}")
+    _log(f"Baender     : {BAND_MODE_LABELS[band_mode]}")
+    _log(f"Kompression : {compress}"
+         + (f" (Qualitaet {quality} %)" if compress == "JPEG" else ""))
+    dtype, nodata = _first_tile_raster_facts(tiles[0])
+    if compress == "JPEG" and dtype != "Byte":
+        raise ValueError(f"JPEG verlangt 8-bit-Daten, die Kacheln sind {dtype} - "
+                         f"bitte DEFLATE, LZW oder ZSTD waehlen.")
+    srs = _resolve_tiles_srs(tiles, _log)
+    _log(f"CRS         : {srs[:60]}  (von den Kacheln)")
+    if nodata is None:
+        _log("NoData      : keines gesetzt")
+    elif compress == "JPEG":
+        _log(f"NoData      : {nodata:g} -> interne Maske (JPEG)")
+    else:
+        _log(f"NoData      : {nodata:g} (bleibt als NoData-Wert)")
+
+    run_dir = Path(staging_dir) / f"COG_{Path(output_path).stem}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    _log(f"Staging     : {run_dir}\n")
+    try:
+        _write_cog_mosaic(tiles, output_path, run_dir, _log, _progress,
+                          band_mode=band_mode, compress=compress, quality=quality,
+                          nodata_val=nodata, srs=srs)
+    finally:
+        if not keep_staging:
+            shutil.rmtree(run_dir, ignore_errors=True)
+
+    size_mb = Path(output_path).stat().st_size / (1024 ** 2)
+    _log(f"\nFertig: {output_path}  ({size_mb:.1f} MB) - geprueft: COG-Layout, "
+         f"Kompression, Baender, kein Alpha-Band.")
+
+
 # ─── DMC LASconverter (PDAL-basiert) ───────────────────────────────────────────
 #
 # Ablauf:
@@ -760,7 +1099,8 @@ def _process(cfg: dict) -> None:
 #   2) Punktwolken-Kacheln (pro 1km-Grid-Kachel):
 #      pro Grid-Zelle die ueberlappenden Input-Kacheln mergen, per AOI-Polygon
 #      croppen, optional thinnen, als .las oder .laz schreiben (out_format,
-#      Default .las - wird u.a. fuer GeoSuite-Reframe LHN95->LN02 benoetigt)
+#      Default .las - Eingabe fuer den GeoSuite-Reframe LHN95->LN02; REFRAME
+#      liest seit dem Update auch .laz, Daten identisch, nur kleiner)
 #   3) DSM-Zellen (nur falls "Create Raster" aktiv), ebenfalls pro 1km-Grid-Kachel:
 #      gleiche Zelle, aber mit Puffer croppen (vollstaendige IDW-Nachbarschaft am
 #      Zellrand), optional thinnen und als Float32-Raster rastern (PDAL
@@ -777,10 +1117,14 @@ def _process(cfg: dict) -> None:
 # ohne exakte Loesung; falls spaeter benoetigt, separat/extern klaeren).
 
 
-def _pdal_info_metadata(pdal_exe: str, path: str) -> dict:
-    result = subprocess.run([pdal_exe, "info", "--metadata", path],
-                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                             universal_newlines=True)
+def _pdal_info_metadata(pdal_exe: str, path: str, driver: str = None) -> dict:
+    cmd = [pdal_exe, "info", "--metadata", path]
+    if driver:
+        # Reader erzwingen, z.B. readers.las fuer ein .copc.laz - so tragen die
+        # Metadaten dieselben Felder wie bei den Kacheln.
+        cmd[3:3] = ["--driver", driver]
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            universal_newlines=True)
     if result.returncode != 0:
         msg = (result.stderr or result.stdout or "").strip()
         raise RuntimeError(f"pdal info beendet mit Exit-Code {result.returncode}"
@@ -902,17 +1246,25 @@ def _las_cell_worker(args) -> tuple:
     if thin_m:
         stages.append({"type": "filters.sample", "radius": float(thin_m)})
 
-    stages.append({"type": "writers.las", "filename": laz_out,
-                    "minor_version": LAS_OUT_MINOR_VERSION,
-                    "dataformat_id": LAS_OUT_POINT_FORMAT,
-                    "a_srs": LAS_OUT_SRS,
-                    # Bit 0 (GPS-Time-Typ) aus der Quelle uebernommen, Bit 4 (WKT)
-                    # gesetzt: LAS 1.4 mit PF >= 6 verlangt die WKT-Variante des
-                    # CRS-Tags (LAS 1.4 R15, Kap. 2.1), und PDAL schreibt dafuer
-                    # ohnehin OGC-WKT-VLRs statt GeoTIFF-Keys.
-                    "global_encoding": 0x10 | int(gps_time_bit),
-                    "scale_x": 0.01, "scale_y": 0.01, "scale_z": 0.01,
-                    "offset_x": origin_x, "offset_y": origin_y, "offset_z": 0})
+    writer = {"type": "writers.las", "filename": laz_out,
+              "minor_version": LAS_OUT_MINOR_VERSION,
+              "dataformat_id": LAS_OUT_POINT_FORMAT,
+              "a_srs": LAS_OUT_SRS,
+              # Bit 0 (GPS-Time-Typ) aus der Quelle uebernommen, Bit 4 (WKT)
+              # gesetzt: LAS 1.4 mit PF >= 6 verlangt die WKT-Variante des
+              # CRS-Tags (LAS 1.4 R15, Kap. 2.1), und PDAL schreibt dafuer
+              # ohnehin OGC-WKT-VLRs statt GeoTIFF-Keys.
+              "global_encoding": 0x10 | int(gps_time_bit),
+              "scale_x": 0.01, "scale_y": 0.01, "scale_z": 0.01,
+              "offset_x": origin_x, "offset_y": origin_y, "offset_z": 0}
+    # Kompression explizit setzen, nicht PDALs Endungs-Automatik ueberlassen: sonst
+    # haengt an einer undokumentierten Writer-Heuristik, ob bei out_format 'laz'
+    # wirklich LASzip herauskommt oder ein unkomprimiertes LAS mit .laz-Endung
+    # (das GeoSuite/REFRAME dann als defekt ablehnt). Gleiches Vorgehen wie im
+    # LN02-Worker.
+    if out_format.lower() == "laz":
+        writer["compression"] = "laszip"
+    stages.append(writer)
 
     try:
         with open(pipeline_path, "w", encoding="utf-8") as f:
@@ -1795,7 +2147,7 @@ def _process_las(cfg: dict) -> None:
 
 # ─── DMC LASconverter [LN02] (GDWH-Metadaten, LAS 1.4) ─────────────────────────
 #
-# Nachgelagerter Schritt zum Tab "DMC - LASconverter [LHN95]": dessen .las-Kacheln
+# Nachgelagerter Schritt zum Tab "DMC - LASconverter [LHN95]": dessen .las/.laz-Kacheln
 # werden extern mit GeoSuite/REFRAME von LHN95 nach LN02 reframt (nur die Hoehe,
 # X/Y bleiben LV95) - dieser Tab bringt das Ergebnis anschliessend in die
 # GDWH-taugliche Form.
@@ -2408,130 +2760,158 @@ def _ln02_tile_worker(args) -> tuple:
                 pass
 
 
-def _vpc_tile_worker(args) -> tuple:
-    """Header-Fakten EINER fertigen Ausgabe-Kachel fuer die VPC (Punktanzahl und
-    3D-BBox). Headerbasiert wie _tile_bbox_worker - die Punktdaten werden nicht
-    gelesen, bei .laz also auch nichts dekomprimiert."""
+def _copc_tile_facts_worker(args) -> tuple:
+    """Punktanzahl und CRS EINER Kachel aus dem Header - Referenz fuer die
+    Vollstaendigkeits- und CRS-Kontrolle des COPC. Headerbasiert, bei .laz wird also
+    nichts dekomprimiert. Fehler werden zurueckgemeldet statt geworfen."""
     pdal_exe, path = args
     try:
         md = _pdal_info_metadata(pdal_exe, path)
-        return (path, int(md.get("count", 0)),
-                float(md["minx"]), float(md["miny"]), float(md["minz"]),
-                float(md["maxx"]), float(md["maxy"]), float(md["maxz"]), None)
+        h_epsg, v_epsg = _resolve_crs_epsg(md)
+        return (path, int(md.get("count", 0)), h_epsg, v_epsg, None)
     except Exception as e:
-        return (path, None, None, None, None, None, None, None, str(e))
+        return (path, None, None, None, str(e))
 
 
-def _vpc_feature(stem: str, href: str, count: int, native_bbox: tuple,
-                  lonlat_ring: list, wkt2: str, encoding: str, stamp: str) -> dict:
-    """EIN STAC-Feature der VPC. Bewusst ohne 'pc:schemas' und 'proj:geometry':
-    beides ist optional (am QGIS-Provider geprueft) und waere nur Ballast - die
-    Dimensionsliste stuende sonst fuer jede Kachel identisch in der Datei.
-
-    'native_bbox' ist (minx, miny, minz, maxx, maxy, maxz) in LV95, 'lonlat_ring'
-    der geschlossene WGS84-Ring aus denselben Ecken."""
-    minx, miny, minz, maxx, maxy, maxz = native_bbox
-    lons = [p[0] for p in lonlat_ring]
-    lats = [p[1] for p in lonlat_ring]
-    return {
-        "type": "Feature",
-        "stac_version": VPC_STAC_VERSION,
-        "stac_extensions": list(VPC_STAC_EXTENSIONS),
-        "id": stem,
-        "geometry": {"type": "Polygon",
-                      "coordinates": [[[lon, lat] for lon, lat in lonlat_ring]]},
-        # Reihenfolge nach STAC: [minx, miny, minz, maxx, maxy, maxz] - horizontal
-        # in WGS84, vertikal in Metern (die Hoehe wird nicht umgerechnet).
-        "bbox": [min(lons), min(lats), minz, max(lons), max(lats), maxz],
-        "properties": {
-            "datetime": stamp,
-            "pc:count": count,
-            "pc:type": VPC_POINTCLOUD_TYPE,
-            "pc:encoding": encoding,
-            "proj:bbox": [minx, miny, minz, maxx, maxy, maxz],
-            "proj:wkt2": wkt2,
-        },
-        "links": [],
-        "assets": {"data": {"href": href, "roles": ["data"]}},
-    }
-
-
-def _build_vpc(features: list) -> dict:
-    """Die VPC als Ganzes - eine GeoJSON/STAC-FeatureCollection."""
-    return {"type": "FeatureCollection", "features": features}
-
-
-def _write_vpc(tile_paths: list, vpc_path: str, pdal_exe: str, num_workers: int,
-                log) -> int:
-    """Schreibt die Virtual Point Cloud fuer die uebergebenen Kacheln und gibt die
-    Anzahl aufgenommener Kacheln zurueck.
-
-    Die Kachel-Fakten werden aus den Headern der FERTIGEN Ausgabedateien gelesen
-    (parallel, ohne die Punktdaten anzufassen) - nicht aus den Job-Ergebnissen. So
-    beschreibt die VPC nachweislich das, was im Ordner liegt, statt das, was der
-    Lauf zu schreiben glaubte; unveraendert kopierte Kacheln sind damit ebenso
-    erfasst wie konvertierte.
-
-    Die Pfade sind RELATIV zum Speicherort der .vpc - der Ordner laesst sich damit
-    verschieben oder kopieren, ohne dass die Datei bricht."""
-    from osgeo import osr
-    osr.UseExceptions()
-
-    # Zielkoordinaten der STAC-Felder: WGS84 in Lon/Lat-Reihenfolge. Ohne
-    # TRADITIONAL_GIS_ORDER liefert GDAL 3 bei EPSG:4326 Lat/Lon - die VPC waere
-    # dann um 90 Grad "verdreht" und QGIS zeigte die Kacheln irgendwo im Meer.
-    lv95 = osr.SpatialReference()
-    lv95.ImportFromEPSG(2056)
-    lv95.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
-    wgs84 = osr.SpatialReference()
-    wgs84.ImportFromEPSG(4326)
-    wgs84.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
-    to_wgs84 = osr.CoordinateTransformation(lv95, wgs84)
-    # Nur der horizontale Rahmen: die VPC ist eine Kartenebene. Der Hoehenbezug
-    # (LN02) steckt in den byte-exakten CRS-VLRs der Kacheln selbst - ein
-    # Compound-CRS an dieser Stelle wuerde die Karten-Ansicht nur verwirren.
-    wkt2 = lv95.ExportToWkt()
-
-    facts = []
-    errors = []
+def _collect_tile_facts(pdal_exe: str, tile_paths: list, num_workers: int) -> tuple:
+    """(Summe der Punkte, Liste der CRS als (horizontal, vertikal)) aller Kacheln -
+    Header, parallel. Wirft, wenn ein Header nicht lesbar ist: ohne vollstaendige
+    Referenz liesse sich das COPC nicht pruefen."""
+    total = 0
+    crs_list = []
+    unreadable = []
     with ProcessPoolExecutor(max_workers=num_workers) as executor:
-        futures = [executor.submit(_vpc_tile_worker, (pdal_exe, p)) for p in tile_paths]
-        for fut in as_completed(futures):
-            path, count, minx, miny, minz, maxx, maxy, maxz, err = fut.result()
+        for path, count, h_epsg, v_epsg, err in executor.map(
+                _copc_tile_facts_worker, [(pdal_exe, f) for f in tile_paths]):
             if err:
-                errors.append((path, err))
+                unreadable.append(f"{Path(path).name}: {err}")
             else:
-                facts.append((path, count, minx, miny, minz, maxx, maxy, maxz))
+                total += count
+                if (h_epsg, v_epsg) not in crs_list:
+                    crs_list.append((h_epsg, v_epsg))
+    if unreadable:
+        raise RuntimeError("Kachel-Header nicht lesbar:\n    " + "\n    ".join(unreadable))
+    return total, crs_list
 
-    for p, e in errors:
-        log(f"  WARNUNG: {Path(p).name} nicht in die VPC aufgenommen "
-            f"(Header nicht lesbar): {e}")
-    if not facts:
-        raise RuntimeError("Keine Kachel fuer die VPC lesbar - Datei nicht geschrieben.")
 
-    facts.sort(key=lambda f: f[0])
-    vpc_dir = Path(vpc_path).parent
-    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    features = []
-    for path, count, minx, miny, minz, maxx, maxy, maxz in facts:
-        ring_native = [(minx, miny), (minx, maxy), (maxx, maxy), (maxx, miny), (minx, miny)]
-        ring_wgs84 = []
-        for x, y in ring_native:
-            lon, lat, _ = to_wgs84.TransformPoint(x, y)
-            ring_wgs84.append((lon, lat))
-        href = os.path.relpath(path, str(vpc_dir)).replace("\\", "/")
-        if not href.startswith("."):
-            href = "./" + href
-        encoding = ("application/vnd.laszip" if path.lower().endswith(".laz")
-                    else "application/vnd.las")
-        features.append(_vpc_feature(Path(path).stem, href, count,
-                                      (minx, miny, minz, maxx, maxy, maxz),
-                                      ring_wgs84, wkt2, encoding, stamp))
+def _fmt_crs(h_epsg, v_epsg=None) -> str:
+    """'EPSG:2056+5728' bzw. 'EPSG:2056' (ohne Hoehenbezug)."""
+    return f"EPSG:{h_epsg}+{v_epsg}" if v_epsg else f"EPSG:{h_epsg}"
 
-    Path(vpc_path).parent.mkdir(parents=True, exist_ok=True)
-    with open(vpc_path, "w", encoding="utf-8") as f:
-        json.dump(_build_vpc(features), f, indent=1)
-    return len(features)
+
+def _copc_crs_from_tiles(crs_list: list, log) -> tuple:
+    """CRS fuer das COPC, von den Kacheln uebernommen. Verschiedene CRS -> Fehler.
+    Keine Kachel mit aufloesbarem CRS -> EPSG:2056 (ohne Hoehenbezug) mit Warnung.
+    Nur einige mit CRS -> dieses fuer alle, mit Warnung."""
+    known = [c for c in crs_list if c[0] is not None]
+    if len(known) > 1:
+        raise ValueError("Die Kacheln tragen verschiedene CRS: "
+                         + ", ".join(_fmt_crs(*c) for c in known))
+    if not known:
+        log("  WARNUNG: keine Kachel traegt ein aufloesbares CRS - EPSG:2056 (LV95, "
+            "ohne Hoehenbezug) wird gesetzt.")
+        return (2056, None)
+    if len(crs_list) > len(known):
+        log(f"  WARNUNG: einige Kacheln ohne CRS - {_fmt_crs(*known[0])} der uebrigen "
+            f"wird fuer alle gesetzt.")
+    return known[0]
+
+
+def _untwine_command(untwine_exe: str, tile_names: list, out_path: str,
+                     temp_dir: str, threads: int, a_srs: str) -> list:
+    """Kommandozeile fuer untwine. Jede Kachel einzeln per '-i' und als reiner
+    Dateiname (untwine laeuft im Kachelordner): ein Ordner als Input wuerde alles
+    darin einlesen, und kurze Namen halten die Zeile unter dem Windows-Limit.
+    Das CRS wird explizit gesetzt."""
+    cmd = [untwine_exe, "-o", out_path, "--a_srs", a_srs,
+           "--temp_dir", temp_dir, "--threads", str(int(threads))]
+    for name in tile_names:
+        cmd += ["-i", name]
+    return cmd
+
+
+def _run_untwine(cmd: list, cwd: str) -> tuple:
+    """Fuehrt untwine aus. Rueckgabe: (Exit-Code, zusammengefasste Ausgabe)."""
+    result = subprocess.run(cmd, cwd=cwd, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, universal_newlines=True)
+    return result.returncode, result.stdout or ""
+
+
+def _validate_copc(md: dict, expected_count: int,
+                   expected_crs: tuple = (2056, 5728)) -> list:
+    """Prueft ein fertiges COPC gegen die Kacheln. Leere Liste = in Ordnung."""
+    problems = []
+    try:
+        count = int(md.get("count", -1))
+    except (TypeError, ValueError):
+        count = -1
+    if count != expected_count:
+        problems.append(f"Punktanzahl {md.get('count')} statt {expected_count} "
+                        f"(Summe der Kacheln)")
+    if md.get("copc") is False:
+        problems.append("die Datei ist kein COPC")
+    h_epsg, v_epsg = _resolve_crs_epsg(md)
+    if (h_epsg, v_epsg) != tuple(expected_crs):
+        problems.append(f"CRS {_fmt_crs(h_epsg, v_epsg)} statt {_fmt_crs(*expected_crs)}")
+    return problems
+
+
+def _write_copc(tile_paths: list, copc_path: str, untwine_exe: str, pdal_exe: str,
+                run_dir: Path, num_workers: int, log, crs: tuple = None) -> int:
+    """Baut EIN COPC aus Kacheln - fuer die QC-Option im Tab [LN02] und fuer den Tab
+    'Create COPC' - und gibt die Punktanzahl zurueck. crs=None: von den Kacheln
+    uebernehmen; sonst (horizontal, vertikal) fest vorgegeben.
+
+    Geschrieben wird in eine Temp-Datei, die erst nach bestandener Pruefung an ihren
+    Platz geschoben wird. Ein alter Stand wird vorher entfernt: eine veraltete Datei
+    soll nie liegen bleiben. Wirft bei jedem Problem."""
+    if not untwine_exe or not os.path.isfile(untwine_exe):
+        raise FileNotFoundError("untwine.exe nicht gefunden (liegt normalerweise im "
+                                "bin-Ordner der QGIS-Installation)")
+    tile_dir = os.path.dirname(os.path.abspath(tile_paths[0]))
+    names = [os.path.basename(f) for f in tile_paths]
+    if any(os.path.dirname(os.path.abspath(f)) != tile_dir for f in tile_paths):
+        raise ValueError("die Kacheln liegen nicht alle im selben Ordner")
+    if any("," in n for n in names):
+        # untwine zerlegt Listenargumente an Kommas (PDAL ProgramArgs)
+        raise ValueError("Kachelnamen mit Komma kann untwine nicht verarbeiten")
+
+    expected, crs_list = _collect_tile_facts(pdal_exe, tile_paths, num_workers)
+    if crs is None:
+        crs = _copc_crs_from_tiles(crs_list, log)
+    a_srs = _fmt_crs(*crs)
+
+    Path(copc_path).parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = _tmp_path(copc_path)
+    for f in (copc_path, tmp_path):
+        if os.path.isfile(f):
+            os.remove(f)
+    temp_dir = Path(run_dir) / "untwine_tmp"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+
+    pts = f"{expected:,}".replace(",", "'")
+    log(f"  untwine: {len(names)} Kachel(n), {pts} Punkte, CRS {a_srs}")
+    t0 = time.time()
+    try:
+        code, output = _run_untwine(
+            _untwine_command(untwine_exe, names, tmp_path, str(temp_dir), num_workers,
+                             a_srs),
+            tile_dir)
+        if code != 0 or not os.path.isfile(tmp_path):
+            tail = "\n    ".join(output.strip().splitlines()[-10:])
+            raise RuntimeError(f"untwine beendet mit Exit-Code {code}"
+                               + (f":\n    {tail}" if tail else ""))
+        md = _pdal_info_metadata(pdal_exe, tmp_path, driver="readers.las")
+        problems = _validate_copc(md, expected, crs)
+        if problems:
+            raise RuntimeError("Pruefung fehlgeschlagen: " + "; ".join(problems))
+        os.replace(tmp_path, copc_path)
+    finally:
+        if os.path.isfile(tmp_path):
+            os.remove(tmp_path)
+        shutil.rmtree(temp_dir, ignore_errors=True)
+    log(f"  Dauer untwine + Pruefung: {time.time() - t0:.0f} s")
+    return expected
 
 
 def _process_las_ln02(cfg: dict) -> None:
@@ -2541,8 +2921,9 @@ def _process_las_ln02(cfg: dict) -> None:
     area              = str(cfg["area"]).strip()
     create_raster     = bool(cfg.get("create_raster", False))
     gsd_raster        = float(cfg["gsd"]) if create_raster else None
-    # Virtual Point Cloud fuer QGIS - reines Ansichtsprodukt neben der Lieferung.
-    create_vpc        = bool(cfg.get("create_vpc", False))
+    # QC-COPC der ganzen AOI - reine Sichtkontrolle neben der Lieferung.
+    create_copc       = bool(cfg.get("create_copc", False))
+    untwine_exe       = cfg.get("untwine_exe", "")
     input_dir         = cfg["input_dir"]
     output_dir_las    = cfg["output_dir_las"]
     output_dir_raster = cfg.get("output_dir_raster")
@@ -2675,9 +3056,9 @@ def _process_las_ln02(cfg: dict) -> None:
         _log(f"  WARNUNG: Punktformat der Quelle nicht lesbar ({e}) - RGB-Hinweis "
              f"uebersprungen.")
     _log(f"Punktwolken-Format  : .{out_format}")
-    _log(f"LAS-Dataset / VPC   : "
-         + (f"AKTIV - {VPC_SUBDIR}/{jahr}_{area}_LV95_LN02.vpc (fuer QGIS)"
-            if create_vpc else "inaktiv"))
+    copc_name = f"{jahr}_{area}_{QC_NAME_TOKEN}_LV95_LN02.copc.laz"
+    _log(f"QC-COPC             : "
+         + (f"AKTIV - {COPC_QC_SUBDIR}/{copc_name}" if create_copc else "inaktiv"))
     _log(f"Raster erstellen    : "
          f"{'AKTIV (GSD ' + format(gsd_raster, 'g') + ' m)' if create_raster else 'inaktiv'}")
     _log(f"Benennung           : {jahr}_{area}_TIN_[thinnedout<NN>_]raw_<E>_<N>_LV95_LN02."
@@ -2824,27 +3205,26 @@ def _process_las_ln02(cfg: dict) -> None:
                 _log(f"  [Retry {i}/{len(failed)}] FEHLER bleibt bei "
                      f"{_job_label(kind, name)}: {res[2]}")
 
-    # --- Schritt 5b: Virtual Point Cloud (QGIS) ---
-    # Bewusst NACH der Konversion und aus dem Ordner-Inhalt heraus: die VPC soll
-    # beschreiben, was tatsaechlich ausgeliefert wird. Ein Fehler hier darf den Lauf
-    # nicht scheitern lassen - die Kacheln sind das Produkt, die VPC nur die Ansicht.
-    if create_vpc:
-        vpc_tiles = sorted(glob.glob(os.path.join(output_dir_las, f"*.{out_format}")))
-        _log(f"\nVirtual Point Cloud (QGIS): {len(vpc_tiles)} Kachel(n) im Output-Ordner")
-        if not vpc_tiles:
-            _log(f"  WARNUNG: keine .{out_format}-Kachel im Output-Ordner - "
-                 f"keine VPC geschrieben.")
+    # --- Schritt 5b: QC-COPC (eine Punktwolke fuer die ganze AOI) ---
+    # Bewusst NACH der Konversion und aus dem Ordner-Inhalt heraus: das COPC soll
+    # zeigen, was tatsaechlich ausgeliefert wird. Ein Fehler hier darf den Lauf nicht
+    # scheitern lassen - die Kacheln sind das Produkt, das COPC nur die Kontrolle.
+    if create_copc:
+        pattern = glob.escape(f"{jahr}_{area}_TIN_") + f"*_LV95_LN02.{out_format}"
+        copc_tiles = sorted(glob.glob(os.path.join(output_dir_las, pattern)))
+        _log(f"\nQC-COPC: {len(copc_tiles)} Kachel(n) der AOI im Output-Ordner")
+        if not copc_tiles:
+            _log(f"  WARNUNG: keine passende .{out_format}-Kachel gefunden - "
+                 f"kein COPC geschrieben.")
         else:
-            vpc_path = str(Path(output_dir_las) / VPC_SUBDIR /
-                           f"{jahr}_{area}_LV95_LN02.vpc")
+            copc_path = str(Path(output_dir_las) / COPC_QC_SUBDIR / copc_name)
             try:
-                n_vpc = _write_vpc(vpc_tiles, vpc_path, pdal_exe, num_workers, _log)
-                _log(f"  Geschrieben: {vpc_path}")
-                _log(f"  {n_vpc} Kachel(n) referenziert (relative Pfade). In QGIS als "
-                     f"eine Punktwolken-Ebene zu oeffnen; ArcGIS Pro liest das Format nicht.")
+                _write_copc(copc_tiles, copc_path, untwine_exe, pdal_exe, run_dir,
+                            num_workers, _log, crs=(2056, 5728))
+                _log(f"  Geschrieben und geprueft: {copc_path}")
             except Exception as e:
-                _log(f"  WARNUNG: VPC konnte nicht geschrieben werden ({e}) - die "
-                     f"Kacheln selbst sind davon nicht betroffen.")
+                _log(f"  WARNUNG: QC-COPC nicht geschrieben ({e}) - die Kacheln "
+                     f"selbst sind davon nicht betroffen.")
 
     # --- Schritt 6: Zell-Raster zum Gesamt-DSM mosaikieren, dann Hillshade ---
     if create_raster:
@@ -2879,6 +3259,51 @@ def _process_las_ln02(cfg: dict) -> None:
     if errors:
         raise RuntimeError(f"{errors} Job(s) konnten auch beim seriellen Wiederholen nicht "
                             f"verarbeitet werden - siehe Log.")
+
+
+# ─── Tab "Create COPC" (eigenstaendig) ────────────────────────────────────────
+# Beliebige LAS/LAZ-Kacheln -> EIN COPC. Keine Converter-Funktionen - nur der Merge
+# via untwine, CRS von den Kacheln.
+def _create_copc(cfg: dict) -> None:
+    input_dir    = cfg["input_dir"]
+    output_path  = cfg["output_path"]
+    untwine_exe  = cfg.get("untwine_exe", "")
+    pdal_exe     = cfg["pdal_exe"]
+    staging_dir  = cfg["staging_dir"]
+    num_workers  = int(cfg.get("num_workers", 6))
+    keep_staging = bool(cfg.get("keep_staging", False))
+
+    def _log(msg: str) -> None:
+        print(msg, flush=True)
+
+    if not output_path.lower().endswith(".copc.laz"):
+        raise ValueError(f"Die Ausgabedatei muss auf .copc.laz enden: {output_path}")
+    if not pdal_exe or not os.path.isfile(pdal_exe):
+        raise FileNotFoundError("pdal.exe wurde nicht gefunden (wird fuer die Kontrolle "
+                                "der Kachel-Header gebraucht).")
+    tiles = _input_tiles(input_dir, ("*.laz", "*.las"), output_path)
+    if not tiles:
+        raise FileNotFoundError(f"Keine .las/.laz Kacheln gefunden in: {input_dir}")
+
+    _log(f"Input   : {input_dir}  ({len(tiles)} Kachel(n))")
+    n_copc = sum(1 for t in tiles if t.lower().endswith(".copc.laz"))
+    if n_copc:
+        _log(f"  WARNUNG: {n_copc} .copc.laz im Input-Ordner - werden wie Kacheln "
+             f"mitgemerged.")
+    _log(f"Output  : {output_path}")
+    _log(f"untwine : {untwine_exe}")
+    run_dir = Path(staging_dir) / f"COPC_{Path(output_path).name[:-len('.copc.laz')]}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    _log(f"Staging : {run_dir}\n")
+    try:
+        _write_copc(tiles, output_path, untwine_exe, pdal_exe, run_dir, num_workers, _log)
+    finally:
+        if not keep_staging:
+            shutil.rmtree(run_dir, ignore_errors=True)
+
+    size_mb = Path(output_path).stat().st_size / (1024 ** 2)
+    _log(f"\nFertig: {output_path}  ({size_mb:.1f} MB) - geprueft: Punktanzahl = Summe "
+         f"der Kacheln, CRS.")
 
 
 # ─── Create DSM-Raster (eigenstaendiger Raster-Build) ──────────────────────────
@@ -3165,6 +3590,10 @@ def main() -> None:
             _process_las_ln02(cfg)
         elif action == "process_dsm":
             _process_dsm(cfg)
+        elif action == "create_cog":
+            _create_cog(cfg)
+        elif action == "create_copc":
+            _create_copc(cfg)
         else:
             print(f"[FEHLER] Unbekannte Aktion: '{action}'", flush=True)
             sys.exit(1)

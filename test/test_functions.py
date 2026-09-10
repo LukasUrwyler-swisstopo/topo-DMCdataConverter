@@ -63,6 +63,12 @@ def test_tiff_tab_name_preview():
         app._update_name_preview()
         text = app._name_preview_lbl.cget("text")
         assert "2026_GUPPENFIRN_DOP_10cm_<NAME>_LV95.tif" in text
+        assert "checkData" not in text
+        # QC-Mosaik: eigener Unterordner, 'checkData' anstelle des Kachelnamens
+        app._create_cog_var.set(True)
+        app._on_create_cog_toggle()
+        text = app._name_preview_lbl.cget("text")
+        assert "cog_QC\\2026_GUPPENFIRN_DOP_10cm_checkData_LV95.tif" in text
     finally:
         app.destroy()
 
@@ -599,15 +605,16 @@ def test_ln02_tab_name_preview():
         text = app._ln02_name_preview_lbl.cget("text")
         assert "2026_GUPPENFIRN_TIN_[thinnedout<NN>_]raw_<E>_<N>_LV95_LN02.laz" in text
         assert "DSM" not in text
-        assert ".vpc" not in text
+        assert ".copc.laz" not in text
         # Kein Thinning-Feld mehr - ausgeduennt wird ausschliesslich im Tab [LHN95]
         assert not hasattr(app, "_ln02_thin_var")
 
-        # VPC ist unabhaengig vom Raster zuschaltbar
-        app._ln02_create_vpc_var.set(True)
+        # Das QC-COPC ist unabhaengig vom Raster zuschaltbar; die VPC gibt es nicht mehr
+        assert not hasattr(app, "_ln02_create_vpc_var")
+        app._ln02_create_copc_var.set(True)
         app._update_ln02_name_preview()
         text = app._ln02_name_preview_lbl.cget("text")
-        assert "2026_GUPPENFIRN_LV95_LN02.vpc" in text
+        assert "copc_QC\\2026_GUPPENFIRN_checkData_LV95_LN02.copc.laz" in text
         assert "DSM" not in text
 
         app._ln02_create_raster_var.set(True)
@@ -812,6 +819,48 @@ def test_las_tile_writer_keeps_colour_for_geosuite(tmp_path):
     assert not out_file.exists()
 
 
+def test_las_tile_compression_is_explicit_for_laz(tmp_path):
+    """Seit dem GeoSuite-Update (09.09.2026) liest REFRAME LAS 1.4 PF6/PF7 auch als
+    .laz, die Zwischenstufe ist deshalb per Default LAZ. Die Kompression wird explizit
+    gesetzt statt PDALs Endungs-Heuristik zu vertrauen: sonst koennte bei out_format
+    'laz' ein unkomprimiertes LAS mit .laz-Endung entstehen, das GeoSuite ablehnt.
+    Bei out_format 'las' darf die Option NICHT gesetzt sein."""
+    import json
+
+    runner_mod = _runner()
+    captured = {}
+
+    def make_fake(out_file):
+        def fake_run(pdal_exe, pipeline_path, metadata_path=None):
+            captured["stages"] = json.loads(
+                open(pipeline_path, encoding="utf-8").read())["pipeline"]
+            out_file.write_bytes(b"dummy")
+        return fake_run
+
+    runner_mod._pdal_info_metadata = lambda exe, path: {
+        "count": 42, "minor_version": 4, "dataformat_id": 7}
+
+    stem = "2026_G_TIN_raw_2713_1206_LV95_LHN95"
+    job = {"stem": stem, "cell_bounds": (2713000.0, 1206000.0, 2714000.0, 1207000.0),
+           "tiles": [os.path.join("X:", "in", "a.laz")]}
+
+    for out_format, expected in (("laz", "laszip"), ("las", None)):
+        out_file = tmp_path / f"{stem}.{out_format}"
+        runner_mod._run_pdal_pipeline = make_fake(out_file)
+        status, _name, err = runner_mod._las_cell_worker(
+            (job, str(tmp_path), str(tmp_path), "pdal.exe",
+             "POLYGON((0 0,1 0,1 1,0 0))", None, out_format, 1))
+        assert (status, err) == ("written", None)
+        writer = captured["stages"][-1]
+        assert writer["filename"].endswith(f".{out_format}")
+        assert writer.get("compression") == expected
+        # Alles andere ist vom Container unabhaengig - Format, Gitter und CRS-Tag
+        # bleiben in beiden Faellen identisch.
+        assert (writer["minor_version"], writer["dataformat_id"]) == (4, 7)
+        assert writer["scale_x"] == 0.01
+        assert (writer["offset_x"], writer["offset_y"]) == (2713000.0, 1206000.0)
+
+
 def test_las_tile_forwards_gps_time_type(tmp_path):
     """Bit 0 des global_encoding (GPS-Time-Typ) beschreibt, wie die GpsTime-Werte zu
     lesen sind - das ist eine Eigenschaft der Daten. Es wird aus der Quelle uebernommen
@@ -957,79 +1006,357 @@ def test_ln02_copy_shortcut_only_for_finished_tiles():
     assert not runner_mod._ln02_is_already_migrated(dict(
         finished, srs={"json": {"components": [
             {"type": "ProjectedCRS", "id": {"authority": "EPSG", "code": 2056}}]}}))
-# ══════════════════════ Virtual Point Cloud (VPC) fuer QGIS ══════════════════════
+# ══════════════════════ QC-Ansichtsprodukte (COPC / COG) ══════════════════════
 
-def test_vpc_feature_uses_wgs84_for_bbox_and_native_for_proj():
-    """Die entscheidende Eigenschaft der VPC: 'geometry'/'bbox' sind WGS84
-    (STAC-Konvention), die Landeskoordinaten stehen in 'proj:bbox'.
+def _compound_srs_md(h=2056, v=5728):
+    comps = [{"type": "ProjectedCRS", "id": {"authority": "EPSG", "code": h}}]
+    if v:
+        comps.append({"type": "VerticalCRS", "id": {"authority": "EPSG", "code": v}})
+    return {"srs": {"json": {"components": comps}}}
 
-    Das ist kein Formalismus - mit LV95-Werten in 'bbox' laedt QGIS die Ebene OHNE
-    Fehlermeldung, liefert aber einen unendlichen Extent: die Kacheln sind dann
-    unsichtbar und nichts weist darauf hin. Am QGIS-Provider (3.44) nachgemessen."""
+
+def test_qc_copc_untwine_command():
+    """untwine bekommt jede Kachel einzeln (reiner Dateiname, untwine laeuft im
+    Kachelordner), das CRS explizit und einen Temp-Ordner im Staging - nie einen
+    Ordner als Input, der alles darin mitlesen wuerde."""
     runner_mod = _runner()
-
-    native = (2713000.0, 1206000.0, 1000.0, 2714000.0, 1207000.0, 1100.0)
-    ring = [(8.92, 46.99), (8.92, 47.00), (8.94, 47.00), (8.94, 46.99), (8.92, 46.99)]
-    feat = runner_mod._vpc_feature(
-        "2026_G_TIN_raw_2713_1206_LV95_LN02", "../2026_G_TIN_raw_2713_1206_LV95_LN02.laz",
-        4711, native, ring, "PROJCS[\"CH1903+ / LV95\"...]",
-        "application/vnd.laszip", "2026-09-09T10:00:00Z")
-
-    # bbox: horizontal WGS84 aus dem Ring, vertikal unveraendert in Metern
-    assert feat["bbox"] == [8.92, 46.99, 1000.0, 8.94, 47.00, 1100.0]
-    assert feat["geometry"]["coordinates"][0][0] == [8.92, 46.99]
-    # Landeskoordinaten NUR in proj:bbox - niemals in bbox
-    assert feat["properties"]["proj:bbox"] == list(native)
-    assert feat["bbox"][0] != native[0]
-    # Ohne proj:wkt2 lehnt QGIS die Datei ab
-    assert "CH1903+" in feat["properties"]["proj:wkt2"]
-    assert feat["assets"]["data"]["href"].startswith("../")
-    assert feat["properties"]["pc:count"] == 4711
-    # Photogrammetrisch abgeleitet - nicht 'lidar'
-    assert feat["properties"]["pc:type"] == "eopc"
+    cmd = runner_mod._untwine_command(
+        "untwine.exe", ["a_2713_1206_LV95_LN02.laz", "b_2714_1206_LV95_LN02.laz"],
+        "X:/out/copc_QC/x_tmp.copc.laz", "Y:/staging/untwine_tmp", 6,
+        "EPSG:2056+5728")
+    assert cmd[0] == "untwine.exe"
+    assert cmd[cmd.index("-o") + 1] == "X:/out/copc_QC/x_tmp.copc.laz"
+    assert cmd[cmd.index("--a_srs") + 1] == "EPSG:2056+5728"
+    assert cmd[cmd.index("--temp_dir") + 1] == "Y:/staging/untwine_tmp"
+    assert cmd[cmd.index("--threads") + 1] == "6"
+    inputs = [cmd[i + 1] for i, a in enumerate(cmd) if a == "-i"]
+    assert inputs == ["a_2713_1206_LV95_LN02.laz", "b_2714_1206_LV95_LN02.laz"]
 
 
-def test_vpc_document_is_a_feature_collection():
-    """QGIS erwartet eine GeoJSON/STAC-FeatureCollection."""
+def test_qc_copc_validation():
+    """Vollstaendig (Punktanzahl = Summe der Kacheln) und LV95/LN02 - sonst Fehler."""
     runner_mod = _runner()
-    doc = runner_mod._build_vpc([{"type": "Feature"}, {"type": "Feature"}])
-    assert doc["type"] == "FeatureCollection"
-    assert len(doc["features"]) == 2
+    ok = dict(_compound_srs_md(), count=1000)
+    assert runner_mod._validate_copc(ok, 1000) == []
+    assert runner_mod._validate_copc(dict(ok, copc=True), 1000) == []
+    assert "Punktanzahl" in runner_mod._validate_copc(ok, 1001)[0]
+    assert runner_mod._validate_copc(dict(ok, copc=False), 1000)
+    lhn95 = dict(_compound_srs_md(v=5729), count=1000)
+    assert "EPSG:2056+5729" in runner_mod._validate_copc(lhn95, 1000)[0]
+    # Ohne Hoehenbezug (z.B. Tiles aus Tab [LHN95]) - wenn so erwartet, in Ordnung
+    assert runner_mod._validate_copc(dict(_compound_srs_md(v=None), count=5), 5,
+                                     (2056, None)) == []
 
 
-def test_vpc_is_optional_and_never_fails_the_run():
-    """Die VPC ist ein Ansichtsprodukt neben der Lieferung. Ein Fehler beim Schreiben
-    darf den Lauf nicht scheitern lassen - die Kacheln sind das Produkt."""
-    import inspect
+def test_qc_copc_is_placed_only_after_validation(tmp_path, monkeypatch):
+    """Das COPC entsteht als Temp-Datei und kommt erst nach bestandener Pruefung an
+    seinen Platz. Ein alter Stand wird vorher entfernt - eine veraltete Kontrolle
+    soll nie liegen bleiben, auch nicht, wenn der neue Bau scheitert."""
+    import pytest
     runner_mod = _runner()
+    tiles_dir = tmp_path / "tiles"
+    tiles_dir.mkdir()
+    tiles = []
+    for e in (2713, 2714):
+        p = tiles_dir / f"2026_G_TIN_raw_{e}_1206_LV95_LN02.laz"
+        p.write_bytes(b"x")
+        tiles.append(str(p))
+    untwine = tmp_path / "untwine.exe"
+    untwine.write_bytes(b"")
+    run_dir = tmp_path / "staging"
+    run_dir.mkdir()
+    copc_path = str(tiles_dir / "copc_QC" / "2026_G_checkData_LV95_LN02.copc.laz")
+    tmp_copc = copc_path.replace(".copc.laz", "_tmp.copc.laz")
+    calls = {}
 
-    src = inspect.getsource(runner_mod._process_las_ln02)
-    assert "if create_vpc:" in src
-    # Der VPC-Block haengt in einem try/except und meldet nur eine WARNUNG
-    vpc_block = src.split("if create_vpc:", 1)[1].split("Schritt 6", 1)[0]
-    assert "except Exception" in vpc_block
-    assert "WARNUNG" in vpc_block
-    assert "raise" not in vpc_block
+    def fake_untwine(cmd, cwd):
+        calls["cmd"], calls["cwd"] = cmd, cwd
+        with open(cmd[cmd.index("-o") + 1], "wb") as f:
+            f.write(b"copc")
+        return 0, ""
+
+    monkeypatch.setattr(runner_mod, "_collect_tile_facts",
+                        lambda exe, paths, n: (500, [(2056, 5728)]))
+    monkeypatch.setattr(runner_mod, "_run_untwine", fake_untwine)
+    monkeypatch.setattr(runner_mod, "_pdal_info_metadata",
+                        lambda exe, path, driver=None: dict(_compound_srs_md(), count=500))
+
+    n = runner_mod._write_copc(tiles, copc_path, str(untwine), "pdal.exe",
+                                  run_dir, 2, lambda msg: None, crs=(2056, 5728))
+    assert n == 500
+    assert os.path.isfile(copc_path)
+    assert not os.path.exists(tmp_copc)
+    assert calls["cwd"] == str(tiles_dir)
+    assert [calls["cmd"][i + 1] for i, a in enumerate(calls["cmd"]) if a == "-i"] == \
+        [os.path.basename(t) for t in tiles]
+    assert not (run_dir / "untwine_tmp").exists()
+
+    # Unvollstaendig -> Fehler, und weder der alte noch der neue Stand bleibt liegen
+    monkeypatch.setattr(runner_mod, "_pdal_info_metadata",
+                        lambda exe, path, driver=None: dict(_compound_srs_md(), count=499))
+    with pytest.raises(RuntimeError, match="Punktanzahl"):
+        runner_mod._write_copc(tiles, copc_path, str(untwine), "pdal.exe",
+                                  run_dir, 2, lambda msg: None, crs=(2056, 5728))
+    assert not os.path.exists(copc_path)
+    assert not os.path.exists(tmp_copc)
 
 
-def test_vpc_tile_worker_reports_errors_instead_of_raising(monkeypatch):
-    """Eine unlesbare Kachel darf den VPC-Lauf nicht abbrechen, sondern wird als
-    Fehler zurueckgemeldet und uebersprungen."""
+def test_copc_tile_facts_worker_reports_errors_instead_of_raising(monkeypatch):
+    """Eine unlesbare Kachel wird zurueckgemeldet, statt den Worker zu sprengen."""
     runner_mod = _runner()
 
     def boom(exe, path):
         raise RuntimeError("kaputt")
 
     monkeypatch.setattr(runner_mod, "_pdal_info_metadata", boom)
-    res = runner_mod._vpc_tile_worker(("pdal.exe", "x.laz"))
-    assert res[0] == "x.laz"
-    assert res[-1] == "kaputt"
+    assert runner_mod._copc_tile_facts_worker(("pdal.exe", "x.laz")) == \
+        ("x.laz", None, None, None, "kaputt")
+    monkeypatch.setattr(runner_mod, "_pdal_info_metadata",
+                        lambda exe, path: dict(_compound_srs_md(), count=12))
+    assert runner_mod._copc_tile_facts_worker(("pdal.exe", "y.laz")) == \
+        ("y.laz", 12, 2056, 5728, None)
 
-    monkeypatch.setattr(runner_mod, "_pdal_info_metadata", lambda exe, path: {
-        "count": 12, "minx": 1.0, "miny": 2.0, "minz": 3.0,
-        "maxx": 4.0, "maxy": 5.0, "maxz": 6.0})
-    res = runner_mod._vpc_tile_worker(("pdal.exe", "y.laz"))
-    assert res == ("y.laz", 12, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, None)
+
+def test_qc_products_never_fail_the_run():
+    """COPC und COG sind Kontrollen neben der Lieferung: ein Fehler beim Bau gibt eine
+    WARNUNG, der Lauf bleibt erfolgreich - die Kacheln sind das Produkt."""
+    import inspect
+    runner_mod = _runner()
+
+    ln02 = inspect.getsource(runner_mod._process_las_ln02)
+    copc_block = ln02.split("if create_copc:", 1)[1].split("Schritt 6", 1)[0]
+    tiff = inspect.getsource(runner_mod._process)
+    cog_block = tiff.split("if create_cog and written:", 1)[1].split("if not keep_staging", 1)[0]
+    for block in (copc_block, cog_block):
+        assert "except Exception" in block
+        assert "WARNUNG" in block
+        assert "raise" not in block
+    # Die VPC ist ersetzt, nicht nur ausgeblendet
+    assert not hasattr(runner_mod, "_write_vpc")
+    assert "create_vpc" not in ln02
+
+
+def test_cog_creation_options():
+    """Profil wie das Mosaik in topo-COGTIFFconverter. QUALITY nur bei JPEG (auch fuer
+    die Overviews), PREDICTOR=2 nur bei verlustfreier Kompression."""
+    runner_mod = _runner()
+    jpeg = runner_mod._cog_creation_options("JPEG", 85)
+    for o in ("COMPRESS=JPEG", "QUALITY=85", "OVERVIEW_QUALITY=85", "OVERVIEWS=AUTO",
+              "OVERVIEW_RESAMPLING=AVERAGE", "BLOCKSIZE=256", "BIGTIFF=YES"):
+        assert o in jpeg
+    assert not any(o.startswith("PREDICTOR") for o in jpeg)
+
+    deflate = runner_mod._cog_creation_options("deflate", 85)
+    assert "COMPRESS=DEFLATE" in deflate and "PREDICTOR=2" in deflate
+    assert not any(o.startswith("QUALITY") for o in deflate)
+    none = runner_mod._cog_creation_options("NONE")
+    assert not any(o.startswith(("PREDICTOR", "QUALITY")) for o in none)
+
+
+def test_qc_cog_end_to_end(tmp_path):
+    """Echter GDAL-Lauf (nur unter OSGeo4W): 4-Band-Kacheln mit NoData-Rand und einem
+    als Alpha getaggten Band 4 -> COG mit JPEG, interner Maske und NIR als normalem
+    Band, ohne NoData-Tag."""
+    import pytest
+    gdal = pytest.importorskip("osgeo.gdal", reason="GDAL nur unter OSGeo4W verfuegbar")
+    np = pytest.importorskip("numpy")
+    from osgeo import osr
+    gdal.UseExceptions()
+    runner_mod = _runner()
+
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(2056)
+    tiles = []
+    for i, x0 in enumerate((2713000.0, 2713100.0)):
+        p = str(tmp_path / f"2026_G_DOP_10cm_{2713 + i}_1206_LV95.tif")
+        ds = gdal.GetDriverByName("GTiff").Create(p, 1000, 1000, 4, gdal.GDT_Byte,
+                                                   ["PHOTOMETRIC=RGB", "ALPHA=YES"])
+        ds.SetGeoTransform((x0, 0.1, 0, 1207000.0, 0, -0.1))
+        ds.SetProjection(srs.ExportToWkt())
+        for b in range(1, 5):
+            arr = np.full((1000, 1000), 100 + b, dtype=np.uint8)
+            arr[:, :100] = 0          # NoData-Rand links in jeder Kachel
+            band = ds.GetRasterBand(b)
+            band.WriteArray(arr)
+            band.SetNoDataValue(0)
+        ds = None
+        tiles.append(p)
+
+    run_dir = tmp_path / "staging"
+    run_dir.mkdir()
+    cog = str(tmp_path / "cog_QC" / "2026_G_DOP_10cm_checkData_LV95.tif")
+    runner_mod._write_cog_mosaic(tiles, cog, run_dir, lambda m: None, lambda *a: 1,
+                                 compress="JPEG", quality=90, nodata_val=0.0,
+                                 srs="EPSG:2056")
+
+    assert runner_mod._check_cog(cog, 4, "JPEG", True) == []
+    ds = gdal.Open(cog)
+    mask = ds.GetRasterBand(1).GetMaskBand().ReadAsArray()
+    assert mask[:, :100].max() == 0          # Rand ungueltig
+    assert mask[:, 200:900].min() == 255     # Inhalt gueltig
+    assert ds.GetRasterBand(4).GetColorInterpretation() != gdal.GCI_AlphaBand
+    assert ds.GetRasterBand(1).GetNoDataValue() is None
+    ds = None
+    assert not os.path.exists(str(run_dir / "cog_scratch.tif"))
+    assert not os.path.exists(cog.replace(".tif", "_tmp.tif"))
+
+
+# ══════════════════════ Tabs "Create COGTIFF" / "Create COPC" ══════════════════════
+
+def test_copc_crs_from_tiles():
+    """Tab 'Create COPC': das CRS kommt von den Kacheln. Widersprechen sie sich, ist
+    das ein Fehler; traegt keine eines, wird EPSG:2056 mit Warnung gesetzt."""
+    import pytest
+    runner_mod = _runner()
+    logged = []
+    assert runner_mod._copc_crs_from_tiles([(2056, 5728)], logged.append) == (2056, 5728)
+    assert runner_mod._copc_crs_from_tiles([(2056, None)], logged.append) == (2056, None)
+    assert not logged
+    assert runner_mod._copc_crs_from_tiles([(None, None)], logged.append) == (2056, None)
+    assert "WARNUNG" in logged[-1]
+    assert runner_mod._copc_crs_from_tiles([(2056, 5728), (None, None)],
+                                           logged.append) == (2056, 5728)
+    with pytest.raises(ValueError, match="verschiedene CRS"):
+        runner_mod._copc_crs_from_tiles([(2056, 5728), (2056, 5729)], logged.append)
+    assert runner_mod._fmt_crs(2056, 5728) == "EPSG:2056+5728"
+    assert runner_mod._fmt_crs(2056) == "EPSG:2056"
+
+
+def test_write_copc_takes_crs_from_tiles(tmp_path, monkeypatch):
+    """Ohne Vorgabe bekommt untwine das CRS der Kacheln explizit, und die Pruefung
+    erwartet genau dieses - hier LV95 ohne Hoehenbezug (z.B. Tiles aus Tab [LHN95])."""
+    runner_mod = _runner()
+    tile = tmp_path / "a.laz"
+    tile.write_bytes(b"x")
+    untwine = tmp_path / "untwine.exe"
+    untwine.write_bytes(b"")
+    calls = {}
+
+    def fake_untwine(cmd, cwd):
+        calls["cmd"] = cmd
+        with open(cmd[cmd.index("-o") + 1], "wb") as f:
+            f.write(b"copc")
+        return 0, ""
+
+    monkeypatch.setattr(runner_mod, "_collect_tile_facts",
+                        lambda exe, paths, n: (10, [(2056, None)]))
+    monkeypatch.setattr(runner_mod, "_run_untwine", fake_untwine)
+    monkeypatch.setattr(runner_mod, "_pdal_info_metadata",
+                        lambda exe, path, driver=None: dict(_compound_srs_md(v=None), count=10))
+    out = str(tmp_path / "out" / "x.copc.laz")
+    assert runner_mod._write_copc([str(tile)], out, str(untwine), "pdal.exe",
+                                  tmp_path, 1, lambda m: None) == 10
+    assert calls["cmd"][calls["cmd"].index("--a_srs") + 1] == "EPSG:2056"
+    assert os.path.isfile(out)
+
+
+def test_create_copc_excludes_output_from_inputs(tmp_path, monkeypatch):
+    """Liegt die Ausgabe im Input-Ordner, darf ein alter Stand (und seine Temp-Datei)
+    nicht wieder ins neue COPC eingehen. Das CRS bleibt 'von den Kacheln'."""
+    runner_mod = _runner()
+    src = tmp_path / "tiles"
+    src.mkdir()
+    for name in ("a.laz", "b.las", "out.copc.laz", "out_tmp.copc.laz"):
+        (src / name).write_bytes(b"x")
+    pdal = tmp_path / "pdal.exe"
+    pdal.write_bytes(b"")
+    captured = {}
+
+    def fake_write_copc(tiles, copc_path, untwine_exe, pdal_exe, run_dir, n, log, crs=None):
+        captured["tiles"], captured["crs"] = tiles, crs
+        with open(copc_path, "wb") as f:
+            f.write(b"copc")
+        return 1
+
+    monkeypatch.setattr(runner_mod, "_write_copc", fake_write_copc)
+    staging = tmp_path / "staging"
+    runner_mod._create_copc({
+        "input_dir": str(src), "output_path": str(src / "out.copc.laz"),
+        "untwine_exe": "untwine.exe", "pdal_exe": str(pdal),
+        "staging_dir": str(staging), "num_workers": 1, "keep_staging": False})
+    assert [os.path.basename(t) for t in captured["tiles"]] == ["a.laz", "b.las"]
+    assert captured["crs"] is None
+    assert not any(staging.iterdir())          # Staging aufgeraeumt
+
+
+def _fake_osgeo(monkeypatch):
+    """Minimales 'osgeo'-Modul, damit Runner-Funktionen mit 'from osgeo import gdal'
+    ohne OSGeo4W testbar sind (die GDAL-Arbeit selbst ist dann gemockt)."""
+    import sys
+    import types
+    osgeo = types.ModuleType("osgeo")
+    osgeo.gdal = types.SimpleNamespace(UseExceptions=lambda: None)
+    monkeypatch.setitem(sys.modules, "osgeo", osgeo)
+
+
+def test_create_cog_excludes_output_and_passes_settings(tmp_path, monkeypatch):
+    """Tab 'Create COGTIFF': Bandauswahl, Kompression, Qualitaet, NoData und CRS gehen
+    an die Mosaik-Funktion; eine Ausgabe im Input-Ordner wird nicht mitgemosaikt."""
+    import pytest
+    runner_mod = _runner()
+    _fake_osgeo(monkeypatch)
+    src = tmp_path / "tiles"
+    src.mkdir()
+    for name in ("t1.tif", "t2.tiff", "mosaik.tif", "mosaik_tmp.tif"):
+        (src / name).write_bytes(b"x")
+    captured = {}
+
+    def fake_mosaic(tiles, cog_path, work_dir, log, progress, **kw):
+        captured["tiles"], captured["kw"] = tiles, kw
+        with open(cog_path, "wb") as f:
+            f.write(b"cog")
+
+    monkeypatch.setattr(runner_mod, "_first_tile_raster_facts", lambda p: ("Byte", 0.0))
+    monkeypatch.setattr(runner_mod, "_resolve_tiles_srs", lambda tiles, log: "EPSG:2056")
+    monkeypatch.setattr(runner_mod, "_write_cog_mosaic", fake_mosaic)
+    cfg = {"input_dir": str(src), "output_path": str(src / "mosaik.tif"),
+           "band_mode": "rgb", "compress": "JPEG", "quality": 85,
+           "staging_dir": str(tmp_path / "staging"), "keep_staging": False}
+    runner_mod._create_cog(cfg)
+    assert [os.path.basename(t) for t in captured["tiles"]] == ["t1.tif", "t2.tiff"]
+    assert captured["kw"] == {"band_mode": "rgb", "compress": "JPEG", "quality": 85,
+                              "nodata_val": 0.0, "srs": "EPSG:2056"}
+
+    # JPEG geht nur mit 8 bit - klare Meldung statt eines GDAL-Fehlers mitten im Lauf
+    monkeypatch.setattr(runner_mod, "_first_tile_raster_facts", lambda p: ("UInt16", None))
+    with pytest.raises(ValueError, match="8-bit"):
+        runner_mod._create_cog(cfg)
+
+
+def test_cog_and_copc_tabs():
+    """Die beiden eigenstaendigen Tabs: Defaults, JPEG-Qualitaet nur bei JPEG,
+    Bandauswahl gesperrt bei 3-Band-Input, Ausgabenamen mit richtiger Endung."""
+    gui_mod = load_module_from_path(
+        "gui_module", os.path.join(PROJECT_ROOT, "GUI_DMCdataConverter.py"))
+    assert gui_mod._normalize_cog_path("X:/a/mosaik") == "X:/a/mosaik.tif"
+    assert gui_mod._normalize_cog_path("X:/a/mosaik.TIF") == "X:/a/mosaik.TIF"
+    assert gui_mod._normalize_copc_path("X:/a/wolke") == "X:/a/wolke.copc.laz"
+    assert gui_mod._normalize_copc_path("X:/a/wolke.laz") == "X:/a/wolke.copc.laz"
+    assert gui_mod._normalize_copc_path("X:/a/wolke.copc.laz") == "X:/a/wolke.copc.laz"
+
+    app = gui_mod.DMCConverterApp()
+    try:
+        tabs = [app._notebook.tab(i, "text") for i in range(app._notebook.index("end"))]
+        assert tabs[-2:] == ["Create COGTIFF", "Create COPC"]
+        # Jede Scroll-Flaeche ist registriert (Theming + Mausrad), auch die des DSM-Tabs
+        assert len(app._scroll_areas) == len(tabs)
+        assert app._canvas_for_widget(app._sf_dsm) is app._canvas_dsm
+
+        assert app._cog_compress_var.get() == "JPEG"
+        assert app._cog_quality_var.get() == "90"
+        assert str(app._cog_quality_entry.cget("state")) == "normal"
+        app._cog_compress_var.set("DEFLATE")
+        assert str(app._cog_quality_entry.cget("state")) == "disabled"
+
+        app._apply_band_availability(3, app._cog_band_combo, app._cog_band_var,
+                                     app._cog_band_hint_lbl)
+        assert str(app._cog_band_combo.cget("state")) == "disabled"
+        assert app._cog_band_var.get() == gui_mod.BAND_KEEP
+        assert str(app._band_combo.cget("state")) == "readonly"   # TIFF-Tab unberuehrt
+    finally:
+        app.destroy()
+
+
 # ══════════════════════ Tab "Create DSM-Raster" ══════════════════════
 
 def test_dsm_action_available():
