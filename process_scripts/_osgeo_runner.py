@@ -2819,13 +2819,14 @@ def _copc_crs_from_tiles(crs_list: list, log) -> tuple:
 
 
 def _untwine_command(untwine_exe: str, tile_names: list, out_path: str,
-                     temp_dir: str, threads: int, a_srs: str) -> list:
+                     temp_dir: str, a_srs: str) -> list:
     """Kommandozeile fuer untwine. Jede Kachel einzeln per '-i' und als reiner
     Dateiname (untwine laeuft im Kachelordner): ein Ordner als Input wuerde alles
     darin einlesen, und kurze Namen halten die Zeile unter dem Windows-Limit.
-    Das CRS wird explizit gesetzt."""
-    cmd = [untwine_exe, "-o", out_path, "--a_srs", a_srs,
-           "--temp_dir", temp_dir, "--threads", str(int(threads))]
+    Das CRS wird explizit gesetzt. Kein '--threads': das untwine von QGIS 3.42 kennt
+    die Option nicht und bricht ab ("Unexpected argument 'threads'"), erst neuere
+    Versionen haben sie - die Thread-Zahl waehlt untwine selbst."""
+    cmd = [untwine_exe, "-o", out_path, "--a_srs", a_srs, "--temp_dir", temp_dir]
     for name in tile_names:
         cmd += ["-i", name]
     return cmd
@@ -2908,8 +2909,7 @@ def _write_copc(tile_paths: list, copc_path: str, untwine_exe: str, pdal_exe: st
     t0 = time.time()
     try:
         code, output = _run_untwine(
-            _untwine_command(untwine_exe, names, tmp_path, str(temp_dir), num_workers,
-                             a_srs),
+            _untwine_command(untwine_exe, names, tmp_path, str(temp_dir), a_srs),
             tile_dir)
         if code != 0 or not os.path.isfile(tmp_path):
             tail = "\n    ".join(output.strip().splitlines()[-10:])

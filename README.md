@@ -684,7 +684,8 @@ im Tab [LN02].
    mitgemerged (Warnung im Log); die Ausgabedatei selbst ist immer ausgenommen.
 2. **Output-Datei**: vollständiger Pfad inklusive Dateiname, muss auf `.copc.laz` enden — `.laz`
    wird zu `.copc.laz`, sonst wird ergänzt.
-3. **Staging & CPU-Kerne**: Temp-Dateien und Threads von untwine, parallele Header-Prüfung.
+3. **Staging & CPU-Kerne**: Temp-Dateien von untwine, parallele Header-Prüfung. Die Thread-Zahl
+   wählt untwine selbst — das untwine von QGIS 3.42 kennt `--threads` nicht und bricht damit ab.
 
 **CRS**: von den Kacheln übernommen — horizontal und, falls getaggt, vertikal (z.B.
 `EPSG:2056+5728` für Kacheln aus Tab [LN02], `EPSG:2056` für die aus Tab [LHN95]) — und untwine

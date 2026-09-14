@@ -1022,13 +1022,18 @@ def test_qc_copc_untwine_command():
     runner_mod = _runner()
     cmd = runner_mod._untwine_command(
         "untwine.exe", ["a_2713_1206_LV95_LN02.laz", "b_2714_1206_LV95_LN02.laz"],
-        "X:/out/copc_QC/x_tmp.copc.laz", "Y:/staging/untwine_tmp", 6,
-        "EPSG:2056+5728")
+        "X:/out/copc_QC/x_tmp.copc.laz", "Y:/staging/untwine_tmp", "EPSG:2056+5728")
     assert cmd[0] == "untwine.exe"
     assert cmd[cmd.index("-o") + 1] == "X:/out/copc_QC/x_tmp.copc.laz"
     assert cmd[cmd.index("--a_srs") + 1] == "EPSG:2056+5728"
     assert cmd[cmd.index("--temp_dir") + 1] == "Y:/staging/untwine_tmp"
-    assert cmd[cmd.index("--threads") + 1] == "6"
+    # Nur Optionen, die das untwine von QGIS 3.42 kennt (external/untwine, addArgs).
+    # '--threads' gibt es erst in neueren Versionen - 3.42 bricht damit ab
+    # ("Unexpected argument 'threads'", so in der Firmenumgebung aufgetreten).
+    qgis342 = {"o", "output_dir", "output_file", "i", "files", "s", "single_file",
+               "temp_dir", "cube", "level", "file_limit", "progress_fd", "progress_debug",
+               "dims", "stats", "a_srs", "metadata", "no_srs"}
+    assert {a.lstrip("-") for a in cmd[1:] if a.startswith("-")} <= qgis342
     inputs = [cmd[i + 1] for i, a in enumerate(cmd) if a == "-i"]
     assert inputs == ["a_2713_1206_LV95_LN02.laz", "b_2714_1206_LV95_LN02.laz"]
 
