@@ -754,9 +754,13 @@ JSON-Pipelines — orchestriert vom selben OSGeo4W-Python-Prozess.
   (wird automatisch erkannt, kein eigenes GUI-Feld). Entwickelt gegen PDAL 2.8 — beim ersten
   Lauf lohnt sich ein Blick ins Log auf die "Pixelraster-Check"-Zeile beim Raster-Build
   (prueft, ob `writers.gdal` die angeforderten `bounds` in dieser PDAL-Version unterstuetzt).
-- **COPC (QC-Option im Tab [LN02], Tab „Create COPC"):** `untwine.exe` (Hobu) — liegt normalerweise im
-  `bin`-Ordner der QGIS-Installation und wird wie `pdal.exe` automatisch gesucht (PATH,
-  OSGeo4W, QGIS-Installationen). Fehlt es, meldet das GUI das vor dem Start.
+- **COPC (QC-Option im Tab [LN02], Tab „Create COPC"):** `untwine.exe` (Hobu) — liegt QGIS bei,
+  bei QGIS 3.42 unter `apps\qgis\untwine.exe` (nicht in `bin`). Wird wie `pdal.exe` automatisch
+  gesucht (PATH, OSGeo4W, QGIS-Installationen, je `bin`, `apps\qgis*\bin` und `apps\qgis*`).
+  Seine DLLs (PDAL, GDAL, PROJ) liegen in `<QGIS>\bin` — diesen Ordner setzt das Tool beim
+  Aufruf vorne in den `PATH`, wie es QGIS beim eigenen Start tut. Fehlt untwine, meldet das GUI
+  das vor dem Start. Steht im Log `Exit-Code 3221225781 (DLL nicht gefunden)` (= `0xC0000135`),
+  ist untwine gar nicht gestartet — dann fehlen DLLs, die nicht in `<QGIS>\bin` liegen.
 - **Arbeitsspeicher:** `filters.merge`/`filters.sample` halten die Punkte im RAM. Deshalb wird
   bewusst zellweise gerechnet statt einmal ueber das ganze Projekt — ein Gesamt-Merge ueber
   >1000 Input-Kacheln laesst `pdal.exe` hart abstuerzen (Windows-Exitcode `3221226505` =

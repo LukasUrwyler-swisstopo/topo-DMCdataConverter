@@ -113,7 +113,7 @@ def _detect_osgeo_python() -> str:
 def _detect_osgeo_exe(name: str, osgeo_python: str = "") -> str:
     """Sucht ein Kommandozeilen-Werkzeug aus dem OSGeo4W-/QGIS-Umfeld: PATH, neben dem
     OSGeo4W-Python, dann OSGEO4W_ROOT, Standard-OSGeo4W und QGIS-Installationen (je
-    'bin' und 'apps/qgis*/bin'). Kein eigenes Config-/GUI-Feld."""
+    'bin', 'apps/qgis*/bin' und 'apps/qgis*'). Kein eigenes Config-/GUI-Feld."""
     import shutil as _shutil
     found = _shutil.which(name)
     if found:
@@ -135,6 +135,9 @@ def _detect_osgeo_exe(name: str, osgeo_python: str = "") -> str:
         kandidaten.append(str(Path(root) / "bin" / exe))
         kandidaten.extend(sorted(_glob.glob(str(Path(root) / "apps" / "qgis*" / "bin" / exe)),
                                  reverse=True))
+        # QGIS legt seine Hilfsprogramme (untwine, pdal_wrench) direkt in apps\qgis* ab
+        kandidaten.extend(sorted(_glob.glob(str(Path(root) / "apps" / "qgis*" / exe)),
+                                 reverse=True))
 
     return next((p for p in kandidaten if Path(p).is_file()), "")
 
@@ -145,8 +148,8 @@ def _detect_pdal_exe(osgeo_python: str = "") -> str:
 
 
 def _detect_untwine_exe(osgeo_python: str = "") -> str:
-    """Pfad zur untwine.exe (Hobu) - baut das QC-COPC im Tab [LN02]. Liegt
-    normalerweise im bin-Ordner der QGIS-Installation."""
+    """Pfad zur untwine.exe (Hobu) - baut das QC-COPC im Tab [LN02]. Liegt in der
+    QGIS-Installation, bei QGIS 3.42 unter 'apps\\qgis\\untwine.exe'."""
     return _detect_osgeo_exe("untwine", osgeo_python)
 
 
@@ -1713,8 +1716,8 @@ class DMCConverterApp(tk.Tk):
                           "Bitte pdal (Teil von OSGeo4W/QGIS) zum System-PATH hinzufuegen.")
         if not self._untwine_exe or not os.path.isfile(self._untwine_exe):
             errors.append("untwine.exe wurde nicht gefunden (baut das COPC).\n"
-                          "Liegt normalerweise im bin-Ordner der QGIS-Installation - diesen "
-                          "zum System-PATH hinzufuegen.")
+                          "Liegt in der QGIS-Installation (QGIS 3.42: apps\\qgis). Gesucht wird "
+                          "im System-PATH, in OSGeo4W und unter C:\\Program Files\\QGIS*.")
         in_dir = self._copc_in_var.get().strip()
         if not in_dir:
             errors.append("Input-Ordner fehlt.")
@@ -2815,8 +2818,9 @@ class DMCConverterApp(tk.Tk):
                 not self._untwine_exe or not os.path.isfile(self._untwine_exe)):
             errors.append(
                 "untwine.exe wurde nicht gefunden (wird fuer 'Create COPC' gebraucht).\n"
-                "Liegt normalerweise im bin-Ordner der QGIS-Installation - diesen zum "
-                "System-PATH hinzufuegen oder die Option abwaehlen.")
+                "Liegt in der QGIS-Installation (QGIS 3.42: apps\\qgis). Gesucht wird im "
+                "System-PATH, in OSGeo4W und unter C:\\Program Files\\QGIS* - sonst die "
+                "Option abwaehlen.")
 
         jahr = self._ln02_jahr_var.get().strip()
         if not jahr or not jahr.isdigit():

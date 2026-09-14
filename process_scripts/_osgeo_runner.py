@@ -2830,9 +2830,22 @@ def _untwine_command(untwine_exe: str, tile_names: list, out_path: str,
     return cmd
 
 
+def _untwine_env(untwine_exe: str) -> dict:
+    """Umgebung fuer untwine. QGIS legt untwine in '<root>\\apps\\qgis' ab, seine DLLs
+    (PDAL, GDAL, PROJ) aber in '<root>\\bin'. Windows sucht DLLs neben der exe und im
+    PATH - und diesen PATH setzt QGIS nur beim eigenen Start. Liegt die exe unter einem
+    'apps'-Ordner, kommt deshalb '<root>\\bin' vorne in den PATH."""
+    env = os.environ.copy()
+    exe = Path(os.path.abspath(untwine_exe))
+    apps = next((p for p in exe.parents if p.name.lower() == "apps"), None)
+    if apps is not None and (apps.parent / "bin").is_dir():
+        env["PATH"] = str(apps.parent / "bin") + os.pathsep + env.get("PATH", "")
+    return env
+
+
 def _run_untwine(cmd: list, cwd: str) -> tuple:
     """Fuehrt untwine aus. Rueckgabe: (Exit-Code, zusammengefasste Ausgabe)."""
-    result = subprocess.run(cmd, cwd=cwd, stdout=subprocess.PIPE,
+    result = subprocess.run(cmd, cwd=cwd, env=_untwine_env(cmd[0]), stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, universal_newlines=True)
     return result.returncode, result.stdout or ""
 
@@ -2866,8 +2879,8 @@ def _write_copc(tile_paths: list, copc_path: str, untwine_exe: str, pdal_exe: st
     Platz geschoben wird. Ein alter Stand wird vorher entfernt: eine veraltete Datei
     soll nie liegen bleiben. Wirft bei jedem Problem."""
     if not untwine_exe or not os.path.isfile(untwine_exe):
-        raise FileNotFoundError("untwine.exe nicht gefunden (liegt normalerweise im "
-                                "bin-Ordner der QGIS-Installation)")
+        raise FileNotFoundError("untwine.exe nicht gefunden (liegt in der QGIS-Installation, "
+                                "bei QGIS 3.42 unter apps\\qgis)")
     tile_dir = os.path.dirname(os.path.abspath(tile_paths[0]))
     names = [os.path.basename(f) for f in tile_paths]
     if any(os.path.dirname(os.path.abspath(f)) != tile_dir for f in tile_paths):
@@ -2899,7 +2912,10 @@ def _write_copc(tile_paths: list, copc_path: str, untwine_exe: str, pdal_exe: st
             tile_dir)
         if code != 0 or not os.path.isfile(tmp_path):
             tail = "\n    ".join(output.strip().splitlines()[-10:])
-            raise RuntimeError(f"untwine beendet mit Exit-Code {code}"
+            # 0xC0000135 = STATUS_DLL_NOT_FOUND: untwine ist gar nicht gestartet, seine
+            # DLLs aus dem QGIS-bin-Ordner fehlen (siehe _untwine_env)
+            hint = " (DLL nicht gefunden)" if code == 0xC0000135 else ""
+            raise RuntimeError(f"untwine beendet mit Exit-Code {code}{hint}"
                                + (f":\n    {tail}" if tail else ""))
         md = _pdal_info_metadata(pdal_exe, tmp_path, driver="readers.las")
         problems = _validate_copc(md, expected, crs)

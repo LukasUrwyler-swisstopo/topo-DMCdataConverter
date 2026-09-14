@@ -1033,6 +1033,34 @@ def test_qc_copc_untwine_command():
     assert inputs == ["a_2713_1206_LV95_LN02.laz", "b_2714_1206_LV95_LN02.laz"]
 
 
+def test_detect_untwine_in_qgis_apps(tmp_path, monkeypatch):
+    """QGIS 3.42 legt untwine direkt in <root>\\apps\\qgis ab, nicht in bin (so in der
+    Firmenumgebung vorgefunden) - die Suche muss es dort finden."""
+    gui_mod = load_module_from_path(
+        "gui_module",
+        os.path.join(PROJECT_ROOT, "GUI_DMCdataConverter.py"),
+    )
+    exe = tmp_path / "apps" / "qgis" / "untwine.exe"
+    exe.parent.mkdir(parents=True)
+    exe.write_bytes(b"")
+    monkeypatch.setattr("shutil.which", lambda *a, **k: None)
+    monkeypatch.setenv("OSGEO4W_ROOT", str(tmp_path))
+    found = gui_mod._detect_untwine_exe("")
+    assert os.path.normcase(found) == os.path.normcase(str(exe))
+
+
+def test_untwine_env_puts_qgis_bin_on_path(tmp_path, monkeypatch):
+    """untwine aus <root>\\apps\\qgis braucht die DLLs aus <root>\\bin - der Ordner kommt
+    vorne in den PATH. Liegt untwine selbst in bin, bleibt der PATH unveraendert."""
+    runner_mod = _runner()
+    (tmp_path / "bin").mkdir()
+    monkeypatch.setenv("PATH", r"C:\Windows")
+    env = runner_mod._untwine_env(str(tmp_path / "apps" / "qgis" / "untwine.exe"))
+    assert env["PATH"].split(os.pathsep) == [str(tmp_path / "bin"), r"C:\Windows"]
+    env = runner_mod._untwine_env(str(tmp_path / "bin" / "untwine.exe"))
+    assert env["PATH"] == r"C:\Windows"
+
+
 def test_qc_copc_validation():
     """Vollstaendig (Punktanzahl = Summe der Kacheln) und LV95/LN02 - sonst Fehler."""
     runner_mod = _runner()
