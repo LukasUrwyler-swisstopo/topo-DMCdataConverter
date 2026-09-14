@@ -24,7 +24,7 @@ ueber die Schaltflaeche **Aendern…** manuell gesetzt werden und wird in
 |---|---|---|---|
 | **DMC - TIFFconverter** | technische 200m-DOP-Kacheln (`.tif`), meist 4-Band RGBN | Mosaik → optionaler Bandauszug (RGB / NRG) → Clip auf die gültige Fläche → Zuschnitt ins 1km-Grid | 1km-DOP-Kacheln (`.tif`)<br>4-Band RGBN (Standard) oder 3-Band RGB / NRG<br>optional QC-Mosaik der AOI (COG) |
 | **DMC - LASconverter [LHN95]** | technische 200m-Punktwolken (`.laz`) | Kacheln je Gitterzelle mergen → Crop auf Zelle + AOI → optional ausdünnen | 1km-Kacheln `…_LV95_LHN95.las` (LAS 1.4 / PF7, mit RGB; `.laz` wählbar)<br>optional DSM + Hillshade |
-| **DMC - LASconverter [LN02]** | die von GeoSuite nach LN02 reframten 1km-Kacheln (`.laz` oder `.las`) | requantisieren → CRS-VLRs byte-exakt injizieren → vollständig validieren | 1km-Kacheln `…_LV95_LN02.laz` (GDWH-tauglich)<br>optional QC-COPC der AOI, DSM + Hillshade |
+| **DMC - LASconverter [LN02]** | die von GeoSuite nach LN02 reframten 1km-Kacheln (`.laz` oder `.las`) | requantisieren → CRS-VLRs byte-exakt injizieren → vollständig validieren | 1km-Kacheln `…_LV95_LN02.laz` (GDWH-tauglich, LAS 1.4 / PF7 mit RGB)<br>optional QC-COPC der AOI, DSM + Hillshade |
 | **Create DSM-Raster** | beliebiger Ordner mit `.las`/`.laz` | zellweise IDW-Rasterung → mosaikieren → Löcher füllen → AOI-Maske → Hillshade | ein DSM + ein Hillshade (`.tif` + `.tfw`) |
 | **Create COGTIFF** | beliebiger Ordner mit `.tif`-Kacheln (+ `.tfw`) | VRT-Mosaik → optionaler Bandauszug (RGB / NRG) → COG → Prüfung | ein COGTIFF (Name frei wählbar) |
 | **Create COPC** | beliebiger Ordner mit `.las`/`.laz`-Kacheln | Merge via untwine → Prüfung | ein COPC `….copc.laz` (Name frei wählbar) |
@@ -44,7 +44,10 @@ technische 200m-LAZ  (RealityStudio)
 …_LV95_LN02.las
       │
       ▼   Tab [LN02]         GDWH-Header · CRS-VLRs · Validierung
-…_LV95_LN02.laz              →  Lieferung
+…_LV95_LN02.laz              LAS 1.4 / PF7, mit RGB  →  Lieferung
+      │
+      ▼   topo-importDATAtoGDWH-STAC   ←  ausserhalb dieses Tools, dort CameraSystem „Leica DMC-4“
+GDWH / STAC                  PF7 mit RGB  (fertige Kacheln werden dort nur kopiert)
 ```
 
 Das DOP läuft unabhängig davon über den **TIFFconverter**. **Create DSM-Raster** ist ein Zusatz,
@@ -298,9 +301,10 @@ als `.las` oder `.laz` geschrieben wird, entscheidet sich rein an der Dateiendun
 
   **PF7 traegt die Farbe durch die ganze Kette.** Die DMC-Quelldaten aus Reality Studio sind PF2
   (RGB vorhanden, `GpsTime` nicht); PF7 ist PF6 + RGB und behaelt die Farbwerte, GeoSuite/REFRAME
-  reicht sie durch, der Tab [LN02] uebernimmt sie unveraendert ins GDWH-Produkt. Fuehrt die
-  Quelle gar keine Farbe, steht das als Warnung im Log — die Kacheln werden trotzdem PF7
-  geschrieben, ihre RGB-Felder bleiben dann 0.
+  reicht sie durch, der Tab [LN02] uebernimmt sie unveraendert, und der GDWH-Import behaelt sie
+  (dort `CameraSystem` = `Leica DMC-4` waehlen, siehe „GDWH-Import" im Abschnitt [LN02]). Fuehrt
+  die Quelle gar keine Farbe, steht das als Warnung im Log — die Kacheln werden trotzdem PF7
+  geschrieben, ihre RGB-Felder bleiben dann 0 (der GDWH-Import macht daraus PF6).
 
   Der Offset wird bewusst aus dem **Dateinamen** bestimmt (Kachelursprung), nicht aus dem
   Datenminimum: der Tab [LN02] macht es genauso, damit liegt die Zwischenstufe schon auf dem
@@ -446,10 +450,12 @@ wenn eine angeforderte Dimension nicht existiert.
 > Time*, weil die Kachel strukturkongruent zu swissSURFACE3D bleiben soll. Der Typ beschreibt
 > damit ein leeres Feld; das ist bewusst so und im Code an der Warnlogik dokumentiert.
 
-> **Flussabwärts beachten:** `4_SB_DSM_PUNKTWOLKE_LAS14upgrade.py` im Projekt
-> `topo-importDATAtoGDWH-STAC` validiert auf `dataformat_id == 6` und würde eine PF7-Kachel
-> **still auf PF6 zurückdrehen** — die Farbe wäre dann doch wieder weg. Dort braucht es ein
-> zweites Zielprofil, sonst endet die Kette wieder farblos.
+> **GDWH-Import (flussabwärts):** Im Projekt `topo-importDATAtoGDWH-STAC` muss beim Import als
+> `CameraSystem` **`Leica DMC-4`** gewählt sein. Dann erkennt `4_SB_DSM_PUNKTWOLKE_LAS14upgrade.py`
+> die Kacheln als fertig (LAS 1.4 / PF7, CRS-Tag, `global_encoding` 17) und kopiert sie 1:1 — die
+> Farbe kommt ins GDWH-Produkt. Kacheln ohne RGB-Werte (nur Nullen) werden dort PF6. Ist
+> fälschlich ADS gewählt, bricht der Import bei Kacheln mit RGB-Werten ab, statt die Farbe
+> still zu verwerfen.
 
 ### QC-COPC — die ganze AOI als eine Punktwolke (nur zur Kontrolle)
 

@@ -115,10 +115,11 @@ LAS_INPUT_SRS = "EPSG:2056+5729"
 # Identisch zu SB_DSM_PUNKTWOLKE (Projekt topo-importDATAtoGDWH-STAC, Skript
 # 4_SB_DSM_PUNKTWOLKE_LAS14upgrade.py), damit die DMC-Punktwolken strukturell
 # kongruent zu swissSURFACE3D sind und in den GDWH importiert werden koennen.
-# Abweichung zu SB_DSM_PUNKTWOLKE/swissSURFACE3D: dort PF6, hier PF7 (= PF6 + RGB,
-# 36 statt 30 Byte). Die DMC-Daten fuehren Farbe, und sie soll bis ins GDWH-Produkt
-# erhalten bleiben. Alles Uebrige (Version, global_encoding, header_size, scale,
-# CRS-VLRs) ist identisch zur etablierten Lieferkette.
+# Abweichung zu swissSURFACE3D: dort PF6, hier PF7 (= PF6 + RGB, 36 statt 30 Byte).
+# Die DMC-Daten fuehren Farbe, und sie soll bis ins GDWH-Produkt erhalten bleiben:
+# Script 4 im Import-Projekt laesst PF7 bei CameraSystem "Leica DMC-4" durch und
+# kopiert fertige Kacheln nur. Alles Uebrige (Version, global_encoding, header_size,
+# scale, CRS-VLRs) ist identisch zur etablierten Lieferkette.
 #
 # Die von PF6/PF7 verlangte GpsTime bleibt leer: die Quelle ist PF2 und fuehrt gar
 # keine GPS-Zeit (photogrammetrisch abgeleitete Punkte haben keinen Zeitstempel).
