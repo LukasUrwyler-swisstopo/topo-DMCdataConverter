@@ -1864,8 +1864,8 @@ class DMCConverterApp(tk.Tk):
         self._nodata_var = tk.StringVar(value=NODATA_DEFAULT)
         ttk.Combobox(sec, textvariable=self._nodata_var, values=NODATA_CHOICES, width=16
                      ).grid(row=5, column=1, sticky="w", padx=(8, 0), pady=(8, 3))
-        h_nd = ttk.Label(sec, text="derselbe Wert in allen Baendern (NoData-Tag der Kacheln)\n"
-                                   "Clip ausserhalb  |  Maske des QC-COG (Flag PER_DATASET)",
+        h_nd = ttk.Label(sec, text="derselbe Wert in allen Baendern (NoData-Tag der Kacheln, wirkt pro Band)\n"
+                                   "Clip ausserhalb  |  QC-COG-Maske: ein Band NoData -> Pixel ungueltig",
                           font=("", 8), justify="left")
         h_nd.grid(row=6, column=1, columnspan=2, sticky="w", padx=(8, 0))
         self._dim_labels.append(h_nd)
@@ -1881,7 +1881,7 @@ class DMCConverterApp(tk.Tk):
         self._cog_quality_var = tk.StringVar(value="90")
         ttk.Entry(self._cog_frame, textvariable=self._cog_quality_var, width=6
                    ).pack(side="left", padx=(8, 8))
-        h_cog = ttk.Label(self._cog_frame, text="% (1-100)  |  Maske aus den NoData-Werten, ohne Randsaeume",
+        h_cog = ttk.Label(self._cog_frame, text="% (1-100)  |  NoData wie die Tiles, ohne Randsaeume",
                            font=("", 8))
         h_cog.pack(side="left")
         self._dim_labels.append(h_cog)

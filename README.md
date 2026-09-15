@@ -185,13 +185,19 @@ selbst aus den verlustfreien Kacheln.
 | Kompression | JPEG, Qualität aus dem GUI (Default 90 %), auch für die Overviews | klein genug zum Durchsehen; die Kacheln selbst bleiben verlustfrei |
 | Overviews | `AUTO`, Resampling `AVERAGE` | ruhige Übersichten beim Herauszoomen |
 | Blockgrösse | 256 | wie das Mosaik in `topo-COGTIFFconverter` |
-| NoData | **interne Maske** (Flag `PER_DATASET`) aus den **NoData-Werten** (Punkt 3), kein NoData-Tag | JPEG verändert die 0-Werte am Rand, ein NoData-Wert gäbe schwarze Säume; die 1-bit-Maske bleibt verlustfrei |
+| NoData | **interne Maske** (Flag `PER_DATASET`) aus den **NoData-Werten** (Punkt 3): ungültig, sobald **ein** Band den Wert trägt; kein NoData-Tag | zeigt die Löcher der Kacheln so, wie QGIS sie darstellt; JPEG verändert die 0-Werte, ein NoData-Tag gäbe schwarze Säume und falsche Löcher — die 1-bit-Maske bleibt verlustfrei |
 | Band 4 (NIR) | als „undefiniert" deklariert | ein als Alpha markiertes Band 4 würde der COG-Treiber bei JPEG in eine Maske umwandeln (NIR weg), und QGIS zeigte das Bild halbtransparent |
 
 Die Maske entsteht zweistufig und blockweise wie in `topo-COGTIFFconverter`: VRT über die fertigen
-Kacheln → Zwischenraster (LZW) im Staging → Maske (ungültig nur, wenn **alle** Bänder den
-NoData-Wert tragen — eine dunkle Stelle mit 0 in nur einem Band bleibt sichtbar) → COG. So bleibt
-der Speicherbedarf auch bei grossen AOIs klein. Vor dem Ablegen wird das Ergebnis geprüft
+Kacheln → Zwischenraster (LZW) im Staging → Maske → COG. So bleibt der Speicherbedarf auch bei
+grossen AOIs klein.
+
+Anders als im Tab „Create COGTIFF" ist ein Pixel hier schon ungültig, wenn **ein** Band den
+NoData-Wert trägt. Grund: Der NoData-Tag der Kacheln gilt pro Band — ein Pixel `0 12 7` ist in
+Band 1 NoData, und QGIS blendet es ganz aus. Das QC-Mosaik zeigt so dieselben Löcher wie die
+Kacheln. Eine Maske pro Band kann GeoTIFF nicht speichern (nur `PER_DATASET`), und ein NoData-Tag
+übersteht JPEG nicht. Bei 4-Band (RGBN) zählt auch Band 4: Ein Pixel mit NIR = 0 fehlt im Mosaik,
+obwohl QGIS es in der RGB-Ansicht der Kacheln zeigt. Vor dem Ablegen wird das Ergebnis geprüft
 (COG-Layout, JPEG, Bandzahl, interne Maske, kein Alpha-Band); ein alter Stand wird vorher
 entfernt. Die Eingabe ist 8 bit (neue Kamera), JPEG passt also. Scheitert der Bau, gibt es eine
 Warnung im Log, der Lauf bleibt erfolgreich.

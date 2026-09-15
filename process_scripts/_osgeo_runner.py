@@ -604,8 +604,8 @@ def _parse_nodata(value) -> list:
 
 def _nodata_per_band(values: list, band_count: int, dtype: str = None) -> list:
     """Ein NoData-Wert je Band. Fehlende Werte werden mit dem letzten aufgefuellt:
-    '0 0 0' auf RGBN ergibt 0 0 0 0, die Maske greift also nur, wo alle vier Baender 0
-    sind. Mehr Werte als Baender oder ein Wert ausserhalb des Datentyps -> ValueError."""
+    '0 0 0' auf RGBN ergibt 0 0 0 0. Mehr Werte als Baender oder ein Wert ausserhalb
+    des Datentyps -> ValueError."""
     if not values:
         raise ValueError("Keine NoData-Werte angegeben.")
     if len(values) > band_count:
@@ -634,11 +634,15 @@ def _raster_facts(path: str) -> tuple:
     return facts
 
 
-def _write_nodata_mask(ds, nodata_vals: list, block: int = 2048) -> None:
+def _write_nodata_mask(ds, nodata_vals: list, block: int = 2048,
+                       any_band: bool = False) -> None:
     """Interne Gueltigkeitsmaske (Flag PER_DATASET), blockweise - speicherschonend auch
-    fuer grosse AOIs. nodata_vals: ein Wert je Band (_nodata_per_band). Ein Pixel ist
-    nur ungueltig, wenn JEDES Band seinen Wert traegt - eine dunkle Stelle mit 0 in nur
-    einem Band bleibt sichtbar. Logik wie _write_nodata_mask in topo-COGTIFFconverter."""
+    fuer grosse AOIs. nodata_vals: ein Wert je Band (_nodata_per_band).
+    any_band=False: ungueltig nur, wenn JEDES Band seinen Wert traegt - eine dunkle Stelle
+    mit 0 in nur einem Band bleibt sichtbar (Logik wie topo-COGTIFFconverter).
+    any_band=True: ungueltig, sobald EIN Band seinen Wert traegt - so zeigt QGIS Kacheln
+    mit NoData-Tag (der Tag gilt pro Band, der Multiband-Renderer blendet das Pixel dann
+    aus). Eine Maske pro Band kennt GTiff nicht, nur PER_DATASET."""
     from osgeo import gdal
     import numpy as np
     gdal.SetConfigOption("GDAL_TIFF_INTERNAL_MASK", "YES")
@@ -648,12 +652,16 @@ def _write_nodata_mask(ds, nodata_vals: list, block: int = 2048) -> None:
         ys = min(block, ds.RasterYSize - y)
         for x in range(0, ds.RasterXSize, block):
             xs = min(block, ds.RasterXSize - x)
-            invalid = np.ones((ys, xs), dtype=bool)
+            invalid = np.full((ys, xs), not any_band, dtype=bool)
             for i, nd in enumerate(nodata_vals, start=1):
                 arr = ds.GetRasterBand(i).ReadAsArray(x, y, xs, ys)
                 # Vergleich im Datentyp des Bandes - bei Float32 traefe "-3.4028235e+38"
                 # den gespeicherten Wert (-FLT_MAX) sonst nicht exakt
-                invalid &= (arr == np.array(nd, dtype=arr.dtype))
+                hit = (arr == np.array(nd, dtype=arr.dtype))
+                if any_band:
+                    invalid |= hit
+                else:
+                    invalid &= hit
             mask_band.WriteArray(np.where(invalid, 0, 255).astype("uint8"), x, y)
 
 
@@ -696,7 +704,7 @@ def _check_cog(path: str, band_count: int, compress: str, expect_mask: bool) -> 
 
 def _write_cog_mosaic(tile_paths: list, cog_path: str, work_dir: Path, log, progress,
                       band_mode: str = "keep", compress: str = "JPEG", quality: int = 90,
-                      nodata_val=None, srs: str = None) -> None:
+                      nodata_val=None, srs: str = None, mask_any_band: bool = False) -> None:
     """Mosaik aus Kacheln als EIN COG - fuer die QC-Option im Tab TIFFconverter und
     fuer den Tab 'Create COGTIFF'.
 
@@ -710,7 +718,7 @@ def _write_cog_mosaic(tile_paths: list, cog_path: str, work_dir: Path, log, prog
     die 0-Werte am Rand, ein NoData-Wert gaebe schwarze Saeume; die Maske ist
     verlustfrei. Neben der Maske bleibt der NoData-Tag weg ('conflicting mask sources' -
     GDAL verwuerfe die Maske). nodata_val=None: keine Maske, das COG uebernimmt den
-    NoData-Tag der Kacheln.
+    NoData-Tag der Kacheln. mask_any_band: Masken-Logik, siehe _write_nodata_mask.
 
     Geschrieben wird in eine Temp-Datei, die erst nach bestandener Pruefung an ihren
     Platz kommt; ein alter Stand wird vorher entfernt."""
@@ -760,10 +768,11 @@ def _write_cog_mosaic(tile_paths: list, cog_path: str, work_dir: Path, log, prog
             if scratch_ds is None:
                 raise RuntimeError("gdal.Translate (Zwischenraster) hat None zurueckgegeben")
             scratch_ds = None
-            log(f"  2/3 Maske (Flag PER_DATASET): ungueltig, wo die Baender = "
-                f"{_fmt_nodata(mask_vals)}")
+            log(f"  2/3 Maske (Flag PER_DATASET): ungueltig, wo "
+                f"{'ein Band' if mask_any_band else 'jedes Band'} seinen NoData-Wert "
+                f"traegt ({_fmt_nodata(mask_vals)})")
             scratch_ds = gdal.Open(str(scratch_path), gdal.GA_Update)
-            _write_nodata_mask(scratch_ds, mask_vals)
+            _write_nodata_mask(scratch_ds, mask_vals, any_band=mask_any_band)
             scratch_ds.FlushCache()
             cog_src, step = scratch_ds, "3/3"
         else:
@@ -1007,9 +1016,10 @@ def _process(cfg: dict) -> None:
         cog_path = str(Path(output_dir) / COG_QC_SUBDIR / cog_name)
         _log(f"\nQC-COG: Mosaik aus {len(cog_tiles)} Kachel(n)")
         try:
+            # Maske wie der NoData-Tag der Kacheln: ein Band NoData -> Pixel ungueltig
             _write_cog_mosaic(cog_tiles, cog_path, run_dir, _log, _progress,
                               compress="JPEG", quality=cog_quality,
-                              nodata_val=nodata_val, srs="EPSG:2056")
+                              nodata_val=nodata_val, srs="EPSG:2056", mask_any_band=True)
             _log(f"  Geschrieben und geprueft: {cog_path}")
         except Exception as e:
             _log(f"  WARNUNG: QC-COG nicht geschrieben ({e}) - die Kacheln selbst "

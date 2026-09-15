@@ -1245,6 +1245,36 @@ def test_qc_cog_end_to_end(tmp_path):
     ds = None
 
 
+def test_qc_cog_mask_matches_tile_nodata(tmp_path):
+    """QC-COG des TIFFconverters: ungueltig, sobald EIN Band NoData traegt - wie der
+    NoData-Tag der Kacheln (gilt pro Band). 'Create COGTIFF' bleibt bei 'alle Baender'."""
+    import inspect
+    import pytest
+    gdal = pytest.importorskip("osgeo.gdal", reason="GDAL nur unter OSGeo4W verfuegbar")
+    np = pytest.importorskip("numpy")
+    gdal.UseExceptions()
+    runner_mod = _runner()
+
+    pixels = [(0, 0, 0), (0, 12, 7), (12, 0, 7), (5, 5, 5)]
+    masks = {}
+    for any_band in (False, True):
+        p = str(tmp_path / f"mask_{any_band}.tif")
+        ds = gdal.GetDriverByName("GTiff").Create(p, len(pixels), 1, 3, gdal.GDT_Byte)
+        for b in range(3):
+            ds.GetRasterBand(b + 1).WriteArray(
+                np.array([[px[b] for px in pixels]], dtype=np.uint8))
+        runner_mod._write_nodata_mask(ds, [0.0, 0.0, 0.0], any_band=any_band)
+        ds = None
+        ds = gdal.Open(p)
+        masks[any_band] = ds.GetRasterBand(1).GetMaskBand().ReadAsArray()[0].tolist()
+        ds = None
+    assert masks[False] == [0, 255, 255, 255]
+    assert masks[True] == [0, 0, 0, 255]
+
+    assert "mask_any_band=True" in inspect.getsource(runner_mod._process)
+    assert "mask_any_band" not in inspect.getsource(runner_mod._create_cog)
+
+
 # ══════════════════════ Tabs "Create COGTIFF" / "Create COPC" ══════════════════════
 
 def test_copc_crs_from_tiles():
