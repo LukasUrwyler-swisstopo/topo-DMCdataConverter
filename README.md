@@ -119,41 +119,48 @@ gültige Fläche ausgeschnitten und das Ergebnis parallelisiert ins 1km-Grid zer
      nebeneinander ablegen will, braucht getrennte Output-Ordner (oder einen abweichenden
      AREA-Namen).
 
-3. **Create COGTIFF** (Checkbox unter der Band-Auswahl) + **JPEG-Qualität** (Default 90 %):
+3. **NoData-Werte** (Feld unter der Band-Auswahl, Default `0 0 0`, änderbar, Vorschlag
+   `255 255 255`): Pixelwert je Band, der als NoData gilt. Daraus werden der Clip-Wert (alles
+   ausserhalb der gültigen Fläche), der NoData-Tag der 1km-Kacheln und die Maske des
+   QC-Mosaiks. GeoTIFF kennt nur **einen** NoData-Wert für alle Bänder, darum muss hier jedes
+   Band denselben Wert haben (`0 0 255` bricht vor dem Start mit einer Meldung ab). Bei 4-Band
+   (RGBN) gilt `0 0 0` als `0 0 0 0` — fehlende Werte werden mit dem letzten aufgefüllt. Den
+   NoData-Tag der Input-Kacheln zeigt die **Datei-Info**.
+
+4. **Create COGTIFF** (Checkbox unter den NoData-Werten) + **JPEG-Qualität** (Default 90 %):
    baut nach dem Zuschnitt zusätzlich **ein** Mosaik aller Kacheln der AOI als COG —
    `cog_QC\<JAHR>_<AREA>_DOP_<GSD>_checkData_LV95.tif`. Nur zur Sichtkontrolle, siehe
    „QC-Mosaik" unten.
 
-4. **Input-Ordner**: Ordner mit den technischen 200m x 200m-Kacheln (`.tif` + `.tfw`).
+5. **Input-Ordner**: Ordner mit den technischen 200m x 200m-Kacheln (`.tif` + `.tfw`).
    Enthaelt der Ordner bereits ein Mosaik-VRT (z.B. `True_Ortho.vrt`), wird dieses direkt
    uebernommen — sonst wird automatisch ein frisches VRT aus allen gefundenen `.tif`-Kacheln
    gebaut (`gdalbuildvrt`-Aequivalent).
 
-5. **Clip-Shape (gueltige Flaeche)**: Polygon-Shape, das die manuell erfasste gueltige Flaeche
+6. **Clip-Shape (gueltige Flaeche)**: Polygon-Shape, das die manuell erfasste gueltige Flaeche
    des Orthophotos beschreibt. Alles ausserhalb wird per Cutline-Clip (`gdal.Warp`) zu
-   NoData — die Quellkacheln tragen bereits NoData=0 je Band, der Clip verwendet denselben Wert.
+   NoData — mit dem Wert aus **NoData-Werte** (Punkt 3, Default 0).
 
-6. **Grid-Shape (1km x 1km)**: Shapefile mit Attributfeld `NAME`, liefert Geometrie und
+7. **Grid-Shape (1km x 1km)**: Shapefile mit Attributfeld `NAME`, liefert Geometrie und
    Benennung der Ausgabekacheln. Standardmaessig vorausgefuellt mit dem mitgelieferten
    `swissGRID_1km2_shp/chGRID_1km2.shp`. Wird bei Bedarf automatisch nach EPSG:2056
    reprojiziert.
 
-7. **Staging & Parallelisierung**: Zwischenergebnisse (VRT, Band-VRT, geclipptes Mosaik) werden in einem
+8. **Staging & Parallelisierung**: Zwischenergebnisse (VRT, Band-VRT, geclipptes Mosaik) werden in einem
    Staging-Ordner abgelegt (Standard `Y:\02_DMC_tempProcessingFolder`), damit mehrere Kerne
    parallel auf dieselbe geclippte Rasterquelle zugreifen koennen. **CPU-Kerne** steuert die
    Anzahl paralleler Prozesse fuer den Grid-Zuschnitt (Standard: 6). Nach erfolgreichem Lauf
    wird der projektspezifische Staging-Unterordner automatisch geloescht, sofern nicht
    **"Staging-Dateien behalten"** aktiviert ist.
 
-8. **Ausgabe-Format** (kein GUI-Feld, automatisch): klassisches TIFF (kein COG — das optionale
-   QC-Mosaik siehe Punkt 3) +
-   `.tfw`-Weltdatei je Ausgabekachel, Blockgroesse fix 256, NoData fix 0 (alle Baender
-   gleichermassen). Die Kompression wird von der ersten gefundenen Input-Kachel automatisch
-   uebernommen (LZW/DEFLATE/ZSTD/unkomprimiert) — nie verlustbehaftet: liegt eine Input-Kachel
-   ausnahmsweise JPEG-komprimiert vor, weicht die Ausgabe auf LZW aus, damit sie nie schlechter
-   als der Input wird.
+9. **Ausgabe-Format** (automatisch): klassisches TIFF (kein COG — das optionale QC-Mosaik siehe
+   Punkt 4) + `.tfw`-Weltdatei je Ausgabekachel, Blockgroesse fix 256, NoData-Tag aus
+   **NoData-Werte** (Punkt 3, Default 0, alle Baender gleich). Die Kompression wird von der
+   ersten gefundenen Input-Kachel automatisch uebernommen (LZW/DEFLATE/ZSTD/unkomprimiert) —
+   nie verlustbehaftet: liegt eine Input-Kachel ausnahmsweise JPEG-komprimiert vor, weicht die
+   Ausgabe auf LZW aus, damit sie nie schlechter als der Input wird.
 
-9. **DMC TIFF KONVERTIEREN** starten.
+10. **DMC TIFF KONVERTIEREN** starten.
 
 Vor dem Cutline-Clip prueft das Tool, ob der Pixelursprung des Mosaiks exakt auf ein Vielfaches
 der Pixelgroesse faellt (sauberes Pixelraster, z.B. bei 10cm GSD auf `.0/.1/.2/…`-Koordinaten).
@@ -178,7 +185,7 @@ selbst aus den verlustfreien Kacheln.
 | Kompression | JPEG, Qualität aus dem GUI (Default 90 %), auch für die Overviews | klein genug zum Durchsehen; die Kacheln selbst bleiben verlustfrei |
 | Overviews | `AUTO`, Resampling `AVERAGE` | ruhige Übersichten beim Herauszoomen |
 | Blockgrösse | 256 | wie das Mosaik in `topo-COGTIFFconverter` |
-| NoData | **interne Maske** statt NoData-Wert | JPEG verändert die 0-Werte am Rand, ein NoData-Wert gäbe schwarze Säume; die 1-bit-Maske bleibt verlustfrei |
+| NoData | **interne Maske** (Flag `PER_DATASET`) aus den **NoData-Werten** (Punkt 3), kein NoData-Tag | JPEG verändert die 0-Werte am Rand, ein NoData-Wert gäbe schwarze Säume; die 1-bit-Maske bleibt verlustfrei |
 | Band 4 (NIR) | als „undefiniert" deklariert | ein als Alpha markiertes Band 4 würde der COG-Treiber bei JPEG in eine Maske umwandeln (NIR weg), und QGIS zeigte das Bild halbtransparent |
 
 Die Maske entsteht zweistufig und blockweise wie in `topo-COGTIFFconverter`: VRT über die fertigen
@@ -655,12 +662,22 @@ Einstellungen.
 3. **Band-Ausgabe**: RGBN (unverändert), RGB (1,2,3) oder NRG (4,1,2) — wie im TIFFconverter.
 4. **Kompression**: JPEG (Default, Qualität 90 %, änderbar), DEFLATE, LZW, ZSTD oder NONE — die
    Auswahl aus dem Mosaik-Tab von `topo-COGTIFFconverter`.
-   - **JPEG**: nur 8 bit (sonst Abbruch mit klarer Meldung). NoData wird zur **internen Maske**
-     (ungültig nur, wenn alle Bänder den NoData-Wert tragen), damit keine schwarzen Säume
-     entstehen.
-   - **DEFLATE / LZW / ZSTD**: verlustfrei mit `PREDICTOR=2`; der NoData-Wert der Kacheln bleibt
-     als NoData-Wert erhalten.
-5. **Staging-Ordner**: für das VRT und — bei JPEG — das Zwischenraster der Maske.
+   - **JPEG**: nur 8 bit (sonst Abbruch mit klarer Meldung).
+   - **DEFLATE / LZW / ZSTD**: verlustfrei mit `PREDICTOR=2`.
+5. **NoData-Werte** (Default `0 0 0`, änderbar, Vorschläge `255 255 255` und `(keine Maske)`):
+   Pixelwert je Band, aus dem die **interne Maske** (Flag `PER_DATASET`) entsteht — bei **jeder**
+   Kompression, auch NONE. Ungültig ist ein Pixel nur, wenn **alle** Bänder ihren Wert tragen;
+   eine dunkle Stelle mit 0 in nur einem Band bleibt sichtbar.
+   - Fehlende Werte werden mit dem letzten aufgefüllt (`0 0 0` auf RGBN = `0 0 0 0`). Mehr
+     Werte als Ausgabebänder oder ein Wert ausserhalb des Datentyps (8 bit: 0–255) brechen vor
+     dem Lauf ab.
+   - Neben der Maske entfällt der NoData-Tag — sonst verwirft GDAL die Maske („conflicting mask
+     sources"). Bei JPEG ist die Maske zwingend: JPEG verändert die 0-Werte am Rand, ein
+     NoData-Tag gäbe schwarze Säume.
+   - Trägt die erste Kachel einen anderen NoData-Tag als eingegeben, steht eine Warnung im Log.
+   - **`(keine Maske)`**: kein Zwischenschritt, das COG übernimmt den NoData-Tag der Kacheln —
+     z.B. für ein DSM, das seinen Sentinel-Wert als Tag behalten soll.
+6. **Staging-Ordner**: für das VRT und das Zwischenraster der Maske.
 
 **CRS**: von den Kacheln übernommen. Tragen sie verschiedene CRS, bricht der Lauf ab. Trägt keine
 eines (reine `.tif` + `.tfw` — die Weltdatei kennt kein CRS), wird EPSG:2056 gesetzt, mit Warnung
@@ -731,7 +748,7 @@ process_scripts/_osgeo_runner.py   (OSGeo4W Python, GDAL/OGR)
         │  4) mosaikieren (VRT) -> Loecher fuellen -> Cutline-Clip -> Hillshade
         │
     Aktion "create_cog"   (Tab "Create COGTIFF"):
-        │  VRT ueber die Kacheln -> optional Bandauszug -> COG (bei JPEG + NoData:
+        │  VRT ueber die Kacheln -> optional Bandauszug -> COG (mit NoData-Werten:
         │  Zwischenraster + interne Maske) -> Pruefung
         │
     Aktion "create_copc"  (Tab "Create COPC"):

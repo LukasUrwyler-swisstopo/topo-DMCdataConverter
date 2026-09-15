@@ -74,6 +74,14 @@ BAND_HINT_UNKNOWN = "RGB-/NRG-Auszug nur bei 4-Band-Input (RGBN)"
 BAND_HINT_4BAND   = "4-Band erkannt  |  RGB = 1,2,3  |  NRG = 4,1,2"
 BAND_HINT_NOT4    = "Input hat {count} Band/Baender - Auswahl nur bei 4-Band (RGBN)"
 
+# ─── NoData-Werte (Tabs "DMC - TIFFconverter" / "Create COGTIFF") ────────────
+# Pixelwert je Band -> interne COG-Maske (Flag PER_DATASET); im TIFFconverter auch
+# Clip-Wert und NoData-Tag der Kacheln. Fehlende Werte fuellt der Runner mit dem
+# letzten auf ("0 0 0" auf RGBN = 0 0 0 0). 8 bit: praktisch immer 0 0 0.
+NODATA_DEFAULT = "0 0 0"
+NODATA_CHOICES = ["0 0 0", "255 255 255"]
+NODATA_NO_MASK = "(keine Maske)"
+
 
 # ─── OSGeo4W Python Erkennung (identisch zu topo-COGTIFFconverter) ───────────
 def _detect_osgeo_python() -> str:
@@ -173,6 +181,14 @@ def _format_bitdepth(info: dict) -> str:
     if not bits:
         return dt or "–"
     return f"{bits}bit ({dt})" if dt else f"{bits}bit"
+
+
+def _parse_nodata_text(text: str) -> list:
+    """'0 0 0' -> [0.0, 0.0, 0.0]; ValueError bei leerer oder ungueltiger Eingabe."""
+    values = [float(t) for t in text.split()]
+    if not values:
+        raise ValueError("keine NoData-Werte")
+    return values
 
 
 def _save_osgeo_config(path: str) -> None:
@@ -1491,16 +1507,28 @@ class DMCConverterApp(tk.Tk):
         self._cog_compress_hint_lbl.grid(row=5, column=1, columnspan=2, sticky="w", padx=(8, 0))
         self._dim_labels.append(self._cog_compress_hint_lbl)
 
+        lbl3 = ttk.Label(sec, text="NoData-Werte:", font=("Segoe UI", 9, "bold"))
+        lbl3.grid(row=6, column=0, sticky="w", pady=(8, 3))
+        self._cog_nodata_var = tk.StringVar(value=NODATA_DEFAULT)
+        ttk.Combobox(sec, textvariable=self._cog_nodata_var,
+                     values=NODATA_CHOICES + [NODATA_NO_MASK], width=16
+                     ).grid(row=6, column=1, sticky="w", padx=(8, 0), pady=(8, 3))
+        h_nd = ttk.Label(sec, text="Pixelwert je Band -> interne Maske (Flag PER_DATASET), bei jeder "
+                                   "Kompression\nungueltig nur, wo ALLE Baender diesen Wert tragen  |  "
+                                   "RGBN: 0 0 0 = 0 0 0 0", font=("", 8), justify="left")
+        h_nd.grid(row=7, column=1, columnspan=2, sticky="w", padx=(8, 0))
+        self._dim_labels.append(h_nd)
+
         self._cog_compress_var.trace_add("write", lambda *_: self._on_cog_compress_change())
         self._on_cog_compress_change()
 
     def _on_cog_compress_change(self):
-        """JPEG-Qualitaet nur bei JPEG editierbar; Hinweis zur NoData-Behandlung."""
+        """JPEG-Qualitaet nur bei JPEG editierbar; Hinweis zur Kompression."""
         jpeg = self._cog_compress_var.get().upper() == "JPEG"
         self._cog_quality_entry.config(state="normal" if jpeg else "disabled")
         self._cog_compress_hint_lbl.config(
-            text=("Verlustbehaftet, nur 8 bit  |  NoData als interne Maske, ohne Randsaeume"
-                  if jpeg else "Verlustfrei  |  der NoData-Wert der Kacheln bleibt erhalten"))
+            text=("Verlustbehaftet, nur 8 bit  |  dank Maske ohne Randsaeume"
+                  if jpeg else "Verlustfrei"))
 
     def _build_cog_staging(self, parent):
         sec = ttk.LabelFrame(parent, text="Staging", padding=10,
@@ -1592,6 +1620,13 @@ class DMCConverterApp(tk.Tk):
                     raise ValueError
             except Exception:
                 errors.append("JPEG-Qualitaet ungueltig (ganze Zahl von 1 bis 100, z.B. 90).")
+        nd_text = self._cog_nodata_var.get().strip()
+        if nd_text != NODATA_NO_MASK:
+            try:
+                _parse_nodata_text(nd_text)
+            except ValueError:
+                errors.append("NoData-Werte ungueltig (Zahlen durch Leerzeichen getrennt, "
+                              f"z.B. 0 0 0) - oder '{NODATA_NO_MASK}' waehlen.")
         if not self._cog_staging_var.get().strip():
             errors.append("Staging-Ordner fehlt.")
         return self._show_errors(errors)
@@ -1612,6 +1647,8 @@ class DMCConverterApp(tk.Tk):
                              if compress == "JPEG" else 90),
             "staging_dir":  self._cog_staging_var.get().strip(),
             "keep_staging": bool(self._cog_keep_staging_var.get()),
+            "nodata":       (None if self._cog_nodata_var.get().strip() == NODATA_NO_MASK
+                             else " ".join(self._cog_nodata_var.get().split())),
         }
         self._launch(cfg, self._start_btn_cog, "Create COGTIFF", "COG_" + Path(out).stem)
 
@@ -1822,26 +1859,37 @@ class DMCConverterApp(tk.Tk):
         self._band_hint_lbl.grid(row=4, column=1, columnspan=2, sticky="w", padx=(8, 0))
         self._dim_labels.append(self._band_hint_lbl)
 
+        lbl5 = ttk.Label(sec, text="NoData-Werte:", font=("Segoe UI", 9, "bold"))
+        lbl5.grid(row=5, column=0, sticky="w", pady=(8, 3))
+        self._nodata_var = tk.StringVar(value=NODATA_DEFAULT)
+        ttk.Combobox(sec, textvariable=self._nodata_var, values=NODATA_CHOICES, width=16
+                     ).grid(row=5, column=1, sticky="w", padx=(8, 0), pady=(8, 3))
+        h_nd = ttk.Label(sec, text="derselbe Wert in allen Baendern (NoData-Tag der Kacheln)\n"
+                                   "Clip ausserhalb  |  Maske des QC-COG (Flag PER_DATASET)",
+                          font=("", 8), justify="left")
+        h_nd.grid(row=6, column=1, columnspan=2, sticky="w", padx=(8, 0))
+        self._dim_labels.append(h_nd)
+
         self._create_cog_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(sec, text="Create COGTIFF  (QC: alle Tiles als EIN Mosaik, nur zur Kontrolle)",
                          variable=self._create_cog_var, command=self._on_create_cog_toggle
-                         ).grid(row=5, column=0, columnspan=3, sticky="w", pady=(10, 0))
+                         ).grid(row=7, column=0, columnspan=3, sticky="w", pady=(10, 0))
         self._cog_frame = ttk.Frame(sec)
-        self._cog_frame.grid(row=6, column=0, columnspan=3, sticky="w", padx=(20, 0), pady=(4, 0))
+        self._cog_frame.grid(row=8, column=0, columnspan=3, sticky="w", padx=(20, 0), pady=(4, 0))
         ttk.Label(self._cog_frame, text="JPEG-Qualitaet:", font=("Segoe UI", 9, "bold")
                    ).pack(side="left")
         self._cog_quality_var = tk.StringVar(value="90")
         ttk.Entry(self._cog_frame, textvariable=self._cog_quality_var, width=6
                    ).pack(side="left", padx=(8, 8))
-        h_cog = ttk.Label(self._cog_frame, text="% (1-100)  |  NoData als interne Maske, ohne Randsaeume",
+        h_cog = ttk.Label(self._cog_frame, text="% (1-100)  |  Maske aus den NoData-Werten, ohne Randsaeume",
                            font=("", 8))
         h_cog.pack(side="left")
         self._dim_labels.append(h_cog)
 
         name_lbl = ttk.Label(sec, text="Ausgabe-Benennung:", font=("Segoe UI", 9, "bold"))
-        name_lbl.grid(row=7, column=0, sticky="nw", pady=(8, 3))
+        name_lbl.grid(row=9, column=0, sticky="nw", pady=(8, 3))
         self._name_preview_lbl = ttk.Label(sec, text="–", font=("Courier New", 9), justify="left")
-        self._name_preview_lbl.grid(row=7, column=1, columnspan=2, sticky="w", padx=(8, 0), pady=(8, 3))
+        self._name_preview_lbl.grid(row=9, column=1, columnspan=2, sticky="w", padx=(8, 0), pady=(8, 3))
         self._accent_labels.append(self._name_preview_lbl)
 
         for var in (self._jahr_var, self._area_var, self._gsd_var, self._band_var):
@@ -1962,6 +2010,7 @@ class DMCConverterApp(tk.Tk):
             ("ColorInterp:",     "_info_colorinterp"),
             ("Aufloesung:",       "_info_res"),
             ("Bit-Tiefe:",       "_info_bitdepth"),
+            ("NoData (Tag):",    "_info_nodata"),
             ("Kompression:",      "_info_compression"),
             ("Koordinatensys.:", "_info_crs"),
             ("Dateigroesse:",     "_info_size"),
@@ -2189,8 +2238,8 @@ class DMCConverterApp(tk.Tk):
     # ── Datei-Info via Runner ──────────────────────────────────────────────────
     def _refresh_info(self):
         src_dir = self._in_var.get().strip()
-        info_attrs = ("_info_bands", "_info_colorinterp", "_info_res",
-                      "_info_bitdepth", "_info_compression", "_info_crs", "_info_size")
+        info_attrs = ("_info_bands", "_info_colorinterp", "_info_res", "_info_bitdepth",
+                      "_info_nodata", "_info_compression", "_info_crs", "_info_size")
 
         def _reset():
             for attr in info_attrs:
@@ -2231,6 +2280,8 @@ class DMCConverterApp(tk.Tk):
                 self._apply_band_availability(info.get("bands"))
                 self._info_res.config(text="{} × {} px".format(info.get('width'), info.get('height')))
                 self._info_bitdepth.config(text=_format_bitdepth(info))
+                nd = info.get("nodata")
+                self._info_nodata.config(text="(keiner)" if nd is None else "{:g}".format(nd))
                 comp   = info.get("compression", "–")
                 layout = info.get("layout", "")
                 self._info_compression.config(
@@ -2589,6 +2640,14 @@ class DMCConverterApp(tk.Tk):
             except Exception:
                 errors.append("JPEG-Qualitaet ungueltig (ganze Zahl von 1 bis 100, z.B. 90).")
 
+        try:
+            nd = _parse_nodata_text(self._nodata_var.get())
+            if len(set(nd)) > 1:
+                errors.append("NoData-Werte: die Kacheln tragen EINEN NoData-Wert fuer alle "
+                              "Baender - bitte in jedem Band denselben Wert, z.B. 0 0 0.")
+        except ValueError:
+            errors.append("NoData-Werte ungueltig (Zahlen durch Leerzeichen getrennt, z.B. 0 0 0).")
+
         in_dir = self._in_var.get().strip()
         if not in_dir:
             errors.append("Input-Ordner fehlt.")
@@ -2649,6 +2708,7 @@ class DMCConverterApp(tk.Tk):
             "num_workers":      int(self._workers_var.get()),
             "keep_staging":     bool(self._keep_staging_var.get()),
             "band_mode":        self._band_mode(),
+            "nodata":           " ".join(self._nodata_var.get().split()),
             "create_cog":       bool(self._create_cog_var.get()),
             "cog_quality":      (int(self._cog_quality_var.get().strip().rstrip("%"))
                                  if self._create_cog_var.get() else 90),

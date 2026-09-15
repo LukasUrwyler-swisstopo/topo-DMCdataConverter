@@ -575,11 +575,70 @@ def _set_display_colour_interpretation(ds) -> None:
         ds.GetRasterBand(i).SetColorInterpretation(gdal.GCI_Undefined)
 
 
-def _write_nodata_mask(ds, nodata_val: float, block: int = 2048) -> None:
-    """Interne Gueltigkeitsmaske, blockweise (speicherschonend auch fuer grosse AOIs).
-    Ein Pixel ist nur ungueltig, wenn ALLE Baender den NoData-Wert tragen - eine dunkle
-    Stelle mit 0 in nur einem Band bleibt sichtbar. Logik wie _write_nodata_mask in
-    topo-COGTIFFconverter."""
+# --- NoData-Werte (GUI-Feld "NoData-Werte", Tabs TIFFconverter und Create COGTIFF) ---
+# Pixelwert je Band, z.B. "0 0 0". Daraus entsteht die interne COG-Maske (Flag
+# PER_DATASET); im TIFFconverter ist es zugleich Clip-Wert und NoData-Tag der Kacheln.
+# Ganzzahlige Datentypen muessen den Wert fassen koennen, Float-Typen fassen alles.
+NODATA_INT_RANGES = {
+    "Byte":   (0, 255),
+    "UInt16": (0, 65535),
+    "Int16":  (-32768, 32767),
+    "UInt32": (0, 4294967295),
+    "Int32":  (-2147483648, 2147483647),
+}
+
+
+def _parse_nodata(value) -> list:
+    """GUI-Eingabe -> Zahlenliste: '0 0 0' -> [0.0, 0.0, 0.0], 0 -> [0.0].
+    None oder leer -> [] (keine Maske)."""
+    if value is None:
+        return []
+    if isinstance(value, (int, float)):
+        return [float(value)]
+    try:
+        return [float(t) for t in str(value).split()]
+    except ValueError:
+        raise ValueError(f"NoData-Werte ungueltig: {value!r} - Zahlen durch Leerzeichen "
+                         f"getrennt, z.B. 0 0 0.") from None
+
+
+def _nodata_per_band(values: list, band_count: int, dtype: str = None) -> list:
+    """Ein NoData-Wert je Band. Fehlende Werte werden mit dem letzten aufgefuellt:
+    '0 0 0' auf RGBN ergibt 0 0 0 0, die Maske greift also nur, wo alle vier Baender 0
+    sind. Mehr Werte als Baender oder ein Wert ausserhalb des Datentyps -> ValueError."""
+    if not values:
+        raise ValueError("Keine NoData-Werte angegeben.")
+    if len(values) > band_count:
+        raise ValueError(f"{len(values)} NoData-Werte ({_fmt_nodata(values)}), die Ausgabe "
+                         f"hat aber nur {band_count} Band/Baender.")
+    rng = NODATA_INT_RANGES.get(dtype)
+    if rng:
+        bad = [v for v in values if not (v.is_integer() and rng[0] <= v <= rng[1])]
+        if bad:
+            raise ValueError(f"NoData-Wert {bad[0]:g} passt nicht in {dtype} "
+                             f"(ganze Zahl von {rng[0]} bis {rng[1]}).")
+    return list(values) + [values[-1]] * (band_count - len(values))
+
+
+def _fmt_nodata(values: list) -> str:
+    return " ".join(f"{v:g}" for v in values)
+
+
+def _raster_facts(path: str) -> tuple:
+    """(Datentyp-Name, NoData-Wert von Band 1 oder None, Bandzahl) eines Rasters."""
+    from osgeo import gdal
+    ds = gdal.Open(path, gdal.GA_ReadOnly)
+    band = ds.GetRasterBand(1)
+    facts = (gdal.GetDataTypeName(band.DataType), band.GetNoDataValue(), ds.RasterCount)
+    ds = None
+    return facts
+
+
+def _write_nodata_mask(ds, nodata_vals: list, block: int = 2048) -> None:
+    """Interne Gueltigkeitsmaske (Flag PER_DATASET), blockweise - speicherschonend auch
+    fuer grosse AOIs. nodata_vals: ein Wert je Band (_nodata_per_band). Ein Pixel ist
+    nur ungueltig, wenn JEDES Band seinen Wert traegt - eine dunkle Stelle mit 0 in nur
+    einem Band bleibt sichtbar. Logik wie _write_nodata_mask in topo-COGTIFFconverter."""
     from osgeo import gdal
     import numpy as np
     gdal.SetConfigOption("GDAL_TIFF_INTERNAL_MASK", "YES")
@@ -590,8 +649,11 @@ def _write_nodata_mask(ds, nodata_val: float, block: int = 2048) -> None:
         for x in range(0, ds.RasterXSize, block):
             xs = min(block, ds.RasterXSize - x)
             invalid = np.ones((ys, xs), dtype=bool)
-            for i in range(1, ds.RasterCount + 1):
-                invalid &= (ds.GetRasterBand(i).ReadAsArray(x, y, xs, ys) == nodata_val)
+            for i, nd in enumerate(nodata_vals, start=1):
+                arr = ds.GetRasterBand(i).ReadAsArray(x, y, xs, ys)
+                # Vergleich im Datentyp des Bandes - bei Float32 traefe "-3.4028235e+38"
+                # den gespeicherten Wert (-FLT_MAX) sonst nicht exakt
+                invalid &= (arr == np.array(nd, dtype=arr.dtype))
             mask_band.WriteArray(np.where(invalid, 0, 255).astype("uint8"), x, y)
 
 
@@ -642,11 +704,13 @@ def _write_cog_mosaic(tile_paths: list, cog_path: str, work_dir: Path, log, prog
     nur Zwischenschritte und werden danach geloescht - das COG enthaelt alle Pixel
     und Overviews selbst.
 
-    Bei JPEG mit NoData zweistufig wie in topo-COGTIFFconverter: Zwischenraster (LZW,
-    ohne NoData-Tag) -> interne Maske blockweise -> COG. JPEG veraendert die 0-Werte
-    am Rand, ein NoData-Wert gaebe schwarze Saeume; die Maske ist verlustfrei. Neben
-    der Maske bleibt der NoData-Tag weg ('conflicting mask sources' - GDAL verwuerfe
-    die Maske). Verlustfreie Kompression behaelt den NoData-Tag der Kacheln.
+    Mit NoData-Werten (nodata_val: eine Zahl oder ein Wert je Band) bei JEDER
+    Kompression zweistufig wie in topo-COGTIFFconverter: Zwischenraster (LZW, ohne
+    NoData-Tag) -> interne Maske blockweise -> COG. Bei JPEG zwingend - JPEG veraendert
+    die 0-Werte am Rand, ein NoData-Wert gaebe schwarze Saeume; die Maske ist
+    verlustfrei. Neben der Maske bleibt der NoData-Tag weg ('conflicting mask sources' -
+    GDAL verwuerfe die Maske). nodata_val=None: keine Maske, das COG uebernimmt den
+    NoData-Tag der Kacheln.
 
     Geschrieben wird in eine Temp-Datei, die erst nach bestandener Pruefung an ihren
     Platz kommt; ein alter Stand wird vorher entfernt."""
@@ -665,7 +729,7 @@ def _write_cog_mosaic(tile_paths: list, cog_path: str, work_dir: Path, log, prog
     vrt_path = work_dir / "cog_mosaic.vrt"
     band_vrt = work_dir / f"01b_bands_{band_mode}.vrt"
     scratch_path = work_dir / "cog_scratch.tif"
-    use_mask = compress == "JPEG" and nodata_val is not None
+    use_mask = nodata_val is not None
     srs_kw = {"outputSRS": srs} if srs else {}
 
     try:
@@ -677,7 +741,11 @@ def _write_cog_mosaic(tile_paths: list, cog_path: str, work_dir: Path, log, prog
         src = _select_bands(str(vrt_path), band_mode, work_dir, log)
         src_ds = gdal.Open(src, gdal.GA_ReadOnly)
         band_count = src_ds.RasterCount
+        dtype = gdal.GetDataTypeName(src_ds.GetRasterBand(1).DataType)
         src_ds = None
+        if use_mask:
+            vals = nodata_val if isinstance(nodata_val, (list, tuple)) else [nodata_val]
+            mask_vals = _nodata_per_band([float(v) for v in vals], band_count, dtype)
 
         scratch_ds = None
         if use_mask:
@@ -692,9 +760,10 @@ def _write_cog_mosaic(tile_paths: list, cog_path: str, work_dir: Path, log, prog
             if scratch_ds is None:
                 raise RuntimeError("gdal.Translate (Zwischenraster) hat None zurueckgegeben")
             scratch_ds = None
-            log("  2/3 Maske (ungueltig, wenn alle Baender = NoData)")
+            log(f"  2/3 Maske (Flag PER_DATASET): ungueltig, wo die Baender = "
+                f"{_fmt_nodata(mask_vals)}")
             scratch_ds = gdal.Open(str(scratch_path), gdal.GA_Update)
-            _write_nodata_mask(scratch_ds, nodata_val)
+            _write_nodata_mask(scratch_ds, mask_vals)
             scratch_ds.FlushCache()
             cog_src, step = scratch_ds, "3/3"
         else:
@@ -740,7 +809,7 @@ def _process(cfg: dict) -> None:
     staging_dir      = cfg["staging_dir"]
     num_workers      = int(cfg.get("num_workers", 6))
     blocksize        = cfg.get("blocksize", "256")
-    nodata_val       = float(cfg.get("nodata", "0"))
+    nodata_vals      = _parse_nodata(cfg.get("nodata", "0"))
     keep_staging     = bool(cfg.get("keep_staging", False))
     band_mode        = str(cfg.get("band_mode", "keep")).strip().lower() or "keep"
     # QC-Mosaik als COG - reine Sichtkontrolle neben der Lieferung.
@@ -755,6 +824,16 @@ def _process(cfg: dict) -> None:
     if band_mode not in BAND_MODES:
         raise ValueError(f"Unbekannte Band-Ausgabe: {band_mode!r} "
                          f"(erlaubt: {', '.join(sorted(BAND_MODES))})")
+
+    # Clip-Wert und NoData-Tag der Kacheln: GeoTIFF kennt nur EINEN NoData-Wert fuer
+    # alle Baender, verschiedene Werte je Band gehen hier also nicht.
+    if not nodata_vals:
+        raise ValueError("NoData-Werte fehlen - der Clip braucht einen Wert, z.B. 0 0 0.")
+    if len(set(nodata_vals)) > 1:
+        raise ValueError(f"NoData-Werte {_fmt_nodata(nodata_vals)}: die Kacheln tragen einen "
+                         f"NoData-Wert fuer alle Baender - bitte in jedem Band denselben Wert "
+                         f"angeben, z.B. 0 0 0.")
+    nodata_val = nodata_vals[0]
 
     gdal.UseExceptions()
     ogr.UseExceptions()
@@ -784,6 +863,10 @@ def _process(cfg: dict) -> None:
     compress = _detect_source_compression(input_dir, _log)
     mosaic_src = _resolve_mosaic_source(input_dir, run_dir, _log)
     mosaic_src = _select_bands(mosaic_src, band_mode, run_dir, _log)
+    src_dtype, _, src_bands = _raster_facts(mosaic_src)
+    _nodata_per_band(nodata_vals, src_bands, src_dtype)   # Anzahl + Wertebereich pruefen
+    _log(f"NoData              : {nodata_val:g} in allen Baendern -> Clip ausserhalb, "
+         f"NoData-Tag der Kacheln" + (", Maske des QC-COG" if create_cog else ""))
     px_w, px_h = _check_pixel_alignment(mosaic_src, _log)
 
     # --- Schritt 2: Cutline-Clip ---
@@ -951,7 +1034,8 @@ def _process(cfg: dict) -> None:
 
 # ─── Tab "Create COGTIFF" (eigenstaendig) ─────────────────────────────────────
 # Beliebige TIFF-Kacheln (+ .tfw) -> EIN COG. Keine Converter-Funktionen: kein
-# Clip, kein Grid-Zuschnitt - nur Mosaik, optionaler Bandauszug und Kompression.
+# Clip, kein Grid-Zuschnitt - nur Mosaik, optionaler Bandauszug, NoData-Maske und
+# Kompression.
 COG_COMPRESSIONS = ("JPEG", "DEFLATE", "LZW", "ZSTD", "NONE")
 
 
@@ -997,16 +1081,6 @@ def _resolve_tiles_srs(tile_paths: list, log) -> str:
     return keys[0]
 
 
-def _first_tile_raster_facts(path: str) -> tuple:
-    """(Datentyp-Name, NoData-Wert von Band 1 oder None) der ersten Kachel."""
-    from osgeo import gdal
-    ds = gdal.Open(path, gdal.GA_ReadOnly)
-    band = ds.GetRasterBand(1)
-    facts = (gdal.GetDataTypeName(band.DataType), band.GetNoDataValue())
-    ds = None
-    return facts
-
-
 def _input_tiles(input_dir: str, patterns: tuple, output_path: str) -> list:
     """Kacheln im Input-Ordner - ohne die Ausgabedatei und ihre Temp-Datei, falls sie
     im selben Ordner liegen (sonst ginge ein alter Stand ins neue Produkt ein)."""
@@ -1027,6 +1101,7 @@ def _create_cog(cfg: dict) -> None:
     quality      = int(cfg.get("quality", 90))
     staging_dir  = cfg["staging_dir"]
     keep_staging = bool(cfg.get("keep_staging", False))
+    nodata_vals  = _parse_nodata(cfg.get("nodata", "0"))   # None = "(keine Maske)"
 
     def _log(msg: str) -> None:
         print(msg, flush=True)
@@ -1063,18 +1138,27 @@ def _create_cog(cfg: dict) -> None:
     _log(f"Baender     : {BAND_MODE_LABELS[band_mode]}")
     _log(f"Kompression : {compress}"
          + (f" (Qualitaet {quality} %)" if compress == "JPEG" else ""))
-    dtype, nodata = _first_tile_raster_facts(tiles[0])
+    dtype, tile_nodata, band_count = _raster_facts(tiles[0])
     if compress == "JPEG" and dtype != "Byte":
         raise ValueError(f"JPEG verlangt 8-bit-Daten, die Kacheln sind {dtype} - "
                          f"bitte DEFLATE, LZW oder ZSTD waehlen.")
+    if nodata_vals:
+        out_bands = len(BAND_MODES[band_mode]) if BAND_MODES[band_mode] else band_count
+        nodata_vals = _nodata_per_band(nodata_vals, out_bands, dtype)
     srs = _resolve_tiles_srs(tiles, _log)
     _log(f"CRS         : {srs[:60]}  (von den Kacheln)")
-    if nodata is None:
-        _log("NoData      : keines gesetzt")
-    elif compress == "JPEG":
-        _log(f"NoData      : {nodata:g} -> interne Maske (JPEG)")
+    if nodata_vals:
+        _log(f"NoData      : {_fmt_nodata(nodata_vals)} -> interne Maske (Flag PER_DATASET), "
+             f"der NoData-Tag entfaellt")
+        # rel_tol: Float32-Genauigkeit (DSM-Sentinel als Text vs. gespeicherter Wert)
+        if tile_nodata is not None and not all(math.isclose(v, tile_nodata, rel_tol=1e-7)
+                                               for v in nodata_vals):
+            _log(f"  WARNUNG: die Kacheln tragen NoData {tile_nodata:g} - fuer die Maske "
+                 f"gilt der Wert aus dem GUI.")
+    elif tile_nodata is None:
+        _log("NoData      : keine Maske, die Kacheln tragen keinen NoData-Wert")
     else:
-        _log(f"NoData      : {nodata:g} (bleibt als NoData-Wert)")
+        _log(f"NoData      : keine Maske, der NoData-Wert {tile_nodata:g} der Kacheln bleibt")
 
     run_dir = Path(staging_dir) / f"COG_{Path(output_path).stem}"
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -1082,14 +1166,14 @@ def _create_cog(cfg: dict) -> None:
     try:
         _write_cog_mosaic(tiles, output_path, run_dir, _log, _progress,
                           band_mode=band_mode, compress=compress, quality=quality,
-                          nodata_val=nodata, srs=srs)
+                          nodata_val=nodata_vals or None, srs=srs)
     finally:
         if not keep_staging:
             shutil.rmtree(run_dir, ignore_errors=True)
 
     size_mb = Path(output_path).stat().st_size / (1024 ** 2)
     _log(f"\nFertig: {output_path}  ({size_mb:.1f} MB) - geprueft: COG-Layout, "
-         f"Kompression, Baender, kein Alpha-Band.")
+         f"Kompression, Baender, {'interne Maske, ' if nodata_vals else ''}kein Alpha-Band.")
 
 
 # ─── DMC LASconverter (PDAL-basiert) ───────────────────────────────────────────

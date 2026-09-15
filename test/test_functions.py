@@ -1233,6 +1233,17 @@ def test_qc_cog_end_to_end(tmp_path):
     assert not os.path.exists(str(run_dir / "cog_scratch.tif"))
     assert not os.path.exists(cog.replace(".tif", "_tmp.tif"))
 
+    # Verlustfrei ebenfalls Maske statt NoData-Tag - hier 3 Werte auf 4 Baender
+    cog2 = str(tmp_path / "cog_QC" / "mosaik_deflate.tif")
+    runner_mod._write_cog_mosaic(tiles, cog2, run_dir, lambda m: None, lambda *a: 1,
+                                 compress="DEFLATE", nodata_val=[0, 0, 0], srs="EPSG:2056")
+    assert runner_mod._check_cog(cog2, 4, "DEFLATE", True) == []
+    ds = gdal.Open(cog2)
+    mask = ds.GetRasterBand(1).GetMaskBand().ReadAsArray()
+    assert mask[:, :100].max() == 0 and mask[:, 200:900].min() == 255
+    assert ds.GetRasterBand(1).GetNoDataValue() is None
+    ds = None
+
 
 # ══════════════════════ Tabs "Create COGTIFF" / "Create COPC" ══════════════════════
 
@@ -1319,12 +1330,14 @@ def _fake_osgeo(monkeypatch):
     import types
     osgeo = types.ModuleType("osgeo")
     osgeo.gdal = types.SimpleNamespace(UseExceptions=lambda: None)
+    osgeo.ogr = types.SimpleNamespace(UseExceptions=lambda: None)
+    osgeo.osr = types.SimpleNamespace()
     monkeypatch.setitem(sys.modules, "osgeo", osgeo)
 
 
 def test_create_cog_excludes_output_and_passes_settings(tmp_path, monkeypatch):
-    """Tab 'Create COGTIFF': Bandauswahl, Kompression, Qualitaet, NoData und CRS gehen
-    an die Mosaik-Funktion; eine Ausgabe im Input-Ordner wird nicht mitgemosaikt."""
+    """Tab 'Create COGTIFF': Bandauswahl, Kompression, Qualitaet, NoData-Werte und CRS
+    gehen an die Mosaik-Funktion; eine Ausgabe im Input-Ordner wird nicht mitgemosaikt."""
     import pytest
     runner_mod = _runner()
     _fake_osgeo(monkeypatch)
@@ -1339,26 +1352,80 @@ def test_create_cog_excludes_output_and_passes_settings(tmp_path, monkeypatch):
         with open(cog_path, "wb") as f:
             f.write(b"cog")
 
-    monkeypatch.setattr(runner_mod, "_first_tile_raster_facts", lambda p: ("Byte", 0.0))
+    monkeypatch.setattr(runner_mod, "_raster_facts", lambda p: ("Byte", 0.0, 4))
     monkeypatch.setattr(runner_mod, "_resolve_tiles_srs", lambda tiles, log: "EPSG:2056")
     monkeypatch.setattr(runner_mod, "_write_cog_mosaic", fake_mosaic)
     cfg = {"input_dir": str(src), "output_path": str(src / "mosaik.tif"),
-           "band_mode": "rgb", "compress": "JPEG", "quality": 85,
+           "band_mode": "rgb", "compress": "JPEG", "quality": 85, "nodata": "0 0 0",
            "staging_dir": str(tmp_path / "staging"), "keep_staging": False}
     runner_mod._create_cog(cfg)
     assert [os.path.basename(t) for t in captured["tiles"]] == ["t1.tif", "t2.tiff"]
     assert captured["kw"] == {"band_mode": "rgb", "compress": "JPEG", "quality": 85,
-                              "nodata_val": 0.0, "srs": "EPSG:2056"}
+                              "nodata_val": [0.0, 0.0, 0.0], "srs": "EPSG:2056"}
+
+    # Maske auch verlustfrei; 3 Werte auf RGBN -> der letzte gilt auch fuer Band 4
+    runner_mod._create_cog(dict(cfg, band_mode="keep", compress="DEFLATE"))
+    assert captured["kw"]["nodata_val"] == [0.0, 0.0, 0.0, 0.0]
+    # "(keine Maske)" kommt als None an -> keine Maske, der Kachel-Tag bleibt
+    runner_mod._create_cog(dict(cfg, nodata=None))
+    assert captured["kw"]["nodata_val"] is None
+    with pytest.raises(ValueError, match="nur 3 Band"):
+        runner_mod._create_cog(dict(cfg, nodata="0 0 0 0"))
+    with pytest.raises(ValueError, match="passt nicht in Byte"):
+        runner_mod._create_cog(dict(cfg, nodata="256"))
 
     # JPEG geht nur mit 8 bit - klare Meldung statt eines GDAL-Fehlers mitten im Lauf
-    monkeypatch.setattr(runner_mod, "_first_tile_raster_facts", lambda p: ("UInt16", None))
+    monkeypatch.setattr(runner_mod, "_raster_facts", lambda p: ("UInt16", None, 4))
     with pytest.raises(ValueError, match="8-bit"):
         runner_mod._create_cog(cfg)
+
+
+def test_nodata_values():
+    """GUI-Feld 'NoData-Werte': ein Wert je Band, fehlende = letzter Wert (0 0 0 auf
+    RGBN = 0 0 0 0); mehr Werte als Baender oder ausserhalb des Datentyps -> Fehler."""
+    import pytest
+    runner_mod = _runner()
+    assert runner_mod._parse_nodata("0 0 0") == [0.0, 0.0, 0.0]
+    assert runner_mod._parse_nodata(" 255  255 255 ") == [255.0] * 3
+    assert runner_mod._parse_nodata(0) == [0.0]
+    assert runner_mod._parse_nodata(None) == runner_mod._parse_nodata("") == []
+    with pytest.raises(ValueError, match="Leerzeichen"):
+        runner_mod._parse_nodata("0,0,0")
+
+    per_band = runner_mod._nodata_per_band
+    assert per_band([0.0, 0.0, 0.0], 4, "Byte") == [0.0] * 4
+    assert per_band([0.0], 3, "Byte") == [0.0] * 3
+    assert per_band([-3.4028235e+38], 1, "Float32") == [-3.4028235e+38]
+    with pytest.raises(ValueError, match="nur 3"):
+        per_band([0.0] * 4, 3, "Byte")
+    for bad in (256.0, -1.0, 0.5):
+        with pytest.raises(ValueError, match="passt nicht in Byte"):
+            per_band([bad], 3, "Byte")
+
+
+def test_tiff_process_needs_one_nodata_value(tmp_path, monkeypatch):
+    """TIFFconverter: die Kacheln tragen EINEN NoData-Tag fuer alle Baender (GeoTIFF) -
+    verschiedene Werte je Band oder ein leeres Feld brechen vor dem ersten
+    Schreibzugriff ab."""
+    import pytest
+    runner_mod = _runner()
+    _fake_osgeo(monkeypatch)
+    out = tmp_path / "out"
+    cfg = {"jahr": "2026", "area": "G", "gsd": "10cm", "input_dir": str(tmp_path),
+           "output_dir": str(out), "clip_shape_path": "clip.shp",
+           "grid_shape_path": "grid.shp", "staging_dir": str(tmp_path / "staging"),
+           "nodata": "0 0 255"}
+    with pytest.raises(ValueError, match="denselben Wert"):
+        runner_mod._process(cfg)
+    with pytest.raises(ValueError, match="fehlen"):
+        runner_mod._process(dict(cfg, nodata=""))
+    assert not out.exists() and not (tmp_path / "staging").exists()
 
 
 def test_cog_and_copc_tabs():
     """Die beiden eigenstaendigen Tabs: Defaults, JPEG-Qualitaet nur bei JPEG,
     Bandauswahl gesperrt bei 3-Band-Input, Ausgabenamen mit richtiger Endung."""
+    import pytest
     gui_mod = load_module_from_path(
         "gui_module", os.path.join(PROJECT_ROOT, "GUI_DMCdataConverter.py"))
     assert gui_mod._normalize_cog_path("X:/a/mosaik") == "X:/a/mosaik.tif"
@@ -1380,6 +1447,13 @@ def test_cog_and_copc_tabs():
         assert str(app._cog_quality_entry.cget("state")) == "normal"
         app._cog_compress_var.set("DEFLATE")
         assert str(app._cog_quality_entry.cget("state")) == "disabled"
+        assert "NoData" not in app._cog_compress_hint_lbl.cget("text")
+
+        # NoData-Werte: in beiden Tabs Default 0 0 0 (Maske bei jeder Kompression)
+        assert app._nodata_var.get() == app._cog_nodata_var.get() == "0 0 0"
+        assert gui_mod._parse_nodata_text(" 0  0 0 ") == [0.0, 0.0, 0.0]
+        with pytest.raises(ValueError):
+            gui_mod._parse_nodata_text("0,0,0")
 
         app._apply_band_availability(3, app._cog_band_combo, app._cog_band_var,
                                      app._cog_band_hint_lbl)
