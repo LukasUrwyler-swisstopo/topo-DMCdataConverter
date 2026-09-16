@@ -5,16 +5,16 @@ Ausgabe geht auf stdout -> wird vom GUI live im Log angezeigt.
 
 Aktionen:
     info        - Metadaten aus Quelldatei lesen, Ergebnis als JSON auf stdout
-    process     - DMC-TIFF-Pipeline (Tab "DMC - TIFFconverter"):
+    process     - DMC-TIFF-Pipeline (Tab "[1] DMC DOP - TIFFconverter"):
                   1) Mosaik der technischen 200m-Kacheln (bestehendes True_Ortho.vrt
                      wird uebernommen, falls vorhanden, sonst frisch aus *.tif gebaut)
                   2) Cutline-Clip auf die gueltige Flaeche (alles ausserhalb -> NoData)
                   3) Zuschnitt auf das 1km x 1km-Grid (Dateiname aus Attribut 'NAME'),
                      parallelisiert ueber mehrere Kerne, Zwischenergebnisse im
                      Staging-Ordner (z.B. Y:\\02_DMC_tempProcessingFolder)
-    process_las - DMC-LAS-Pipeline (Tab "DMC - LASconverter [LHN95]"), siehe
+    process_las - DMC-LAS-Pipeline (Tab "[2a] DMC DSM - LASconverter [LHN95]"), siehe
                   Kommentarblock direkt ueber _process_las() weiter unten.
-    process_las_ln02 - DMC-LAS-Pipeline LN02 (Tab "DMC - LASconverter [LN02]"),
+    process_las_ln02 - DMC-LAS-Pipeline LN02 (Tab "[2b] DMC DSM - LASconverter [LN02]"),
                   siehe Kommentarblock direkt ueber _process_las_ln02() weiter unten.
     process_dsm - DSM + Hillshade aus einem beliebigen LAS/LAZ-Ordner
                   (Tab "Create DSM-Raster"), siehe Kommentarblock ueber _process_dsm().
@@ -54,6 +54,18 @@ LAS_FILL_HOLE_CONNECTEDNESS = 8      # 8 = diagonal beruehrende Pixel sind EIN L
 # gefuellten Flaechen auf 2-3 erhoehen (GDAL glaettet dabei laut Doku nur die
 # interpolierten Pixel).
 LAS_FILL_SMOOTHING_ITERATIONS = 0
+
+# Kompression der FLOAT32-Zwischenraster im Staging (04_raster_dsm.tif). Das sind
+# Wegwerfprodukte: sie werden am Ende des Laufs geloescht und nie ausgeliefert. LZW mit
+# PREDICTOR=3 kostet auf 200+ Mio. Float32-Werten spuerbar CPU und komprimiert Float
+# ohnehin schlecht. "NONE" tauscht diese CPU gegen Bytes auf dem Staging-Laufwerk; auf
+# "ZSTD" umstellen (dann zusaetzlich ZSTD_LEVEL=1), falls das Staging-Laufwerk der
+# Engpass ist. Verlustfrei ist beides - GeoTIFF-Kompression aendert keinen einzigen
+# Pixelwert, die Wahl beeinflusst ausschliesslich Laufzeit und Platzbedarf.
+# NICHT betroffen: die AUSGELIEFERTEN Raster (gdal.Warp in _mosaic_las_raster, eigene
+# creationOptions) und die Byte-Masken im Staging - eine 0/1-Maske komprimiert um
+# Groessenordnungen und kostet dabei fast keine CPU; dort bleibt LZW das bessere Geschaeft.
+LAS_STAGING_COMPRESS = "NONE"
 
 # Hillshade (Byte): 255 bedeutet ausschliesslich "ausserhalb des AOI". Innerhalb des
 # AOI traegt kein einziges Pixel 255 - weder ein voll beleuchtetes (gdaldem liefert
@@ -111,7 +123,7 @@ LAS_OUT_SRS = "EPSG:2056"
 # nicht still mit einer abweichenden Referenz in den Merge einfliesst.
 LAS_INPUT_SRS = "EPSG:2056+5729"
 
-# ─── Zielwerte fuer die GDWH-taugliche LAS-1.4-Ausgabe (Tab "DMC - LASconverter [LN02]") ──
+# ─── Zielwerte fuer die GDWH-taugliche LAS-1.4-Ausgabe (Tab "[2b] DMC DSM - LASconverter [LN02]") ──
 # Identisch zu SB_DSM_PUNKTWOLKE (Projekt topo-importDATAtoGDWH-STAC, Skript
 # 4_SB_DSM_PUNKTWOLKE_LAS14upgrade.py), damit die DMC-Punktwolken strukturell
 # kongruent zu swissSURFACE3D sind und in den GDWH importiert werden koennen.
@@ -375,7 +387,7 @@ def _select_bands(mosaic_src: str, band_mode: str, staging_run_dir: Path, log) -
         raise RuntimeError(
             f"Band-Ausgabe '{BAND_MODE_LABELS[band_mode]}' verlangt einen 4-Band-Input (RGBN), "
             f"die Quelle hat aber {band_count} Band/Baender.\n"
-            f"Bitte im Tab 'DMC - TIFFconverter' die Band-Ausgabe auf "
+            f"Bitte im Tab '[1] DMC DOP - TIFFconverter' die Band-Ausgabe auf "
             f"'{BAND_MODE_LABELS['keep']}' stellen."
         )
     if band_count > 4:
@@ -1186,7 +1198,7 @@ def _create_cog(cfg: dict) -> None:
          f"Kompression, Baender, {'interne Maske, ' if nodata_vals else ''}kein Alpha-Band.")
 
 
-# ─── DMC LASconverter (PDAL-basiert) ───────────────────────────────────────────
+# ─── [2a] DMC DSM - LASconverter [LHN95] (PDAL-basiert) ────────────────────────
 #
 # Ablauf:
 #   1) Metadaten (Bounding Box) aller Input-.laz/.las-Kacheln parallel einlesen
@@ -1431,8 +1443,8 @@ def _raster_cell_worker(args) -> tuple:
     tif_out = str(Path(cells_dir) / f"dsm_{cell}.tif")
 
     buf = _raster_cell_buffer(gsd, thin_m)
-    # SRS der Input-Kacheln: LHN95 (Tab "LASconverter [LHN95]") bzw. LN02, wenn der
-    # Job-Aufbau es explizit setzt (Tab "LASconverter [LN02]").
+    # SRS der Input-Kacheln: LHN95 (Tab "[2a] ... [LHN95]") bzw. LN02, wenn der
+    # Job-Aufbau es explizit setzt (Tab "[2b] ... [LN02]").
     srs = job.get("srs", LAS_INPUT_SRS)
 
     stages = []
@@ -1480,18 +1492,23 @@ def _raster_cell_worker(args) -> tuple:
 
 
 def _fill_raster_nodata(vrt_path: Path, run_dir: Path, gsd: float, num_threads: str,
-                         log) -> tuple:
-    """Interpoliert die NoData-Loecher des DSM-Mosaiks und liefert ZWEI Varianten:
+                         raw_hillshade_path: str, log) -> str:
+    """Interpoliert die NoData-Loecher des DSM-Mosaiks.
 
-      (dsm_pfad, hillshade_pfad)
+    Rueckgabe: der Pfad des DSM, in dem nur die KLEINEN Loecher interpoliert sind -
+    die grossen stehen wieder als echtes NoData drin. Das ist das auszuliefernde
+    Hoehenmodell; dort bleibt erkennbar, wo die Autokorrelation nichts messen konnte.
 
-    - dsm_pfad: nur die KLEINEN Loecher sind interpoliert, die grossen stehen wieder
-      als echtes NoData drin. Das ist das auszuliefernde Hoehenmodell - dort bleibt
-      erkennbar, wo die Autokorrelation nichts messen konnte.
-    - hillshade_pfad: ALLE erreichbaren Loecher sind gefuellt. Der Hillshade ist ein
-      reines Visualisierungsprodukt; aus dieser Variante gerechnet bekommen die
-      Felswaende eine plausible Schattierung statt einer weissen Flaeche, ohne dass
-      das ausgelieferte DSM seine ehrlichen Luecken verliert.
+    NEBENBEI entsteht der ROHE Hillshade unter 'raw_hillshade_path', gerechnet aus dem
+    Stand, in dem ALLE erreichbaren Loecher gefuellt sind. Der Hillshade ist ein reines
+    Visualisierungsprodukt; so bekommen die Felswaende eine plausible Schattierung statt
+    einer weissen Flaeche, ohne dass das ausgelieferte DSM seine ehrlichen Luecken
+    verliert. Frueher wurde dieser Zwischenstand dafuer als komplette zweite Kopie des
+    Mosaiks weggeschrieben (04_raster_filled_all.tif) und erst spaeter an gdaldem
+    gegeben - das kostete bei grossen AOIs einen vollstaendigen Lese- PLUS
+    Schreibdurchlauf ueber mehrere hundert MB. gdaldem bekommt jetzt direkt das offene
+    Dataset im selben Moment; das Ergebnis ist bitgenau dasselbe (GeoTIFF-Kopien sind
+    verlustfrei, der NoData-Tag wandert mit).
 
     Ablauf:
       1. VRT materialisieren (gdal.FillNodata braucht ein beschreibbares Band)
@@ -1500,8 +1517,12 @@ def _fill_raster_nodata(vrt_path: Path, run_dir: Path, gsd: float, num_threads: 
          Flaechenschwelle; uebrig bleiben die GROSSEN Loecher
       4. gdal.FillNodata fuellt zunaechst alles (IDW aus den naechstgelegenen
          gueltigen Nachbarn je Quadrant)
-      5. dieser Stand wird als Hillshade-Quelle weggeschrieben
-      6. im DSM werden die grossen Loecher wieder auf NoData gesetzt
+      5. aus DIESEM Stand wird der rohe Hillshade gerechnet
+      6. im DSM werden die grossen Loecher wieder auf NoData gesetzt - im selben
+         Durchlauf wird gezaehlt, was an NoData uebrig bleibt (Kontrolle)
+
+    Jeder Schritt loggt seine Dauer: dieser Block war frueher ein blinder Fleck von
+    mehreren hundert Sekunden ohne eine einzige Ausgabe.
 
     Schritt 4 vor 6 und nicht umgekehrt: gdal.FillNodata kennt keine Moeglichkeit,
     Pixel gleichzeitig ungefuellt zu lassen UND von der Interpolation auszunehmen -
@@ -1516,7 +1537,6 @@ def _fill_raster_nodata(vrt_path: Path, run_dir: Path, gsd: float, num_threads: 
     import numpy as np
 
     filled_path = run_dir / "04_raster_dsm.tif"          # kleine Loecher gefuellt
-    hs_src_path = run_dir / "04_raster_filled_all.tif"   # alle Loecher gefuellt
     mask_path   = run_dir / "04_holes_mask.tif"
     sieve_path  = run_dir / "04_holes_large.tif"
 
@@ -1526,19 +1546,43 @@ def _fill_raster_nodata(vrt_path: Path, run_dir: Path, gsd: float, num_threads: 
     log(f"  Schwelle: {LAS_FILL_MAX_HOLE_AREA_M2:g} m2 = {max_hole_px} Pixel bei "
         f"{gsd:g} m GSD - groessere Loecher bleiben echtes NoData")
 
-    base_co = ["TILED=YES", "BLOCKXSIZE=512", "BLOCKYSIZE=512",
-               "COMPRESS=LZW", "BIGTIFF=YES", f"NUM_THREADS={num_threads}"]
+    # Laufzeit je Teilschritt. Ohne das ist dieser Block von aussen nicht zu
+    # unterscheiden - er meldet sich erst wieder, wenn alles durch ist.
+    _t = [time.time()]
+
+    def _step(name: str) -> None:
+        now = time.time()
+        log(f"  [{now - _t[0]:8.1f} s] {name}")
+        _t[0] = now
+
+    # Float32-Zwischenraster: Kompression ueber LAS_STAGING_COMPRESS steuerbar.
+    # PREDICTOR nur mitgeben, wenn ueberhaupt komprimiert wird - ohne Kompression ist
+    # er wirkungslos und GDAL warnt darueber.
+    float_co = ["TILED=YES", "BLOCKXSIZE=512", "BLOCKYSIZE=512",
+                f"COMPRESS={LAS_STAGING_COMPRESS}", "BIGTIFF=YES",
+                f"NUM_THREADS={num_threads}"]
+    if LAS_STAGING_COMPRESS.upper() != "NONE":
+        float_co.append("PREDICTOR=3")
+        if LAS_STAGING_COMPRESS.upper() == "ZSTD":
+            float_co.append("ZSTD_LEVEL=1")
+    # Byte-Masken bleiben komprimiert: 0/1-Flaechen mit langen uniformen Laeufen
+    # schrumpfen unter LZW um Groessenordnungen, und das kostet kaum CPU. Hier waere
+    # Abschalten das schlechtere Geschaeft (je Maske mehrere hundert MB mehr).
+    byte_co = ["TILED=YES", "BLOCKXSIZE=512", "BLOCKYSIZE=512",
+               "COMPRESS=LZW", "PREDICTOR=2", "BIGTIFF=YES",
+               f"NUM_THREADS={num_threads}"]
 
     trans_ds = gdal.Translate(
         str(filled_path), str(vrt_path),
         options=gdal.TranslateOptions(format="GTiff", noData=LAS_CELL_NODATA,
-                                       creationOptions=base_co + ["PREDICTOR=3"]),
+                                       creationOptions=float_co),
     )
     if trans_ds is None:
         raise RuntimeError("gdal.Translate hat None zurueckgegeben - Mosaik nicht "
                             "materialisierbar, NoData-Fuellung nicht moeglich.")
     trans_ds.FlushCache()
     trans_ds = None
+    _step(f"Mosaik materialisiert (COMPRESS={LAS_STAGING_COMPRESS})")
 
     ds = mask_ds = sieve_ds = None
     try:
@@ -1549,9 +1593,11 @@ def _fill_raster_nodata(vrt_path: Path, run_dir: Path, gsd: float, num_threads: 
         xs, ys = band.XSize, band.YSize
         rows_per_chunk = max(1, (64 * 1024 * 1024) // max(1, xs * 4))
 
+        log(f"  Rastergroesse: {xs} x {ys} = {xs * ys / 1e6:.1f} Mio. Pixel")
+
         def _byte_raster(path):
             out = gdal.GetDriverByName("GTiff").Create(
-                str(path), xs, ys, 1, gdal.GDT_Byte, options=base_co + ["PREDICTOR=2"])
+                str(path), xs, ys, 1, gdal.GDT_Byte, options=byte_co)
             if out is None:
                 raise RuntimeError(f"Hilfsraster nicht anzulegen: {path}")
             out.SetGeoTransform(ds.GetGeoTransform())
@@ -1568,6 +1614,7 @@ def _fill_raster_nodata(vrt_path: Path, run_dir: Path, gsd: float, num_threads: 
             holes_total += int(np.count_nonzero(hole))
             mask_band.WriteArray(hole.astype("uint8"), 0, y0)
         mask_band.FlushCache()
+        _step(f"Loch-Maske gesichert ({holes_total} NoData-Pixel)")
 
         # --- Kleine Loecher aus der Maske sieben -> uebrig bleiben die grossen ---
         # SieveFilter entfernt Polygone KLEINER als die Schwelle. Deshalb +1, damit ein
@@ -1577,6 +1624,7 @@ def _fill_raster_nodata(vrt_path: Path, run_dir: Path, gsd: float, num_threads: 
         gdal.SieveFilter(mask_band, None, sieve_band, max_hole_px + 1,
                           LAS_FILL_HOLE_CONNECTEDNESS)
         sieve_band.FlushCache()
+        _step("SieveFilter (grosse von kleinen Loechern getrennt)")
 
         # --- Fuellen ---
         # Suchdistanz max_hole_px ist eine harte obere Schranke: ein Loch von A Pixeln
@@ -1591,41 +1639,52 @@ def _fill_raster_nodata(vrt_path: Path, run_dir: Path, gsd: float, num_threads: 
         finally:
             gdal.SetConfigOption("CPL_TMPDIR", old_tmpdir)
         band.FlushCache()
+        _step("FillNodata (alle erreichbaren Loecher interpoliert)")
 
-        # --- Diesen Stand (alles gefuellt) als Hillshade-Quelle sichern ---
-        # Muss VOR dem Ruecksetzen passieren - danach ist er nicht mehr rekonstruierbar,
-        # ohne die ganze Interpolation zu wiederholen.
+        # --- Hillshade aus DIESEM Stand (alles gefuellt) rechnen ---
+        # Muss VOR dem Ruecksetzen passieren - danach ist der Stand nicht mehr
+        # rekonstruierbar, ohne die ganze Interpolation zu wiederholen.
+        # gdaldem bekommt das offene Dataset direkt. Frueher wurde hier erst eine
+        # vollstaendige Kopie des Mosaiks geschrieben und diese spaeter an gdaldem
+        # gegeben - ein kompletter Schreib- plus Lesedurchlauf ueber mehrere hundert MB,
+        # ohne dass sich am Ergebnis etwas aendert (GeoTIFF-Kopien sind verlustfrei und
+        # der NoData-Tag wandert ohnehin mit).
         ds.FlushCache()
-        hs_copy = gdal.GetDriverByName("GTiff").CreateCopy(
-            str(hs_src_path), ds, options=base_co + ["PREDICTOR=3"])
-        if hs_copy is None:
-            raise RuntimeError(f"Hillshade-Quelle nicht zu schreiben: {hs_src_path}")
-        hs_copy.FlushCache()
-        hs_copy = None
+        hs_ds = gdal.DEMProcessing(
+            str(raw_hillshade_path), ds, "hillshade",
+            options=gdal.DEMProcessingOptions(computeEdges=True),
+        )
+        if hs_ds is None:
+            raise RuntimeError("gdal.DEMProcessing hat None zurueckgegeben - Hillshade "
+                                "fehlgeschlagen.")
+        hs_ds.FlushCache()
+        hs_ds = None
+        _step(f"Hillshade gerechnet: {raw_hillshade_path}")
 
-        # --- Grosse Loecher wieder auf NoData (nur im DSM) ---
+        # --- Grosse Loecher wieder auf NoData (nur im DSM) + Kontrolle in EINEM Durchlauf ---
         # Das UND mit der Originalmaske sichert dagegen ab, dass SieveFilter kleine
         # GUELTIGE Inseln inmitten eines grossen Lochs mitverschluckt: zurueckgesetzt
         # wird nur, was vorher schon NoData war.
+        # 'remaining' wird hier gleich mitgezaehlt, statt das fertige Raster anschliessend
+        # ein zweites Mal komplett zu lesen: 'arr' ist nach dem Setzen bitgleich mit dem,
+        # was auf die Platte geht. Dafuer wird 'arr' jetzt in JEDEM Block gelesen (vorher
+        # nur in Bloecken mit Treffern) - unter dem Strich ein voller Lesedurchlauf
+        # weniger, weil ausserhalb der Daten praktisch jeder Block Treffer hat.
         kept = 0
+        remaining = 0
         for y0 in range(0, ys, rows_per_chunk):
             rows = min(rows_per_chunk, ys - y0)
             big = ((sieve_band.ReadAsArray(0, y0, xs, rows) != 0) &
                    (mask_band.ReadAsArray(0, y0, xs, rows) != 0))
             n = int(np.count_nonzero(big))
+            arr = band.ReadAsArray(0, y0, xs, rows)
             if n:
-                arr = band.ReadAsArray(0, y0, xs, rows)
                 arr[big] = LAS_CELL_NODATA
                 band.WriteArray(arr, 0, y0)
                 kept += n
-        band.FlushCache()
-
-        # --- Kontrolle statt Annahme: uebrig sein duerfen nur die grossen Loecher ---
-        remaining = 0
-        for y0 in range(0, ys, rows_per_chunk):
-            rows = min(rows_per_chunk, ys - y0)
-            arr = band.ReadAsArray(0, y0, xs, rows)
             remaining += int(np.count_nonzero(arr == LAS_CELL_NODATA))
+        band.FlushCache()
+        _step("Grosse Loecher zurueckgesetzt + Kontrolle")
     finally:
         ds = mask_ds = sieve_ds = None
 
@@ -1638,8 +1697,7 @@ def _fill_raster_nodata(vrt_path: Path, run_dir: Path, gsd: float, num_threads: 
             f"der Schwelle liegt - kein gueltiger Nachbar in Reichweite.")
     else:
         log("  Kontrolle OK: es ist genau das NoData uebrig, das stehen bleiben soll.")
-    log(f"  Hillshade-Quelle (alle Loecher gefuellt): {hs_src_path}")
-    return (str(filled_path), str(hs_src_path))
+    return str(filled_path)
 
 
 def _prepare_hillshade_values(path: str) -> tuple:
@@ -1737,10 +1795,27 @@ def _mosaic_las_raster(cell_rasters, run_dir: Path, output_path: str,
     vrt_ds.FlushCache()
     vrt_ds = None
 
-    warp_source = hillshade_source = str(vrt_path)
+    # Der ROHE Hillshade entsteht bereits IN _fill_raster_nodata: er muss aus dem
+    # vollstaendig gefuellten Zwischenstand gerechnet werden, und den gibt es dort nur
+    # kurz - frueher wurde dafuer eine komplette zweite Kopie des Mosaiks geschrieben.
+    raw_hillshade_path = run_dir / "05_hillshade_raw.tif"
+    warp_source = str(vrt_path)
     if LAS_FILL_NODATA_HOLES:
-        warp_source, hillshade_source = _fill_raster_nodata(
-            vrt_path, run_dir, gsd, num_threads, log)
+        warp_source = _fill_raster_nodata(vrt_path, run_dir, gsd, num_threads,
+                                           str(raw_hillshade_path), log)
+    else:
+        # Ohne Loch-Fuellung gibt es keinen solchen Zwischenstand - dann direkt aus dem
+        # Mosaik, wie bisher.
+        log("\nErzeuge Hillshade (ohne Loch-Fuellung, direkt aus dem Mosaik)...")
+        hs_ds = gdal.DEMProcessing(
+            str(raw_hillshade_path), str(vrt_path), "hillshade",
+            options=gdal.DEMProcessingOptions(computeEdges=True),
+        )
+        if hs_ds is None:
+            raise RuntimeError("gdal.DEMProcessing hat None zurueckgegeben - Hillshade "
+                                "fehlgeschlagen.")
+        hs_ds.FlushCache()
+        hs_ds = None
 
     log(f"\nClippe Raster auf AOI (Cutline): {clip_shape_path}")
     log(f"  Ausserhalb -> NoData = {LAS_RASTER_NODATA:g}")
@@ -1796,18 +1871,12 @@ def _mosaic_las_raster(cell_rasters, run_dir: Path, output_path: str,
             f"(GDWH-Konvention SB_DSM) - Raster nicht auslieferbar.")
     log(f"  NoData-Kontrolle OK: Header traegt {written_nd!r}")
 
-    # --- Hillshade aus dem vollstaendig gefuellten, ungeclippten Mosaik rechnen ---
-    log("\nErzeuge Hillshade...")
-    log(f"  Quelle: {hillshade_source}")
-    raw_hillshade_path = run_dir / "05_hillshade_raw.tif"
-    hs_ds = gdal.DEMProcessing(
-        str(raw_hillshade_path), hillshade_source, "hillshade",
-        options=gdal.DEMProcessingOptions(computeEdges=True),
-    )
-    if hs_ds is None:
-        raise RuntimeError("gdal.DEMProcessing hat None zurueckgegeben - Hillshade fehlgeschlagen.")
-    hs_ds.FlushCache()
-    hs_ds = None
+    # --- Hillshade-Nachbearbeitung ---
+    # Der rohe Hillshade liegt bereits unter raw_hillshade_path: gerechnet wurde er aus
+    # dem vollstaendig gefuellten Zwischenstand, also dort, wo es diesen Stand ueberhaupt
+    # gab (in _fill_raster_nodata bzw. oben im Zweig ohne Loch-Fuellung).
+    log("\nBereite Hillshade auf...")
+    log(f"  Roh-Hillshade: {raw_hillshade_path}")
 
     # Muss VOR dem Clip passieren: danach ist 255 die NoData-Maske und weder ein
     # gueltiges 255er-Pixel noch ein Loch waere davon noch zu trennen.
@@ -2240,9 +2309,9 @@ def _process_las(cfg: dict) -> None:
                             f"verarbeitet werden - siehe Log.")
 
 
-# ─── DMC LASconverter [LN02] (GDWH-Metadaten, LAS 1.4) ─────────────────────────
+# ─── [2b] DMC DSM - LASconverter [LN02] (GDWH-Metadaten, LAS 1.4) ──────────────
 #
-# Nachgelagerter Schritt zum Tab "DMC - LASconverter [LHN95]": dessen .las/.laz-Kacheln
+# Nachgelagerter Schritt zum Tab "[2a] DMC DSM - LASconverter [LHN95]": dessen .las/.laz-Kacheln
 # werden extern mit GeoSuite/REFRAME von LHN95 nach LN02 reframt (nur die Hoehe,
 # X/Y bleiben LV95) - dieser Tab bringt das Ergebnis anschliessend in die
 # GDWH-taugliche Form.

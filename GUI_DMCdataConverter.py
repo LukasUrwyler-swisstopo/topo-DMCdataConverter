@@ -1,31 +1,32 @@
 """
 GUI_DMCdataConverter.py - DMC Werkzeuge GUI
-Tkinter-Oberflaeche mit sechs Tabs:
-  - "DMC - TIFFconverter"       : technische 200m-DOP-Tiles clippen (gueltige
-                                   Flaeche) und in 1km x 1km-Tiles zerlegen
-                                   (parallelisiert), optional ein QC-Mosaik (COG)
-  - "DMC - LASconverter [LHN95]": technische 200m-LAZ-Tiles per AOI croppen,
-                                   optional thinnen, in 1km x 1km-Tiles zerlegen
-                                   (.las/.laz) und optional zu einem Gesamt-DSM-
-                                   Raster (.tif/.tfw) rastern - Hoehe bleibt LHN95,
-                                   Reframe zu LN02 erfolgt separat via GeoSuite
-  - "DMC - LASconverter [LN02]"  : die via GeoSuite nach LN02 reframten 1km-Tiles
-                                   in die GDWH-taugliche LAS-1.4-Form bringen (PF7
-                                   mit RGB, global_encoding 17, scale 0.01, Offset =
-                                   Tile-Ursprung, byte-exakte LV95/LN02-CRS-VLRs),
-                                   optional ein QC-COPC der ganzen AOI (Sichtkontrolle)
-                                   und optional ebenfalls DSM + Hillshade rastern
-  - "Create DSM-Raster"          : DSM + Hillshade aus einem beliebigen Ordner mit
-                                   LAS/LAZ-Kacheln - ohne Punktwolken-Verarbeitung
-  - "Create COGTIFF"             : EIN COG aus einem beliebigen Ordner mit TIFF-
-                                   Kacheln (Mosaik, Bandauswahl, Kompression)
-  - "Create COPC"                : EIN COPC aus einem beliebigen Ordner mit LAS/LAZ-
-                                   Kacheln (Merge via untwine)
+Tkinter-Oberflaeche mit sechs Tabs - drei Haupt-Tabs [1] / [2a] / [2b] (der
+Produktionsweg) und drei optionale Zusatz-Tabs:
+  - "[1] DMC DOP - TIFFconverter"        : technische 200m-DOP-Tiles clippen (gueltige
+                                           Flaeche) und in 1km x 1km-Tiles zerlegen
+                                           (parallelisiert), optional ein QC-Mosaik (COG)
+  - "[2a] DMC DSM - LASconverter [LHN95]": technische 200m-LAZ-Tiles per AOI croppen,
+                                           optional thinnen, in 1km x 1km-Tiles zerlegen
+                                           (.las/.laz) und optional zu einem Gesamt-DSM-
+                                           Raster (.tif/.tfw) rastern - Hoehe bleibt LHN95,
+                                           Reframe zu LN02 erfolgt separat via GeoSuite
+  - "[2b] DMC DSM - LASconverter [LN02]" : die via GeoSuite nach LN02 reframten 1km-Tiles
+                                           in die GDWH-taugliche LAS-1.4-Form bringen (PF7
+                                           mit RGB, global_encoding 17, scale 0.01, Offset =
+                                           Tile-Ursprung, byte-exakte LV95/LN02-CRS-VLRs),
+                                           optional ein QC-COPC der ganzen AOI (Sichtkontrolle)
+                                           und optional ebenfalls DSM + Hillshade rastern
+  - "Create DSM-Raster"                  : DSM + Hillshade aus einem beliebigen Ordner mit
+                                           LAS/LAZ-Kacheln - ohne Punktwolken-Verarbeitung
+  - "Create COGTIFF"                     : EIN COG aus einem beliebigen Ordner mit TIFF-
+                                           Kacheln (Mosaik, Bandauswahl, Kompression)
+  - "Create COPC"                        : EIN COPC aus einem beliebigen Ordner mit LAS/LAZ-
+                                           Kacheln (Merge via untwine)
 Styling analog zu topo-COGTIFFconverter / GUI_cogtiffConverter.py.
 
 Das GUI laeuft mit Standard-Python (kein osgeo erforderlich).
 GDAL-Operationen werden via _osgeo_runner.py als Subprocess (OSGeo4W Python) ausgefuehrt.
-Punktwolken-Operationen (Tab 2) laufen via PDAL-CLI-Subprocess (pdal.exe, automatisch
+Punktwolken-Operationen (Tabs [2a]/[2b]) laufen via PDAL-CLI-Subprocess (pdal.exe, automatisch
 erkannt), orchestriert vom selben OSGeo4W-Python-Prozess.
 """
 
@@ -56,7 +57,7 @@ CONFIG_FILE          = os.path.join(PROCESS_SCRIPTS_DIR, "_dmc_config.json")
 DEFAULT_GRID_SHAPE   = os.path.join(SCRIPT_DIR, "swissGRID_1km2_shp", "chGRID_1km2.shp")
 DEFAULT_STAGING_DIR  = r"Y:\02_DMC_tempProcessingFolder"
 
-# ─── Band-Ausgabe (Tab "DMC - TIFFconverter") ────────────────────────────────
+# ─── Band-Ausgabe (Tab "[1] DMC DOP - TIFFconverter") ────────────────────────
 # DMC-Ausgangsdaten sind praktisch immer 4-Band (RGBN: Rot, Gruen, Blau, NIR).
 # Fuer die Publikation wird daraus optional ein 3-Band-Auszug gebildet. Die
 # Schluessel entsprechen 1:1 _osgeo_runner.BAND_MODES.
@@ -74,7 +75,7 @@ BAND_HINT_UNKNOWN = "RGB-/NRG-Auszug nur bei 4-Band-Input (RGBN)"
 BAND_HINT_4BAND   = "4-Band erkannt  |  RGB = 1,2,3  |  NRG = 4,1,2"
 BAND_HINT_NOT4    = "Input hat {count} Band/Baender - Auswahl nur bei 4-Band (RGBN)"
 
-# ─── NoData-Werte (Tabs "DMC - TIFFconverter" / "Create COGTIFF") ────────────
+# ─── NoData-Werte (Tabs "[1] DMC DOP - TIFFconverter" / "Create COGTIFF") ────
 # Pixelwert je Band -> interne COG-Maske (Flag PER_DATASET); im TIFFconverter auch
 # Clip-Wert und NoData-Tag der Kacheln. Fehlende Werte fuellt der Runner mit dem
 # letzten auf ("0 0 0" auf RGBN = 0 0 0 0). 8 bit: praktisch immer 0 0 0.
@@ -434,12 +435,34 @@ class DMCConverterApp(tk.Tk):
         tab_dsm  = ttk.Frame(self._notebook)
         tab_cog  = ttk.Frame(self._notebook)
         tab_copc = ttk.Frame(self._notebook)
-        self._notebook.add(tab_tiff, text="DMC - TIFFconverter")
-        self._notebook.add(tab_las,  text="DMC - LASconverter [LHN95]")
-        self._notebook.add(tab_ln02, text="DMC - LASconverter [LN02]")
+        # Leerer Platzhalter, nur als optischer Trenner zwischen den Haupt-Tabs und den
+        # optionalen Zusatz-Tabs. Bleibt immer leer und wird nie aufgebaut.
+        tab_gap  = ttk.Frame(self._notebook)
+        self._notebook.add(tab_tiff, text="[1] DMC DOP - TIFFconverter")
+        self._notebook.add(tab_las,  text="[2a] DMC DSM - LASconverter [LHN95]")
+        self._notebook.add(tab_ln02, text="[2b] DMC DSM - LASconverter [LN02]")
+        # Trenner: 'disabled' macht ihn unanwaehlbar (ein Klick prallt ab, der aktive
+        # Tab bleibt stehen) und nimmt ihn aus der Tastatur-Navigation.
+        self._notebook.add(tab_gap,  text="   ", state="disabled")
         self._notebook.add(tab_dsm,  text="Create DSM-Raster")
         self._notebook.add(tab_cog,  text="Create COGTIFF")
         self._notebook.add(tab_copc, text="Create COPC")
+
+        # Haupt-Tabs [1]/[2a]/[2b] breit, optionale Zusatz-Tabs schmal.
+        # ttk kennt KEINE Schriftart pro Tab (gueltige Optionen: compound, image,
+        # padding, state, sticky, text, underline; tab(i, font=...) wirft TclError
+        # 'unknown option "-font"'). Auch die HOEHE hilft nicht: die Tab-Leiste ist
+        # immer so hoch wie ihr hoechster Tab. Bleibt die BREITE.
+        #
+        # 'padding' taugt NICHT als Luecke zwischen zwei Tabs - es wirkt INNERHALB des
+        # Tabs und macht ihn bloss breiter, der Rahmen waechst mit. Die Trennung
+        # uebernimmt deshalb der leere, deaktivierte Platzhalter-Tab auf Index 3;
+        # dadurch liegen die Zusatz-Tabs bei 4/5/6.
+        for _i in (0, 1, 2):
+            self._notebook.tab(_i, padding=(14, 6))
+        self._notebook.tab(3, padding=(10, 0))      # Breite der Luecke
+        for _i in (4, 5, 6):
+            self._notebook.tab(_i, padding=(5, 0))
 
         self._build_tiff_tab(tab_tiff)
         self._build_las_tab(tab_las)
@@ -497,7 +520,7 @@ class DMCConverterApp(tk.Tk):
         self._accent_labels.append(lbl)
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=(0, 6))
 
-    # ── Tab: DMC - LASconverter ────────────────────────────────────────────────
+    # ── Tab: [2a] DMC DSM - LASconverter [LHN95] ───────────────────────────────
     def _build_las_tab(self, parent):
         sf = self._build_scrollable(parent, "_canvas_las", "_sf_las")
 
@@ -778,7 +801,7 @@ class DMCConverterApp(tk.Tk):
                          variable=self._las_keep_staging_var
                          ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
-    # ── Tab: DMC - LASconverter [LN02] ─────────────────────────────────────────
+    # ── Tab: [2b] DMC DSM - LASconverter [LN02] ────────────────────────────────
     def _build_ln02_tab(self, parent):
         sf = self._build_scrollable(parent, "_canvas_ln02", "_sf_ln02")
 
@@ -1794,7 +1817,7 @@ class DMCConverterApp(tk.Tk):
         self._launch(cfg, self._start_btn_copc, "Create COPC",
                      "COPC_" + Path(out).name[:-len(".copc.laz")])
 
-    # ── Tab: DMC - TIFFconverter ───────────────────────────────────────────────
+    # ── Tab: [1] DMC DOP - TIFFconverter ───────────────────────────────────────
     def _build_tiff_tab(self, parent):
         self.bind_class("TCombobox", "<MouseWheel>", self._fwd_wheel)
         self.bind_all("<MouseWheel>", self._fwd_wheel)
@@ -1923,7 +1946,7 @@ class DMCConverterApp(tk.Tk):
         erkannte Input nicht dazu, wird die Auswahl gesperrt und auf '4-Band'
         zurueckgesetzt - sonst laeuft der Job erst im Runner in einen Fehler.
         band_count=None bedeutet 'unbekannt' (keine Datei-Info gelesen).
-        Ohne Widget-Angabe die des Tabs TIFFconverter; 'Create COGTIFF' uebergibt
+        Ohne Widget-Angabe die des Tabs [1]; 'Create COGTIFF' uebergibt
         seine eigenen."""
         combo = combo or self._band_combo
         var = var or self._band_var
@@ -2480,13 +2503,35 @@ class DMCConverterApp(tk.Tk):
             bordercolor=T["sep"])
         s.configure("TNotebook",
             background=T["root"], bordercolor=T["sep"])
+        # Bewusst KEINE Schriftart gesetzt: ttk kann sie ohnehin nicht pro Tab
+        # vergeben, fett wirkten dann alle sechs Tabs - die Abstufung Haupt- vs.
+        # Zusatz-Tab laeuft allein ueber die pro Tab gesetzte Groesse, siehe die
+        # tab(padding=...)-Schleifen beim Aufbau.
         s.configure("TNotebook.Tab",
             background=T["btn"], foreground=T["fg"],
             bordercolor=T["sep"], padding=(10, 4))
+        # Bewusst KEIN padding in dieser Map: ein Style-Map schlaegt die pro Tab
+        # gesetzte Groesse, sobald der Tab ausgewaehlt ist - ein kleiner Zusatz-Tab
+        # waere beim Anklicken auf Haupt-Tab-Groesse gesprungen.
+        #
+        # Der leere Platzhalter-Tab wird hier unsichtbar gemacht. ttk kann zwar keinen
+        # Stil pro Tab vergeben, wohl aber pro ZUSTAND - und 'disabled' hat genau ein
+        # Tab: der Trenner (siehe den Aufbau oben; sonst wird nirgends ein Tab
+        # deaktiviert). Gesetzt werden die Fuellung UND alle drei Rahmenfarben, mit
+        # denen clam einen Tab zeichnet (bordercolor/lightcolor/darkcolor) - sonst
+        # bliebe der Umriss stehen. Zielfarbe ist T["root"], also exakt der Grund
+        # hinter der Tab-Leiste; weil das in _apply_theme steht, folgt der Trenner
+        # automatisch dem Hell-/Dunkel-Umschalter.
+        #
+        # 'disabled' steht VORNE: ttk nimmt den ersten passenden Eintrag, sonst
+        # wuerde blosses Ueberfahren mit der Maus ('active') ihn wieder sichtbar machen.
         s.map("TNotebook.Tab",
-            background=[("selected", T["panel"]), ("active", T["btn_hover"])],
-            foreground=[("selected", T["accent"])],
-            padding=[("selected", (16, 8))])
+            background=[("disabled", T["root"]), ("selected", T["panel"]),
+                        ("active", T["btn_hover"])],
+            foreground=[("disabled", T["root"]), ("selected", T["accent"])],
+            bordercolor=[("disabled", T["root"])],
+            lightcolor=[("disabled", T["root"])],
+            darkcolor=[("disabled", T["root"])])
 
         self.option_add("*TCombobox*Listbox.background",       T["list"])
         self.option_add("*TCombobox*Listbox.foreground",       T["fg"])
@@ -2574,9 +2619,16 @@ class DMCConverterApp(tk.Tk):
 
     def _show_done_popup(self, success: bool, vorgang: str) -> None:
         from tkinter import messagebox
+        # Hinweis auf den Folgeschritt, den der startende Tab hinterlegt hat (derzeit
+        # nur [2a] -> GeoSuite -> [2b]). Wird IMMER konsumiert, auch bei Misserfolg:
+        # sonst taucht er spaeter im Popup eines ganz anderen Laufs wieder auf.
+        hint = getattr(self, "_done_hint", None)
+        self._done_hint = None
         if success:
-            messagebox.showinfo(f"{vorgang} abgeschlossen",
-                                 f"{vorgang} erfolgreich abgeschlossen.", parent=self)
+            text = f"{vorgang} erfolgreich abgeschlossen."
+            if hint:
+                text = text + "\n\n" + hint
+            messagebox.showinfo(f"{vorgang} abgeschlossen", text, parent=self)
         else:
             messagebox.showerror(f"{vorgang} fehlgeschlagen",
                                   f"{vorgang} ist fehlgeschlagen.\nDetails siehe Log-Ausgabe.", parent=self)
@@ -2852,6 +2904,21 @@ class DMCConverterApp(tk.Tk):
         self._progress_bar.start(10)
         self._clear_log()
         self._log("=== DMC LAS-Konvertierung gestartet ===\n\n")
+
+        # Hinweis auf den naechsten Arbeitsschritt, den das Abschluss-Popup anzeigt.
+        # Zwischen diesem Tab und [2b] liegt GeoSuite/REFRAME - ein Schritt AUSSERHALB
+        # dieses Tools, der sonst leicht vergessen geht.
+        self._done_hint = (
+            "Die 1km-Kacheln (LV95 / LHN95) liegen hier:\n"
+            "{}\n\n"
+            "Nächster Schritt - ausserhalb dieses Tools:\n"
+            "Diese .{}-Kacheln mit GeoSuite / REFRAME von LHN95 nach LN02\n"
+            "transformieren (nur die Höhe, X/Y bleiben LV95).\n\n"
+            "Danach im Tab \"[2b] DMC DSM - LASconverter [LN02]\":\n"
+            "den GeoSuite-Output als Input-Ordner wählen. Dort werden die Kacheln\n"
+            "GDWH-tauglich finalisiert - LAS 1.4 / PF7 mit RGB, global_encoding 17\n"
+            "und der autoritative CRS-Tag LV95 + LN02 (EPSG:2056 + 5728)."
+        ).format(cfg["output_dir_laz"], cfg["out_format"])
 
         log_stem = f"{cfg['jahr']}_{cfg['area']}_TIN"
         threading.Thread(

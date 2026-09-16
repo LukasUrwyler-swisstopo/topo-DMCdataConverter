@@ -217,7 +217,7 @@ def test_raster_cell_pipeline_structure(tmp_path):
     assert not list(tmp_path.glob("pipeline_*.json"))
 
 
-# ── Tab "DMC - LASconverter [LN02]" ───────────────────────────────────────────
+# ── Tab "[2b] DMC DSM - LASconverter [LN02]" ──────────────────────────────────
 def _runner():
     return load_module_from_path(
         "runner_module",
@@ -684,16 +684,25 @@ def test_dsm_small_holes_filled_large_holes_kept():
     assert runner_mod.LAS_FILL_HOLE_CONNECTEDNESS == 8
 
     src = inspect.getsource(runner_mod._mosaic_las_raster)
-    assert "warp_source, hillshade_source = _fill_raster_nodata(" in src
+    assert "warp_source = _fill_raster_nodata(" in src
+    # Der Pfad des rohen Hillshade wird hineingereicht - erzeugt wird er dort, wo es den
+    # vollgefuellten Zwischenstand gibt (siehe test_hillshade_comes_from_fully_filled_mosaic)
+    assert "str(raw_hillshade_path), log)" in src
     assert src.index("_fill_raster_nodata(") < src.index("cutlineDSName=clip_shape_path")
     # Geclippt wird das gefuellte Raster, nicht mehr das rohe VRT
     assert "gdal.Warp(output_path, warp_source" in src
+    # Die AUSGELIEFERTEN Raster bleiben komprimiert - LAS_STAGING_COMPRESS betrifft
+    # ausschliesslich die Wegwerf-Zwischenraster im Staging.
+    assert '"COMPRESS=LZW", "PREDICTOR=3", "BIGTIFF=YES", "TFW=YES"' in src
 
     fill = inspect.getsource(runner_mod._fill_raster_nodata)
-    # Zwei Varianten: DSM mit ehrlichen Luecken, Hillshade-Quelle vollstaendig gefuellt
-    assert "return (str(filled_path), str(hs_src_path))" in fill
-    # Die vollgefuellte Kopie muss VOR dem Ruecksetzen der grossen Loecher entstehen
-    assert fill.index("CreateCopy(") < fill.index("arr[big] = LAS_CELL_NODATA")
+    # Zurueck kommt das DSM mit ehrlichen Luecken; der Hillshade entsteht nebenbei
+    # unter dem hineingereichten Pfad (frueher als zweite, vollgefuellte Kopie).
+    assert "return str(filled_path)" in fill
+    assert "raw_hillshade_path: str" in fill
+    # Der Hillshade muss aus dem vollgefuellten Stand kommen, also VOR dem
+    # Ruecksetzen der grossen Loecher gerechnet werden.
+    assert fill.index("gdal.DEMProcessing(") < fill.index("arr[big] = LAS_CELL_NODATA")
     # Flaechenschwelle -> Pixelschwelle ueber die GSD, +1 damit "bis zu" inklusiv ist
     assert "LAS_FILL_MAX_HOLE_AREA_M2 / (gsd * gsd)" in fill
     assert "max_hole_px + 1" in fill
@@ -720,10 +729,16 @@ def test_hillshade_comes_from_fully_filled_mosaic():
     import inspect
     runner_mod = _runner()
     src = inspect.getsource(runner_mod._mosaic_las_raster)
+    fill = inspect.getsource(runner_mod._fill_raster_nodata)
 
-    # Quelle des Hillshade ist die gefuellte Variante, nicht output_path
-    assert 'gdal.DEMProcessing(\n        str(raw_hillshade_path), hillshade_source,' in src
+    # Quelle des Hillshade ist der vollgefuellte Stand: gdaldem bekommt das offene
+    # Dataset direkt nach FillNodata - und damit zwingend vor dem Ruecksetzen.
+    assert 'str(raw_hillshade_path), ds, "hillshade"' in fill
+    assert fill.index("gdal.FillNodata(") < fill.index("gdal.DEMProcessing(")
+    assert fill.index("gdal.DEMProcessing(") < fill.index("arr[big] = LAS_CELL_NODATA")
+    # Niemals aus dem fertigen (geclippten) DSM
     assert 'str(raw_hillshade_path), output_path' not in src
+    assert "output_path" not in fill
 
     # Weil die Quelle jetzt das Mosaik ist, muss das Zielgitter erzwungen werden
     hs_opts = src[src.index("hs_warp_options = gdal.WarpOptions("):]
@@ -1466,10 +1481,25 @@ def test_cog_and_copc_tabs():
 
     app = gui_mod.DMCConverterApp()
     try:
-        tabs = [app._notebook.tab(i, "text") for i in range(app._notebook.index("end"))]
+        n_tabs = app._notebook.index("end")
+        tabs = [app._notebook.tab(i, "text") for i in range(n_tabs)]
+        states = [str(app._notebook.tab(i, "state")) for i in range(n_tabs)]
         assert tabs[-2:] == ["Create COGTIFF", "Create COPC"]
-        # Jede Scroll-Flaeche ist registriert (Theming + Mausrad), auch die des DSM-Tabs
-        assert len(app._scroll_areas) == len(tabs)
+
+        # Zwischen den Haupt-Tabs [1]/[2a]/[2b] und den optionalen Zusatz-Tabs steht ein
+        # leerer, deaktivierter Platzhalter - rein optische Trennung. ttk kann Tabs nicht
+        # anders auseinanderruecken: 'padding' wirkt INNERHALB eines Tabs und macht ihn
+        # bloss breiter, der Rahmen waechst mit.
+        spacer = [i for i, s in enumerate(states) if s == "disabled"]
+        assert len(spacer) == 1
+        assert tabs[spacer[0]].strip() == ""
+        assert tabs[spacer[0] - 1].startswith("[2b]")
+        assert tabs[spacer[0] + 1] == "Create DSM-Raster"
+
+        # Jede Scroll-Flaeche ist registriert (Theming + Mausrad), auch die des DSM-Tabs.
+        # Gezaehlt werden nur Tabs MIT Inhalt - der Platzhalter baut keine auf.
+        inhalt = [t for t, s in zip(tabs, states) if s == "normal"]
+        assert len(app._scroll_areas) == len(inhalt)
         assert app._canvas_for_widget(app._sf_dsm) is app._canvas_dsm
 
         assert app._cog_compress_var.get() == "JPEG"

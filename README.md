@@ -22,35 +22,35 @@ ueber die Schaltflaeche **Aendern…** manuell gesetzt werden und wird in
 
 | Tab | Input | Verarbeitung | Output |
 |---|---|---|---|
-| **DMC - TIFFconverter** | technische 200m-DOP-Kacheln (`.tif`), meist 4-Band RGBN | Mosaik → optionaler Bandauszug (RGB / NRG) → Clip auf die gültige Fläche → Zuschnitt ins 1km-Grid | 1km-DOP-Kacheln (`.tif`)<br>4-Band RGBN (Standard) oder 3-Band RGB / NRG<br>optional QC-Mosaik der AOI (COG) |
-| **DMC - LASconverter [LHN95]** | technische 200m-Punktwolken (`.laz`) | Kacheln je Gitterzelle mergen → Crop auf Zelle + AOI → optional ausdünnen | 1km-Kacheln `…_LV95_LHN95.las` (LAS 1.4 / PF7, mit RGB; `.laz` wählbar)<br>optional DSM + Hillshade |
-| **DMC - LASconverter [LN02]** | die von GeoSuite nach LN02 reframten 1km-Kacheln (`.laz` oder `.las`) | requantisieren → CRS-VLRs byte-exakt injizieren → vollständig validieren | 1km-Kacheln `…_LV95_LN02.laz` (GDWH-tauglich, LAS 1.4 / PF7 mit RGB)<br>optional QC-COPC der AOI, DSM + Hillshade |
+| **[1] DMC DOP - TIFFconverter** | technische 200m-DOP-Kacheln (`.tif`), meist 4-Band RGBN | Mosaik → optionaler Bandauszug (RGB / NRG) → Clip auf die gültige Fläche → Zuschnitt ins 1km-Grid | 1km-DOP-Kacheln (`.tif`)<br>4-Band RGBN (Standard) oder 3-Band RGB / NRG<br>optional QC-Mosaik der AOI (COG) |
+| **[2a] DMC DSM - LASconverter [LHN95]** | technische 200m-Punktwolken (`.laz`) | Kacheln je Gitterzelle mergen → Crop auf Zelle + AOI → optional ausdünnen | 1km-Kacheln `…_LV95_LHN95.las` (LAS 1.4 / PF7, mit RGB; `.laz` wählbar)<br>optional DSM + Hillshade |
+| **[2b] DMC DSM - LASconverter [LN02]** | die von GeoSuite nach LN02 reframten 1km-Kacheln (`.laz` oder `.las`) | requantisieren → CRS-VLRs byte-exakt injizieren → vollständig validieren | 1km-Kacheln `…_LV95_LN02.laz` (GDWH-tauglich, LAS 1.4 / PF7 mit RGB)<br>optional QC-COPC der AOI, DSM + Hillshade |
 | **Create DSM-Raster** | beliebiger Ordner mit `.las`/`.laz` | zellweise IDW-Rasterung → mosaikieren → Löcher füllen → AOI-Maske → Hillshade | ein DSM + ein Hillshade (`.tif` + `.tfw`) |
 | **Create COGTIFF** | beliebiger Ordner mit `.tif`-Kacheln (+ `.tfw`) | VRT-Mosaik → optionaler Bandauszug (RGB / NRG) → COG → Prüfung | ein COGTIFF (Name frei wählbar) |
 | **Create COPC** | beliebiger Ordner mit `.las`/`.laz`-Kacheln | Merge via untwine → Prüfung | ein COPC `….copc.laz` (Name frei wählbar) |
 
 ### Reihenfolge bei den Punktwolken
 
-Die beiden LASconverter-Tabs gehören zusammen — dazwischen liegt ein Schritt **ausserhalb**
+Die beiden Tabs **[2a]** und **[2b]** gehören zusammen — dazwischen liegt ein Schritt **ausserhalb**
 dieses Tools:
 
 ```
 technische 200m-LAZ  (RealityStudio)
       │
-      ▼   Tab [LHN95]        AOI-Crop · Thinning · 1km-Grid
+      ▼   Tab [2a]           AOI-Crop · Thinning · 1km-Grid
 …_LV95_LHN95.las             LAS 1.4 / PF7, mit RGB  (`.laz` wählbar)
       │
       ▼   GeoSuite / REFRAME     ←  ausserhalb dieses Tools, transformiert NUR die Höhe
 …_LV95_LN02.las
       │
-      ▼   Tab [LN02]         GDWH-Header · CRS-VLRs · Validierung
+      ▼   Tab [2b]           GDWH-Header · CRS-VLRs · Validierung
 …_LV95_LN02.laz              LAS 1.4 / PF7, mit RGB  →  Lieferung
       │
       ▼   topo-importDATAtoGDWH-STAC   ←  ausserhalb dieses Tools, dort CameraSystem „Leica DMC-4“
 GDWH / STAC                  PF7 mit RGB  (fertige Kacheln werden dort nur kopiert)
 ```
 
-Das DOP läuft unabhängig davon über den **TIFFconverter**. **Create DSM-Raster** ist ein Zusatz,
+Das DOP läuft unabhängig davon über den Tab **[1]**. **Create DSM-Raster** ist ein Zusatz,
 den man auf jeden fertigen Kachelordner ansetzen kann — unabhängig von den anderen Tabs.
 Dasselbe gilt für **Create COGTIFF** und **Create COPC**: sie machen aus einem beliebigen
 Kachelordner genau ein Produkt, ohne die Converter-Funktionen.
@@ -246,12 +246,12 @@ automatisch erkannt (PATH, OSGeo4W-/QGIS-Installationspfade), kein eigenes GUI-F
    Punktwolke entfernt), bei DSM und Hillshade je eine Maskierung (ausserhalb -> NoData, Extent
    bleibt).
 
-6. **Grid-Shape (1km x 1km)**: wie bei Tab 1 — Attribut `NAME`, Standard `chGRID_1km2.shp`.
+6. **Grid-Shape (1km x 1km)**: wie bei Tab **[1]** — Attribut `NAME`, Standard `chGRID_1km2.shp`.
    Bestimmt die Kachelung der LAZ/LAS-Ausgabe und intern auch die Zellen des Raster-Builds;
    DSM und Hillshade werden trotzdem als je ein einzelnes Gesamtbild ausgeliefert (die
    Zell-Raster sind reine Zwischenprodukte im Staging-Ordner).
 
-7. **Staging & Parallelisierung**: analog Tab 1, eigener Staging-Unterordner (`<AREA>_<JAHR>_LAS`).
+7. **Staging & Parallelisierung**: analog Tab **[1]**, eigener Staging-Unterordner (`<AREA>_<JAHR>_LAS`).
 
 8. **DMC LAS KONVERTIEREN** starten.
 
@@ -725,20 +725,20 @@ GUI_DMCdataConverter.py            (Standard-Python, tkinter)
         │  JSON-Config (tempfile)
         ▼
 process_scripts/_osgeo_runner.py   (OSGeo4W Python, GDAL/OGR)
-    Aktion "process"      (Tab "DMC - TIFFconverter"):
+    Aktion "process"      (Tab "[1] DMC DOP - TIFFconverter"):
         │  1) Mosaik-VRT (uebernommen oder frisch gebaut)
         │  1b) optionaler Bandauszug RGBN -> RGB / NRG als VRT (band_mode)
         │  2) Cutline-Clip auf gueltige Flaeche  -> Staging
         │  3) Grid-Zuschnitt, parallelisiert (ProcessPoolExecutor)
         │  4) optional QC-Mosaik (COG) aus den fertigen Kacheln
         │
-    Aktion "process_las"  (Tab "DMC - LASconverter [LHN95]"):
+    Aktion "process_las"  (Tab "[2a] DMC DSM - LASconverter [LHN95]"):
         │  1) Metadaten-Scan aller Kacheln, parallel (ProcessPoolExecutor)
         │  2) Job-Pool ueber alle 1km-Zellen, parallel -> je 1 pdal.exe pro Job
         │     (Punktwolken-Kachel + optional DSM-Zelle), Retry seriell
         │  3) Zell-Raster mosaikieren (VRT) -> Cutline-Clip -> Hillshade
         │
-    Aktion "process_las_ln02"  (Tab "DMC - LASconverter [LN02]"):
+    Aktion "process_las_ln02"  (Tab "[2b] DMC DSM - LASconverter [LN02]"):
         │  1) Kachelursprung aus allen Dateinamen parsen (Abbruch vor dem
         │     ersten Schreibzugriff), Metadaten-Scan parallel
         │  2) Job-Pool: je Kachel Requantisierung auf LAS 1.4/PF7 + VLR-Byte-
@@ -768,8 +768,8 @@ process_scripts/_osgeo_runner.py   (OSGeo4W Python, GDAL/OGR)
 Die Trennung ermoeglicht es, das GUI mit jeder Standard-Python-Installation zu starten, ohne
 OSGeo4W-Abhaengigkeiten im GUI-Prozess. Der Grid-Zuschnitt laeuft in mehreren eigenen Prozessen
 (nicht Threads), da GDAL-Lesezugriffe so am zuverlaessigsten parallelisiert werden koennen —
-jeder Worker oeffnet das geclippte Zwischenraster (Tab 1) bzw. seine zugewiesenen LAZ-Kacheln
-(Tab 2) read-only fuer genau seine Zuweisung. Punktwolken-Operationen laufen nicht ueber
+jeder Worker oeffnet das geclippte Zwischenraster (Tab [1]) bzw. seine zugewiesenen LAZ-Kacheln
+(Tab [2a]) read-only fuer genau seine Zuweisung. Punktwolken-Operationen laufen nicht ueber
 GDAL/OGR (kennt keine Punktwolken), sondern als `pdal.exe`-Subprocess-Aufrufe mit generierten
 JSON-Pipelines — orchestriert vom selben OSGeo4W-Python-Prozess.
 
@@ -778,9 +778,9 @@ JSON-Pipelines — orchestriert vom selben OSGeo4W-Python-Prozess.
 ## Voraussetzungen
 
 - **GUI:** Python >= 3.6 (Standard-Installation, nur `tkinter` benoetigt).
-- **GDAL-Verarbeitung (Tab 1, Orchestrierung Tab 2):** [OSGeo4W](https://trac.osgeo.org/osgeo4w/)
+- **GDAL-Verarbeitung (Tab [1], Orchestrierung [2a]/[2b]):** [OSGeo4W](https://trac.osgeo.org/osgeo4w/)
   oder QGIS-Installation mit `python3.exe`/`python.exe` und `osgeo`-Paket. GDAL >= 3.1.
-- **PDAL-Verarbeitung (Tab 2):** `pdal.exe` im PATH oder Teil der OSGeo4W-/QGIS-Installation
+- **PDAL-Verarbeitung (Tabs [2a]/[2b]):** `pdal.exe` im PATH oder Teil der OSGeo4W-/QGIS-Installation
   (wird automatisch erkannt, kein eigenes GUI-Feld). Entwickelt gegen PDAL 2.8 — beim ersten
   Lauf lohnt sich ein Blick ins Log auf die "Pixelraster-Check"-Zeile beim Raster-Build
   (prueft, ob `writers.gdal` die angeforderten `bounds` in dieser PDAL-Version unterstuetzt).
@@ -804,8 +804,8 @@ JSON-Pipelines — orchestriert vom selben OSGeo4W-Python-Prozess.
 
 Fest **EPSG:2056** (CH1903+ / LV95), massgebend fuer swisstopo-Daten. Kachel-TIFFs mit
 `.tfw`-Begleitdatei tragen i.d.R. keine eingebettete CRS-Information. Bei den Punktwolken-Daten
-(Tab 2) ist die Hoehe fest **LHN95** (EPSG:5729) — Input wie Output; ein Reframe nach LN02
-findet nicht im Tool statt (siehe Tab-2-Abschnitt oben). Tab 3 setzt fest **LN02** (EPSG:5728)
+(Tab [2a]) ist die Hoehe fest **LHN95** (EPSG:5729) — Input wie Output; ein Reframe nach LN02
+findet nicht im Tool statt (siehe Abschnitt [2a] oben). Tab [2b] setzt fest **LN02** (EPSG:5728)
 als Höhenbezug — er taggt die extern reframten Kacheln, transformiert aber selbst nichts.
 
 ---
