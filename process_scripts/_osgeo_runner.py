@@ -2186,6 +2186,11 @@ def _mosaic_las_raster(cell_rasters, run_dir: Path, output_path: str,
     hs_out_ds = gdal.Warp(hillshade_output_path, str(raw_hillshade_path), options=hs_warp_options)
     if hs_out_ds is None:
         raise RuntimeError("gdal.Warp hat None zurueckgegeben - Hillshade-Clip fehlgeschlagen.")
+    # Der Hillshade ist ein einheitenloser Grauwert. Er erbt aber 'metre': GTiff leitet
+    # die Einheit der PDAL-Zellraster aus deren Vertikal-CRS ab, und Translate,
+    # DEMProcessing und Warp reichen sie weiter - auch nachdem der Warp das Vertikal-CRS
+    # entfernt hat (gemessen). Beim DSM ist 'metre' richtig und bleibt stehen.
+    hs_out_ds.GetRasterBand(1).SetUnitType("")
     hs_out_ds.FlushCache()
     hs_out_ds = None
 
@@ -2195,11 +2200,17 @@ def _mosaic_las_raster(cell_rasters, run_dir: Path, output_path: str,
     hs_chk = gdal.Open(hillshade_output_path, gdal.GA_ReadOnly)
     dsm_geom = (dsm_chk.RasterXSize, dsm_chk.RasterYSize, dsm_chk.GetGeoTransform())
     hs_geom = (hs_chk.RasterXSize, hs_chk.RasterYSize, hs_chk.GetGeoTransform())
+    hs_unit = hs_chk.GetRasterBand(1).GetUnitType()
     dsm_chk = hs_chk = None
     if dsm_geom != hs_geom:
         raise RuntimeError(f"DSM und Hillshade liegen nicht auf demselben Gitter: "
                             f"{dsm_geom} vs. {hs_geom}")
     log("  Gitter-Kontrolle OK: DSM und Hillshade sind deckungsgleich.")
+    # Nur Warnung: eine falsche Einheit macht den Hillshade nicht unbrauchbar und soll
+    # einen stundenlangen Lauf nicht am Ende noch abbrechen.
+    if hs_unit:
+        log(f"  WARNUNG: Hillshade traegt weiterhin die Einheit {hs_unit!r} - "
+            f"erwartet keine (Grauwert).")
     log(f"  Hillshade geschrieben: {hillshade_output_path}")
 
 

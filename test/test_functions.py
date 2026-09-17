@@ -907,6 +907,55 @@ def test_hillshade_comes_from_fully_filled_mosaic():
     assert "nicht auf demselben Gitter" in src
 
 
+def test_hillshade_has_no_unit_type():
+    """Der Hillshade ist ein einheitenloser Grauwert. Aus den PDAL-Zellrastern
+    (Vertikal-CRS) erbt er sonst 'Unit Type: metre' - gemessen an GUPPENFIRN.
+    Die Einheit wird auf dem fertigen Hillshade entfernt, am DSM bleibt sie."""
+    import inspect
+    runner_mod = _runner()
+    src = inspect.getsource(runner_mod._mosaic_las_raster)
+
+    hs_part = src[src.index("hs_out_ds = gdal.Warp("):]
+    assert 'hs_out_ds.GetRasterBand(1).SetUnitType("")' in hs_part
+    # vor dem Schliessen, sonst wirkt es nicht auf die Datei
+    assert hs_part.index("SetUnitType(") < hs_part.index("hs_out_ds = None")
+    # nur am Hillshade, nie am DSM
+    assert src.count("SetUnitType(") == 1
+    assert "GetUnitType()" in src
+
+
+def test_clearing_unit_type_after_warp_persists(tmp_path):
+    """SetUnitType("") direkt auf dem von gdal.Warp zurueckgegebenen Dataset muss in
+    der Datei ankommen - ohne .aux.xml und ohne den NoData-Wert anzutasten."""
+    import os
+    import pytest
+    gdal = pytest.importorskip("osgeo.gdal", reason="GDAL nur unter OSGeo4W verfuegbar")
+    np = pytest.importorskip("numpy")
+    gdal.UseExceptions()
+
+    src_path = str(tmp_path / "hs_raw.tif")
+    ds = gdal.GetDriverByName("GTiff").Create(src_path, 4, 4, 1, gdal.GDT_Byte)
+    ds.SetGeoTransform((2714000.0, 0.5, 0.0, 1206002.0, 0.0, -0.5))
+    ds.SetProjection("EPSG:2056")
+    ds.GetRasterBand(1).SetUnitType("metre")
+    ds.GetRasterBand(1).WriteArray(np.full((4, 4), 128, dtype="uint8"))
+    ds = None
+
+    out_path = str(tmp_path / "hs.tif")
+    out = gdal.Warp(out_path, src_path, srcSRS="EPSG:2056", dstSRS="EPSG:2056",
+                    dstNodata=255, creationOptions=["TILED=YES", "COMPRESS=LZW"])
+    assert out.GetRasterBand(1).GetUnitType() == "metre"   # Warp reicht sie weiter
+    out.GetRasterBand(1).SetUnitType("")
+    out.FlushCache()
+    out = None
+
+    chk = gdal.Open(out_path)
+    assert chk.GetRasterBand(1).GetUnitType() == ""
+    assert chk.GetRasterBand(1).GetNoDataValue() == 255
+    chk = None
+    assert not os.path.exists(out_path + ".aux.xml")
+
+
 def test_prepare_hillshade_values(tmp_path):
     """Im Hillshade darf innerhalb des AOI kein 255 uebrig bleiben: voll beleuchtete
     Pixel (255) UND die NoData-Pixel ueber den DSM-Loechern (gdaldem schreibt dort 0)
@@ -925,7 +974,7 @@ def test_prepare_hillshade_values(tmp_path):
                               [7, 254, 255, 200]], dtype="uint8"))
     ds = None
 
-    assert runner_mod._prepare_hillshade_values(path) == (5, 2)   # 5x255, 2x NoData
+    assert runner_mod._prepare_hillshade_values(path) == (4, 2)   # 4x255, 2x NoData
 
     ds = gdal.Open(path)
     out = ds.GetRasterBand(1).ReadAsArray()
