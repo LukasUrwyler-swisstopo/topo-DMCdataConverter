@@ -319,10 +319,30 @@ BAND_MODES = {
     "nrg":  [4, 1, 2],
 }
 BAND_MODE_LABELS = {
-    "keep": "4-Band (RGBN, unveraendert)",
-    "rgb":  "RGBN -> RGB (3-Band, Echtfarbe)",
-    "nrg":  "RGBN -> NRG (3-Band, Falschfarben-Infrarot)",
+    "keep": "4-BAND (RGBN)",
+    "rgb":  "RGBN -> RGB (3-BAND, Echtfarbe)",
+    "nrg":  "RGBN -> NRG (3-BAND, Falschfarben-Infrarot)",
 }
+
+# Kuerzel der Band-Ausgabe im Dateinamen der Kacheln, z.B.
+# "2026_GUPPENFIRN_DOP_10cm_RGBN_2713_1206_LV95.tif". Ein Auszug bestimmt das
+# Kuerzel ueber die Bandreihenfolge (rgb/nrg), ohne Auszug ("keep") zaehlt die
+# tatsaechliche Bandzahl der Quelle - so beschreibt der Name immer den echten
+# Inhalt, auch wenn ausnahmsweise ein 3-Band-Input kommt.
+BAND_TOKEN_BY_MODE  = {"rgb": "RGB", "nrg": "NRG"}
+BAND_TOKEN_BY_COUNT = {3: "RGB", 4: "RGBN"}
+
+
+def _band_token(band_mode: str, band_count) -> str:
+    """Namens-Kuerzel der Band-Ausgabe: 'RGB' | 'NRG' | 'RGBN' | '<n>BAND'."""
+    token = BAND_TOKEN_BY_MODE.get(str(band_mode).strip().lower())
+    if token:
+        return token
+    try:
+        count = int(band_count)
+    except (TypeError, ValueError):
+        return "RGBN"
+    return BAND_TOKEN_BY_COUNT.get(count, f"{count}BAND")
 
 
 # --- Schritt 1: Mosaik-Quelle ermitteln (bestehendes VRT oder frisch bauen) ---
@@ -354,7 +374,7 @@ def _resolve_mosaic_source(input_dir: str, staging_run_dir: Path, log) -> str:
 # --- Schritt 1b: Band-Auswahl (nur bei 4-Band-Input RGBN) ---
 
 def _select_bands(mosaic_src: str, band_mode: str, staging_run_dir: Path, log) -> str:
-    """Reduziert eine 4-Band-Quelle (RGBN) per VRT auf drei Baender.
+    """Reduziert eine 4-BAND-Quelle (RGBN) per VRT auf drei Baender.
 
     'rgb' -> Quellbaender 1,2,3 (echtfarbig)
     'nrg' -> Quellbaender 4,1,2 (Falschfarben-Infrarot: NIR/Rot/Gruen)
@@ -374,7 +394,7 @@ def _select_bands(mosaic_src: str, band_mode: str, staging_run_dir: Path, log) -
                          f"(erlaubt: {', '.join(sorted(BAND_MODES))})")
     band_list = BAND_MODES[band_mode]
     if band_list is None:
-        log("\nBand-Ausgabe        : 4-Band unveraendert (keine Bandauswahl)")
+        log("\nBand-Ausgabe        : 4-BAND (RGBN) - keine Bandauswahl")
         return mosaic_src
 
     src_ds = gdal.Open(mosaic_src, gdal.GA_ReadOnly)
@@ -385,7 +405,7 @@ def _select_bands(mosaic_src: str, band_mode: str, staging_run_dir: Path, log) -
 
     if band_count < 4:
         raise RuntimeError(
-            f"Band-Ausgabe '{BAND_MODE_LABELS[band_mode]}' verlangt einen 4-Band-Input (RGBN), "
+            f"Band-Ausgabe '{BAND_MODE_LABELS[band_mode]}' verlangt einen 4-BAND-Input (RGBN), "
             f"die Quelle hat aber {band_count} Band/Baender.\n"
             f"Bitte im Tab '[1] DMC DOP - TIFFconverter' die Band-Ausgabe auf "
             f"'{BAND_MODE_LABELS['keep']}' stellen."
@@ -411,6 +431,94 @@ def _select_bands(mosaic_src: str, band_mode: str, staging_run_dir: Path, log) -
             f"die Ausgabe wird ueber PHOTOMETRIC=RGB dennoch korrekt getaggt.")
     vrt_ds.FlushCache()
     vrt_ds = None
+    return str(vrt_path)
+
+
+def _normalize_alpha_band(mosaic_src: str, staging_run_dir: Path, log) -> str:
+    """Nimmt dem Mosaik-VRT das Alpha-Verhalten. Gibt den zu verwendenden Pfad zurueck.
+
+    Band 4 eines RGBN-TIFF traegt haeufig den Alpha-Tag (der DMC-Prozess liefert das
+    so). GDAL wertet ein Alpha-Band als Gueltigkeitsmaske der Quelle: gdal.BuildVRT
+    schreibt daraufhin in JEDES Band ein <UseMaskBand>true</UseMaskBand>, und das VRT
+    liefert ueberall dort Nullen, wo das Alpha 0 ist - in allen vier Baendern. Im NIR
+    ist 0 aber ein plausibler Messwert: Wasser reflektiert im nahen Infrarot praktisch
+    nicht. Die RGB-Werte solcher Flaechen waeren damit still verloren, schon bevor
+    geclippt oder gekachelt wird.
+
+    Gemessen mit GDAL 3.x an einem Quellpixel [146, 104, 68, 0]:
+        unveraendertes VRT          -> [0, 0, 0, 0]        (RGB zerstoert)
+        nur <ColorInterp> geaendert -> [0, 0, 0, 0]        (reicht NICHT)
+        ohne <UseMaskBand>          -> [146, 104, 68, 0]   (korrekt)
+    Der Alpha-Tag wird zusaetzlich auf 'Undefined' gesetzt, sonst liest gdal.Warp das
+    NIR erneut als Transparenz und die Kacheln kaemen als RGB+Alpha statt als RGBN
+    ins GDWH. Solange die Ausgabe 3-Band RGB war, konnte der Fall nicht auftreten -
+    da gab es kein viertes Band.
+
+    Korrigiert wird an einer Kopie im Staging: der Input-Ordner bleibt unberuehrt
+    (dort kann ein geliefertes True_Ortho.vrt liegen). Relative Quellpfade werden
+    dabei absolut gemacht, sonst zeigte die Kopie ins Leere. Ohne Alpha-Band wird die
+    Quelle unveraendert zurueckgegeben.
+    """
+    from osgeo import gdal
+
+    ds = gdal.Open(mosaic_src, gdal.GA_ReadOnly)
+    if ds is None:
+        return mosaic_src
+    count = ds.RasterCount
+    alpha = [i for i in range(1, count + 1)
+             if ds.GetRasterBand(i).GetColorInterpretation() == gdal.GCI_AlphaBand]
+    driver = ds.GetDriver().ShortName
+    ds = None
+    if not alpha:
+        return mosaic_src
+
+    # Nur ein VRT laesst sich als XML korrigieren - fuer alles andere zuerst eines bauen.
+    if driver != "VRT":
+        wrapper = staging_run_dir / "01c_alpha_src.vrt"
+        wrap_ds = gdal.BuildVRT(str(wrapper), [mosaic_src])
+        if wrap_ds is None:
+            raise RuntimeError("gdal.BuildVRT hat None zurueckgegeben - Alpha-Korrektur "
+                               "fehlgeschlagen.")
+        wrap_ds.FlushCache()
+        wrap_ds = None
+        mosaic_src = str(wrapper)
+
+    src_dir = os.path.dirname(os.path.abspath(mosaic_src))
+    with open(mosaic_src, encoding="utf-8") as f:
+        xml = f.read()
+
+    def _to_absolute(m):
+        return ('<SourceFilename relativeToVRT="0">'
+                + os.path.join(src_dir, m.group(1))
+                + "</SourceFilename>")
+
+    xml = re.sub(r'<SourceFilename relativeToVRT="1">([^<]*)</SourceFilename>',
+                 _to_absolute, xml)
+    xml, masks = re.subn(r"\s*<UseMaskBand>true</UseMaskBand>", "", xml)
+    xml = xml.replace("<ColorInterp>Alpha</ColorInterp>",
+                      "<ColorInterp>Undefined</ColorInterp>")
+
+    vrt_path = staging_run_dir / "01c_no_alpha.vrt"
+    with open(str(vrt_path), "w", encoding="utf-8") as f:
+        f.write(xml)
+
+    # Die Interpretation zentral setzen statt im XML zu raten: Band 4 wird NIR,
+    # nicht 'undefiniert' - es ist ein Messkanal, kein unbekanntes Band.
+    check = gdal.Open(str(vrt_path), gdal.GA_Update)
+    if check is None:
+        raise RuntimeError(f"Alpha-korrigiertes VRT nicht lesbar: {vrt_path}")
+    _set_display_colour_interpretation(check)
+    check.FlushCache()
+    check = None
+
+    log("\nAlpha-Korrektur     : Band " + ", ".join(str(b) for b in alpha)
+        + " ist als 'Alpha' getaggt -> wird als NIR gekennzeichnet")
+    log(f"  Quellmaske       : {masks} x <UseMaskBand> entfernt")
+    log("  Grund            : GDAL nimmt ein Alpha-Band als Gueltigkeitsmaske und "
+        "liefert sonst in ALLEN")
+    log("                     Baendern 0, wo das NIR 0 ist (Wasser) - die RGB-Werte "
+        "waeren verloren.")
+    log(f"  Korrigiertes VRT : {vrt_path}")
     return str(vrt_path)
 
 
@@ -508,6 +616,17 @@ def _clip_to_valid_area(mosaic_src: str, clip_shape_path: str, staged_path: Path
         raise RuntimeError("gdal.Warp hat None zurueckgegeben - Clip fehlgeschlagen.")
     out_ds.FlushCache()
     out_ds = None
+
+    # Absicherung: Die Quelle ist durch _ensure_display_colour_interpretation bereits
+    # frei von Alpha-Tags, aber der Warp kann bei 4 Baendern von sich aus wieder einen
+    # setzen. Die Kacheln erben ihre Interpretation von diesem Zwischenraster, und ein
+    # Alpha-Tag dort hiesse: in QGIS halbtransparent, im GDWH ein Alphakanal statt des
+    # 4. Messkanals. PHOTOMETRIC=RGB allein genuegt dafuer nicht (gemessen).
+    fix_ds = gdal.Open(str(staged_path), gdal.GA_Update)
+    if fix_ds is not None:
+        _set_display_colour_interpretation(fix_ds)
+        fix_ds.FlushCache()
+        fix_ds = None
     log(f"  Zwischenraster (geclippt): {staged_path}")
 
 
@@ -572,18 +691,35 @@ def _tmp_path(path: str) -> str:
     return f"{stem}_tmp{ext}"
 
 
-def _set_display_colour_interpretation(ds) -> None:
-    """Baender 1-3 als Rot/Gruen/Blau, alle weiteren als 'undefiniert'.
+def _nir_colour_interpretation():
+    """GDAL-Farbinterpretation fuer das NIR-Band.
 
-    Wichtig fuer das QC-COG bei 4-Band (RGBN): Band 4 ist in der Quelle haeufig als
-    'Alpha' getaggt. Der COG-Treiber machte daraus bei JPEG eine 1-bit-Maske (das NIR
-    waere weg), und QGIS zeigte das Bild halbtransparent."""
+    GDAL kennt 'NIR' als eigene Farbinterpretation (GCI_NIRBand, seit GDAL 3.10).
+    Aeltere Versionen haben sie nicht - dort bleibt nur 'Undefined'. Wichtig ist in
+    beiden Faellen, dass das Band NICHT als 'Alpha' gilt, sonst liest GDAL es als
+    Transparenz (siehe _normalize_alpha_band)."""
+    from osgeo import gdal
+    return getattr(gdal, "GCI_NIRBand", gdal.GCI_Undefined)
+
+
+def _set_display_colour_interpretation(ds) -> None:
+    """Baender 1-3 als Rot/Gruen/Blau, Band 4 als NIR, alles weitere 'undefiniert'.
+
+    Bei RGBN IST das vierte Band das Nahe Infrarot - ein Messkanal wie die drei
+    anderen. In der Quelle ist es haeufig als 'Alpha' getaggt; der COG-Treiber machte
+    daraus bei JPEG eine 1-bit-Maske (das NIR waere weg) und QGIS zeigte das Bild
+    halbtransparent. Darum wird es hier ausdruecklich als NIR gekennzeichnet.
+
+    Ab Band 5 (kommt bei DMC-Produkten nicht vor) bleibt es bei 'undefiniert' - was
+    dort steht, ist nicht bekannt."""
     from osgeo import gdal
     if ds.RasterCount < 3:
         return
     for i, ci in enumerate((gdal.GCI_RedBand, gdal.GCI_GreenBand, gdal.GCI_BlueBand), 1):
         ds.GetRasterBand(i).SetColorInterpretation(ci)
-    for i in range(4, ds.RasterCount + 1):
+    if ds.RasterCount >= 4:
+        ds.GetRasterBand(4).SetColorInterpretation(_nir_colour_interpretation())
+    for i in range(5, ds.RasterCount + 1):
         ds.GetRasterBand(i).SetColorInterpretation(gdal.GCI_Undefined)
 
 
@@ -677,6 +813,110 @@ def _write_nodata_mask(ds, nodata_vals: list, block: int = 2048,
             mask_band.WriteArray(np.where(invalid, 0, 255).astype("uint8"), x, y)
 
 
+# Klartext-Namen der Baender je Namens-Kuerzel - nur fuer die Meldungen unten.
+BAND_LABELS_BY_TOKEN = {
+    "RGBN": ("Rot", "Gruen", "Blau", "NIR"),
+    "RGB":  ("Rot", "Gruen", "Blau"),
+    "NRG":  ("NIR", "Rot", "Gruen"),
+}
+
+
+def _resolve_nodata_collisions(path: str, nodata_val: float, band_token: str, log,
+                               block: int = 2048) -> int:
+    """Hebt echte Messwerte an, die mit dem NoData-Wert kollidieren. Gibt die Anzahl
+    geaenderter Pixel zurueck.
+
+    Das Problem entsteht erst mit 4-Band RGBN. Ein GeoTIFF traegt EINEN NoData-Wert,
+    und der wirkt pro Band: sobald ein Band den Wert traegt, gilt das Pixel dort als
+    NoData. Im NIR ist 0 aber ein echter Messwert - Wasser reflektiert im nahen
+    Infrarot praktisch nicht. Seen, Schmelzwasser und nasser Fels wuerden so als
+    Loecher in der Lieferkachel landen, obwohl RGB gueltige Daten fuehrt. Bei 3-Band
+    RGB konnte der Fall nicht auftreten: exakt R=G=B=0 kommt in echten Bilddaten
+    praktisch nicht vor.
+
+    Unterschieden wird ueber die uebrigen Baender: Traegt ein Pixel den Wert in JEDEM
+    Band, ist es echtes NoData (Rand, Clip-Ausschluss) und bleibt unangetastet. Traegt
+    es ihn nur in einzelnen Baendern, sind das Messwerte - sie werden um einen
+    Digitalwert verschoben (0 -> 1, bzw. 255 -> 254 am oberen Rand des Datentyps).
+    Danach bedeutet der NoData-Wert in der Kachel wirklich nur noch "kein Datum", und
+    zwar fuer jeden Konsumenten - ohne dass GDWH, QGIS oder ArcGIS eine
+    Sonderbehandlung pro Band braeuchten.
+
+    Der radiometrische Eingriff betraegt einen DN von 255 (0.4 %) und trifft nur die
+    kollidierenden Pixel. Es ist dasselbe Verfahren, das GDAL bei Bedarf selbst
+    anwendet ("Value 0 in the source dataset has been changed to 1 in the destination
+    dataset to avoid being treated as NoData").
+
+    Gearbeitet wird blockweise und nur dort geschrieben, wo es etwas zu aendern gibt -
+    das haelt den Zusatzaufwand auch bei grossen AOIs klein.
+    """
+    from osgeo import gdal
+    import numpy as np
+
+    ds = gdal.Open(path, gdal.GA_Update)
+    if ds is None:
+        raise RuntimeError(f"Konnte Zwischenraster fuer die NoData-Pruefung nicht "
+                           f"oeffnen: {path}")
+    count = ds.RasterCount
+    if count < 2:
+        ds = None
+        return 0
+
+    dtype = gdal.GetDataTypeName(ds.GetRasterBand(1).DataType)
+    rng = NODATA_INT_RANGES.get(dtype)
+    # Ein DN nach oben, am oberen Rand des Datentyps stattdessen nach unten
+    if rng and nodata_val >= rng[1]:
+        replacement = nodata_val - 1
+    else:
+        replacement = nodata_val + 1
+
+    labels = BAND_LABELS_BY_TOKEN.get(band_token, ())
+    changed = [0] * count
+    inside = 0
+    xs, ys = ds.RasterXSize, ds.RasterYSize
+
+    for y in range(0, ys, block):
+        rows = min(block, ys - y)
+        for x in range(0, xs, block):
+            cols = min(block, xs - x)
+            arrays = [ds.GetRasterBand(i).ReadAsArray(x, y, cols, rows)
+                      for i in range(1, count + 1)]
+            hits = [a == np.array(nodata_val, dtype=a.dtype) for a in arrays]
+            outside = np.logical_and.reduce(hits)      # alle Baender -> echtes NoData
+            inside += int(cols * rows - np.count_nonzero(outside))
+            collision = ~outside
+            for i, (arr, hit) in enumerate(zip(arrays, hits)):
+                mask = hit & collision
+                n = int(np.count_nonzero(mask))
+                if not n:
+                    continue
+                arr[mask] = np.array(replacement, dtype=arr.dtype)
+                ds.GetRasterBand(i + 1).WriteArray(arr, x, y)
+                changed[i] += n
+
+    total = sum(changed)
+    if total:
+        ds.FlushCache()
+    ds = None
+
+    if not total:
+        return 0
+    log(f"\nNoData-Kollision    : {total} Pixel trugen NoData {nodata_val:g} in nur "
+        f"einzelnen Baendern")
+    for i, n in enumerate(changed):
+        if not n:
+            continue
+        name = labels[i] if i < len(labels) else ""
+        pct = (100.0 * n / inside) if inside else 0.0
+        log(f"  Band {i + 1}{f' ({name})' if name else ''}: {n} Pixel = {pct:.3f} % der "
+            f"gueltigen Flaeche -> {nodata_val:g} auf {replacement:g} angehoben")
+    log("  Grund            : echte Messwerte (im NIR ist 0 Wasser), kein NoData. Ohne "
+        "Anhebung")
+    log("                     galten diese Pixel in der Kachel als NoData, obwohl RGB "
+        "Daten fuehrt.")
+    return total
+
+
 def _cog_creation_options(compress: str, quality: int = 90) -> list:
     """COG-Profil der Mosaike (wie das Mosaik in topo-COGTIFFconverter). QUALITY nur
     bei JPEG, PREDICTOR=2 nur bei verlustfreier Kompression."""
@@ -756,9 +996,18 @@ def _write_cog_mosaic(tile_paths: list, cog_path: str, work_dir: Path, log, prog
         vrt_ds = gdal.BuildVRT(str(vrt_path), tile_paths)
         if vrt_ds is None:
             raise RuntimeError("gdal.BuildVRT hat None zurueckgegeben")
-        _set_display_colour_interpretation(vrt_ds)
         vrt_ds = None
-        src = _select_bands(str(vrt_path), band_mode, work_dir, log)
+        # Zuerst den Alpha-Tag der Kacheln neutralisieren: sonst liefert das VRT in
+        # ALLEN Baendern 0, wo das vierte Band 0 ist (siehe _normalize_alpha_band) -
+        # das Mosaik haette dort schwarze Loecher statt Bilddaten. Erst danach die
+        # Baender 1-3 als Rot/Gruen/Blau markieren.
+        src_vrt = _normalize_alpha_band(str(vrt_path), work_dir, log)
+        fix_ds = gdal.Open(src_vrt, gdal.GA_Update)
+        if fix_ds is not None:
+            _set_display_colour_interpretation(fix_ds)
+            fix_ds.FlushCache()
+            fix_ds = None
+        src = _select_bands(src_vrt, band_mode, work_dir, log)
         src_ds = gdal.Open(src, gdal.GA_ReadOnly)
         band_count = src_ds.RasterCount
         dtype = gdal.GetDataTypeName(src_ds.GetRasterBand(1).DataType)
@@ -809,7 +1058,9 @@ def _write_cog_mosaic(tile_paths: list, cog_path: str, work_dir: Path, log, prog
             raise RuntimeError("Pruefung fehlgeschlagen: " + "; ".join(problems))
         os.replace(tmp_cog, cog_path)
     finally:
-        for f in (tmp_cog, vrt_path, band_vrt, scratch_path, f"{scratch_path}.aux.xml"):
+        for f in (tmp_cog, vrt_path, band_vrt, work_dir / "01c_no_alpha.vrt",
+                  work_dir / "01c_alpha_src.vrt", scratch_path,
+                  f"{scratch_path}.aux.xml"):
             try:
                 if os.path.isfile(str(f)):
                     os.remove(str(f))
@@ -883,17 +1134,29 @@ def _process(cfg: dict) -> None:
     # --- Schritt 1: Mosaik-Quelle + Kompression von den Input-Kacheln uebernehmen ---
     compress = _detect_source_compression(input_dir, _log)
     mosaic_src = _resolve_mosaic_source(input_dir, run_dir, _log)
+    # Muss VOR der Bandauswahl geschehen: ein Auszug laese sonst bereits maskierte
+    # Werte, und nach dem Warp waeren die RGB-Werte ohnehin schon verworfen.
+    mosaic_src = _normalize_alpha_band(mosaic_src, run_dir, _log)
     mosaic_src = _select_bands(mosaic_src, band_mode, run_dir, _log)
     src_dtype, _, src_bands = _raster_facts(mosaic_src)
+    # Kuerzel der Band-Ausgabe im Dateinamen - aus der tatsaechlichen Bandzahl der
+    # Ausgabe, damit der Name den echten Inhalt beschreibt.
+    band_token = _band_token(band_mode, src_bands)
     _nodata_per_band(nodata_vals, src_bands, src_dtype)   # Anzahl + Wertebereich pruefen
-    _log(f"NoData              : {nodata_val:g} in allen Baendern -> Clip ausserhalb, "
-         f"NoData-Tag der Kacheln" + (", Maske des QC-COG" if create_cog else ""))
+    _log(f"NoData              : {nodata_val:g} in allen {src_bands} Baendern -> Clip "
+         f"ausserhalb, NoData-Tag der Kacheln"
+         + (", Maske des QC-COG" if create_cog else ""))
     px_w, px_h = _check_pixel_alignment(mosaic_src, _log)
 
     # --- Schritt 2: Cutline-Clip ---
     staged_path = run_dir / "02_clipped_mosaic.tif"
     _clip_to_valid_area(mosaic_src, clip_shape_path, staged_path, nodata_val,
                          px_w, px_h, str(num_workers), _log, _progress)
+
+    # Echte Messwerte, die auf den NoData-Wert fallen, um einen DN anheben - sonst
+    # gaelten Wasserflaechen (NIR = 0) in der Lieferkachel als NoData. Siehe
+    # _resolve_nodata_collisions. Laeuft auf der gemeinsamen Quelle aller Kacheln.
+    _resolve_nodata_collisions(str(staged_path), nodata_val, band_token, _log)
 
     # --- Schritt 3: Grid vorbereiten ---
     _log(f"\nOeffne Grid-Shape: {grid_shape_path}")
@@ -948,19 +1211,22 @@ def _process(cfg: dict) -> None:
     layer.ResetReading()
     total = layer.GetFeatureCount()
     _log(f"\nGefundene Grid-Kacheln (ueberlappend mit geclipptem Mosaik): {total}")
-    _log(f"Ausgabe-Benennung   : {jahr}_{area}_DOP_{gsd}_<NAME>_LV95.tif")
-    _log(f"Band-Ausgabe        : {BAND_MODE_LABELS[band_mode]}")
+    _log(f"Ausgabe-Benennung   : {jahr}_{area}_DOP_{gsd}_{band_token}_<NAME>_LV95.tif")
+    _log(f"Band-Ausgabe        : {BAND_MODE_LABELS[band_mode]}  ->  {band_token} "
+         f"({src_bands} Baender)")
     _log(f"Kompression         : {compress} (von Input-Kacheln uebernommen, verlustfrei)")
     _log(f"Blockgroesse        : {blocksize}")
     _log(f"Parallele Prozesse  : {num_workers}")
-    cog_name = f"{jahr}_{area}_DOP_{gsd}_{QC_NAME_TOKEN}_LV95.tif"
+    cog_name = f"{jahr}_{area}_DOP_{gsd}_{band_token}_{QC_NAME_TOKEN}_LV95.tif"
     _log(f"QC-COG              : "
          + (f"AKTIV - {COG_QC_SUBDIR}/{cog_name} (JPEG {cog_quality} %)"
             if create_cog else "inaktiv"))
 
-    # PHOTOMETRIC nur bei aktiver Bandauswahl erzwingen - ohne Auswahl bleibt die
-    # Ausgabe exakt so getaggt wie die Quelle.
-    photometric = "RGB" if BAND_MODES[band_mode] else None
+    # PHOTOMETRIC=RGB ab drei Baendern - auch ohne Bandauswahl. Bei 4-Band (RGBN)
+    # bekommt das TIFF damit PhotometricInterpretation=RGB und das NIR ein
+    # ExtraSample, statt als Alphakanal gelesen zu werden. Die ColorInterp selbst
+    # stellt _clip_to_valid_area auf der gemeinsamen Quelle richtig.
+    photometric = "RGB" if src_bands >= 3 else None
 
     jobs = []
     skipped = 0
@@ -969,7 +1235,7 @@ def _process(cfg: dict) -> None:
         if name_val is None or str(name_val).strip() == "":
             skipped += 1
             continue
-        tile_name = f"{jahr}_{area}_DOP_{gsd}_{str(name_val).strip()}_LV95.tif"
+        tile_name = f"{jahr}_{area}_DOP_{gsd}_{band_token}_{str(name_val).strip()}_LV95.tif"
 
         geom = feature.GetGeometryRef()
         if geom is None:
@@ -1023,12 +1289,21 @@ def _process(cfg: dict) -> None:
     # tatsaechlich ausgeliefert wird. Ein Fehler hier laesst den Lauf nicht
     # scheitern - die Kacheln sind das Produkt, das Mosaik nur die Kontrolle.
     if create_cog and written:
-        pattern = glob.escape(f"{jahr}_{area}_DOP_{gsd}_") + "*_LV95.tif"
+        # Token im Muster: sonst saugt das QC-Mosaik auch Kacheln eines frueheren
+        # Laufs mit anderer Band-Ausgabe aus demselben Output-Ordner an.
+        pattern = glob.escape(f"{jahr}_{area}_DOP_{gsd}_{band_token}_") + "*_LV95.tif"
         cog_tiles = sorted(glob.glob(os.path.join(output_dir, pattern)))
         cog_path = str(Path(output_dir) / COG_QC_SUBDIR / cog_name)
         _log(f"\nQC-COG: Mosaik aus {len(cog_tiles)} Kachel(n)")
         try:
-            # Maske wie der NoData-Tag der Kacheln: ein Band NoData -> Pixel ungueltig
+            # mask_any_band=True bildet den NoData-Tag der Kacheln exakt ab: der Tag
+            # wirkt pro Band, ein Renderer blendet das Pixel aus, sobald EIN Band ihn
+            # traegt. Das QC-Mosaik zeigt damit genau das, was die Lieferkacheln zeigen -
+            # der Zweck der Sichtkontrolle.
+            # Wasserflaechen kostet das nichts mehr: _resolve_nodata_collisions hat die
+            # Kollisionen vorher an der Quelle beseitigt, innerhalb der gueltigen Flaeche
+            # gibt es keine Einzelband-NoData mehr. Maskiert wird also nur echtes NoData
+            # (Rand, Clip-Ausschluss) - dort tragen ohnehin alle Baender den Wert.
             _write_cog_mosaic(cog_tiles, cog_path, run_dir, _log, _progress,
                               compress="JPEG", quality=cog_quality,
                               nodata_val=nodata_val, srs="EPSG:2056", mask_any_band=True)

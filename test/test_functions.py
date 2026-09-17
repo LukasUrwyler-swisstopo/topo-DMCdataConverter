@@ -50,6 +50,99 @@ def test_process_action_available():
     assert callable(runner_mod._grid_tile_worker)
 
 
+def test_area_from_input_path():
+    """AREA wird lexikalisch aus dem Input-Pfad abgeleitet - je nach Tab
+    unterschiedlich tief in der Ablagestruktur.
+
+        [1]  DOP : ...\2026\_MUSTER\DOP\LV95\01_INPUT_realityStudio        (4.-letzter)
+        [2a] DSM : ...\2026\_MUSTER\DSM\LV95_LHN95\01_INPUT_realityStudio  (4.-letzter)
+        [2b] LN02: ...\2026\_MUSTER\DSM\LV95_LN02\01_DSM_LAZ\01_INPUT_...  (5.-letzter)
+
+    Die Ableitung greift NICHT auf die Platte zu - sie muss auch funktionieren,
+    wenn das Netzlaufwerk gerade offline ist."""
+    gui_mod = load_module_from_path(
+        "gui_module", os.path.join(PROJECT_ROOT, "GUI_DMCdataConverter.py"))
+    f = gui_mod._area_from_input_path
+    d5 = gui_mod.AREA_PATH_DEPTH_LN02
+
+    dop  = r"U:\VDI-Transfer\2026\_MUSTER\DOP\LV95\01_INPUT_realityStudio"
+    dsm  = r"U:\VDI-Transfer\2026\_MUSTER\DSM\LV95_LHN95\01_INPUT_realityStudio"
+    ln02 = r"U:\VDI-Transfer\2026\_MUSTER\DSM\LV95_LN02\01_DSM_LAZ\01_INPUT_GeoSuite_LN02"
+
+    assert gui_mod.AREA_PATH_DEPTH == 4 and d5 == 5
+    assert f(dop) == "_MUSTER"
+    assert f(dsm) == "_MUSTER"
+    assert f(ln02, d5) == "_MUSTER"
+    # Der LN02-Pfad hat eine Ebene mehr (01_DSM_LAZ): mit der Standardtiefe 4 kaeme
+    # "DSM" heraus statt des Gebietsnamens - daher die eigene Tiefe fuer Tab [2b]
+    assert f(ln02) == "DSM"
+
+    assert f(dop + "\\") == "_MUSTER"                  # abschliessender Backslash
+    assert f(dop.replace("\\", "/")) == "_MUSTER"      # Schraegstriche
+    assert f('"' + dop + '"') == "_MUSTER"             # aus der Zwischenablage kopiert
+    assert f("  " + dop + "  ") == "_MUSTER"           # Leerzeichen aussen
+    # UNC: die Freigabe ist ein Pfadteil, nicht zwei Ordner
+    assert f(r"\server\share\2026\GUPPENFIRN\DOP\LV95\01_INPUT") == "GUPPENFIRN"
+    # Zu kurz - an der Stelle staende nur noch das Laufwerk
+    assert f(r"C:\DOP\LV95\01_INPUT") is None
+    assert f(r"C:\LV95\01_INPUT") is None
+    assert f(ln02[:0] or "") is None
+    assert f(None) is None
+
+
+def test_area_autofill_in_allen_drei_tabs():
+    """AREA-Vorbelegung in den Tabs [1], [2a] und [2b].
+
+    Liefert der Pfad einen Namen, gewinnt er - auch gegen einen abweichenden
+    Handeintrag (der kann von einem frueheren Gebiet stehengeblieben sein).
+    Liefert der Pfad nichts, bleibt ein vorhandener Eintrag unangetastet.
+    Die uebrigen Tabs (Create DSM-Raster / COGTIFF / COPC) haben die Vorbelegung
+    bewusst NICHT - dort laufen spontane Verarbeitungen mit beliebigen Pfaden."""
+    gui_mod = load_module_from_path(
+        "gui_module", os.path.join(PROJECT_ROOT, "GUI_DMCdataConverter.py"))
+    app = gui_mod.DMCConverterApp()
+    try:
+        d4 = gui_mod.AREA_PATH_DEPTH
+        d5 = gui_mod.AREA_PATH_DEPTH_LN02
+        tabs = [
+            (app._in_var, app._area_var, d4,
+             r"U:\VDI-Transfer\2026\_MUSTER\DOP\LV95\01_INPUT_realityStudio"),
+            (app._las_in_var, app._las_area_var, d4,
+             r"U:\VDI-Transfer\2026\_MUSTER\DSM\LV95_LHN95\01_INPUT_realityStudio"),
+            (app._ln02_in_var, app._ln02_area_var, d5,
+             r"U:\VDI-Transfer\2026\_MUSTER\DSM\LV95_LN02\01_DSM_LAZ\01_INPUT_GeoSuite_LN02"),
+        ]
+        for in_var, area_var, depth, pfad in tabs:
+            # leeres Feld wird gefuellt
+            area_var.set("")
+            in_var.set(pfad)
+            app._autofill_area(in_var, area_var, depth)
+            assert area_var.get() == "_MUSTER"
+
+            # abweichender Handeintrag: der Pfad gewinnt
+            area_var.set("ALTES_GEBIET")
+            app._autofill_area(in_var, area_var, depth)
+            assert area_var.get() == "_MUSTER"
+
+            # Pfad liefert nichts -> Handeintrag bleibt stehen, nichts wird geraten
+            area_var.set("HANDEINGABE")
+            in_var.set(r"C:\LV95\01_INPUT")
+            app._autofill_area(in_var, area_var, depth)
+            assert area_var.get() == "HANDEINGABE"
+
+        # Die Eingabefelder loesen die Vorbelegung selbst aus
+        for attr in ("_in_entry", "_las_in_entry", "_ln02_in_entry"):
+            entry = getattr(app, attr)
+            for seq in ("<FocusOut>", "<Return>", "<<Paste>>"):
+                assert entry.bind(seq), f"{attr}: {seq} nicht gebunden"
+
+        # Die uebrigen Tabs bleiben ohne Vorbelegung
+        for attr in ("_dsm_in_entry", "_cog_in_entry", "_copc_in_entry"):
+            assert not hasattr(app, attr), f"{attr} sollte keine Vorbelegung haben"
+    finally:
+        app.destroy()
+
+
 def test_tiff_tab_name_preview():
     gui_mod = load_module_from_path(
         "gui_module",
@@ -62,19 +155,68 @@ def test_tiff_tab_name_preview():
         app._gsd_var.set("10cm")
         app._update_name_preview()
         text = app._name_preview_lbl.cget("text")
-        assert "2026_GUPPENFIRN_DOP_10cm_<NAME>_LV95.tif" in text
+        # Band-Kuerzel im Namen: ohne erkannte Datei-Info gilt RGBN (4-BAND ist
+        # seit der Umstellung der Standard)
+        assert "2026_GUPPENFIRN_DOP_10cm_RGBN_<NAME>_LV95.tif" in text
         assert "checkData" not in text
         # QC-Mosaik: eigener Unterordner, 'checkData' anstelle des Kachelnamens
         app._create_cog_var.set(True)
         app._on_create_cog_toggle()
         text = app._name_preview_lbl.cget("text")
-        assert "cog_QC\\2026_GUPPENFIRN_DOP_10cm_checkData_LV95.tif" in text
+        assert "cog_QC\\2026_GUPPENFIRN_DOP_10cm_RGBN_checkData_LV95.tif" in text
+        # Ein 3-Band-Auszug schlaegt auf beide Namen durch
+        app._band_var.set(gui_mod.BAND_NRG)
+        text = app._name_preview_lbl.cget("text")
+        assert "2026_GUPPENFIRN_DOP_10cm_NRG_<NAME>_LV95.tif" in text
+        assert "cog_QC\\2026_GUPPENFIRN_DOP_10cm_NRG_checkData_LV95.tif" in text
+        # 3-Band-Input ohne Auszug -> RGB statt RGBN
+        app._band_var.set(gui_mod.BAND_KEEP)
+        app._apply_band_availability(3)
+        assert "2026_GUPPENFIRN_DOP_10cm_RGB_<NAME>_LV95.tif" in app._name_preview_lbl.cget("text")
+
     finally:
         app.destroy()
 
 
+def test_band_token_matches_between_gui_and_runner():
+    """Das Kuerzel im Dateinamen entsteht in der GUI (Vorschau, Log-Name) und im
+    Runner (echter Kachelname) getrennt - beide muessen dasselbe liefern."""
+    gui_mod = load_module_from_path(
+        "gui_module", os.path.join(PROJECT_ROOT, "GUI_DMCdataConverter.py"))
+    runner_mod = load_module_from_path(
+        "runner_module", os.path.join(PROJECT_ROOT, "process_scripts", "_osgeo_runner.py"))
+    for mode, count, expected in [
+        ("keep", 4, "RGBN"), ("keep", 3, "RGB"), ("keep", 5, "5BAND"),
+        ("rgb", 4, "RGB"), ("nrg", 4, "NRG"),
+        ("keep", None, "RGBN"),          # Bandzahl unbekannt -> Normalfall 4-BAND
+    ]:
+        assert gui_mod._band_token(mode, count) == expected, (mode, count)
+        assert runner_mod._band_token(mode, count) == expected, (mode, count)
+
+
+def test_nodata_choices_follow_band_count():
+    """Die NoData-Auswahl beschreibt die Ausgabe: 4-BAND -> vier Werte. Inhaltlich
+    aendert das nichts (der Runner fuellt auf), die Anzeige darf aber nicht luegen."""
+    gui_mod = load_module_from_path(
+        "gui_module", os.path.join(PROJECT_ROOT, "GUI_DMCdataConverter.py"))
+    assert gui_mod._nodata_choices(4) == ["0 0 0 0", "255 255 255 255"]
+    assert gui_mod._nodata_choices(3) == ["0 0 0", "255 255 255"]
+    assert gui_mod._nodata_choices(None) == gui_mod.NODATA_CHOICES
+    # Auffuellen mit dem letzten Wert / ueberzaehlige abschneiden - wie _nodata_per_band
+    assert gui_mod._fit_nodata_text("0 0 0", 4) == "0 0 0 0"
+    assert gui_mod._fit_nodata_text("255 255 255 255", 3) == "255 255 255"
+    assert gui_mod._fit_nodata_text("0 0 0", None) == "0 0 0"
+    # Ein Auszug liefert immer 3 Baender, unabhaengig von der Quelle
+    assert gui_mod._output_band_count("nrg", 4) == 3
+    assert gui_mod._output_band_count("keep", 4) == 4
+    assert gui_mod._output_band_count("keep", 3) == 3
+    # Ohne gelesene Datei-Info zaehlt die Zusage der Auswahl: "4-BAND (RGBN)" = 4
+    assert gui_mod._output_band_count("keep", None) == 4
+    assert gui_mod._output_band_count("nrg", None) == 3
+
+
 def test_tiff_tab_band_selection():
-    """Band-Ausgabe im TIFFconverter: Default ist 4-Band (unveraendert), die
+    """Band-Ausgabe im TIFFconverter: Default ist 4-BAND (RGBN), die
     3-Band-Auszuege bilden auf die Runner-Schluessel 'rgb'/'nrg' ab."""
     gui_mod = load_module_from_path(
         "gui_module",
@@ -94,12 +236,12 @@ def test_tiff_tab_band_selection():
         assert app._band_mode() == "nrg"
         assert "NRG" in app._name_preview_lbl.cget("text")
 
-        # 4-Band-Input: Auswahl bleibt bedienbar
+        # 4-BAND-Input: Auswahl bleibt bedienbar
         app._apply_band_availability(4)
         assert str(app._band_combo.cget("state")) == "readonly"
         assert app._band_mode() == "nrg"
 
-        # 3-Band-Input: Auswahl sperren und auf 4-Band/unveraendert zuruecksetzen,
+        # 3-BAND-Input: Auswahl sperren und auf 4-BAND zuruecksetzen,
         # sonst liefe der Job erst im Runner in einen Fehler
         app._apply_band_availability(3)
         assert str(app._band_combo.cget("state")) == "disabled"
@@ -109,6 +251,22 @@ def test_tiff_tab_band_selection():
         # Unbekannte Bandzahl (keine Datei-Info): frei waehlbar
         app._apply_band_availability(None)
         assert str(app._band_combo.cget("state")) == "readonly"
+
+        # Die NoData-Auswahl folgt der Bandzahl der AUSGABE: bei 4-BAND (RGBN)
+        # vier Werte, bei einem 3-Band-Auszug drei. Der Runner fuellt fehlende
+        # Werte ohnehin auf - die Anzeige soll die Ausgabe nur nicht falsch
+        # beschreiben.
+        app._apply_band_availability(4)
+        assert app._nodata_var.get() == "0 0 0 0"
+        assert list(app._nodata_combo.cget("values")) == ["0 0 0 0", "255 255 255 255"]
+        app._band_var.set(gui_mod.BAND_RGB)
+        assert app._nodata_var.get() == "0 0 0"
+        app._band_var.set(gui_mod.BAND_KEEP)
+        assert app._nodata_var.get() == "0 0 0 0"
+        # Weisses NoData bleibt weiss, nur die Anzahl folgt
+        app._nodata_var.set("255 255 255 255")
+        app._band_var.set(gui_mod.BAND_NRG)
+        assert app._nodata_var.get() == "255 255 255"
     finally:
         app.destroy()
 
@@ -155,7 +313,7 @@ def test_band_selection_needs_four_band_input(tmp_path, monkeypatch):
         runner_mod._select_bands("mosaic.vrt", "rgb", tmp_path, logged.append)
         raise AssertionError("Bandauswahl haette scheitern muessen")
     except RuntimeError as e:
-        assert "4-Band" in str(e)
+        assert "4-BAND" in str(e)
 
     # 'keep' laesst die Quelle unangetastet (kein VRT, kein Oeffnen noetig)
     assert runner_mod._select_bands("mosaic.vrt", "keep", tmp_path, logged.append) == "mosaic.vrt"
@@ -1202,7 +1360,7 @@ def test_cog_creation_options():
 
 
 def test_qc_cog_end_to_end(tmp_path):
-    """Echter GDAL-Lauf (nur unter OSGeo4W): 4-Band-Kacheln mit NoData-Rand und einem
+    """Echter GDAL-Lauf (nur unter OSGeo4W): 4-BAND-Kacheln mit NoData-Rand und einem
     als Alpha getaggten Band 4 -> COG mit JPEG, interner Maske und NIR als normalem
     Band, ohne NoData-Tag."""
     import pytest
@@ -1509,8 +1667,9 @@ def test_cog_and_copc_tabs():
         assert str(app._cog_quality_entry.cget("state")) == "disabled"
         assert "NoData" not in app._cog_compress_hint_lbl.cget("text")
 
-        # NoData-Werte: in beiden Tabs Default 0 0 0 (Maske bei jeder Kompression)
-        assert app._nodata_var.get() == app._cog_nodata_var.get() == "0 0 0"
+        # NoData-Werte: in beiden Tabs Default 0 0 0 0 - die Vorgabe ist 4-BAND
+        # (RGBN), und das Feld soll die Ausgabe beschreiben, nicht drei Baender
+        assert app._nodata_var.get() == app._cog_nodata_var.get() == "0 0 0 0"
         assert gui_mod._parse_nodata_text(" 0  0 0 ") == [0.0, 0.0, 0.0]
         with pytest.raises(ValueError):
             gui_mod._parse_nodata_text("0,0,0")
@@ -1650,3 +1809,141 @@ def test_dsm_tab_reads_project_from_tile_name():
     ) == ("2026", "G", "LHN95")
     # Fremddaten: nichts vorbelegen statt etwas zu raten
     assert gui_mod._project_from_tile_name("irgendeine_wolke.laz") is None
+
+
+def test_alpha_band_would_destroy_rgb_without_normalisation(tmp_path):
+    """Kernregression der 4-BAND-Umstellung (RGBN).
+
+    Band 4 eines RGBN-TIFF traegt haeufig den Alpha-Tag. GDAL wertet ein Alpha-Band
+    als Gueltigkeitsmaske: gdal.BuildVRT schreibt dann in JEDES Band ein
+    <UseMaskBand>, und das VRT liefert ueberall dort Nullen, wo das NIR 0 ist - in
+    allen vier Baendern. Im NIR ist 0 aber ein plausibler Messwert (Wasser reflektiert
+    im nahen Infrarot praktisch nicht), die RGB-Werte solcher Flaechen waeren damit
+    still verloren. Bei 3-Band RGB konnte der Fall nicht auftreten: kein viertes Band.
+
+    Der Test haelt beide Haelften fest: dass der Rohzustand die Daten zerstoert, und
+    dass _normalize_alpha_band sie rettet.
+    """
+    import pytest
+    gdal = pytest.importorskip("osgeo.gdal", reason="GDAL nur unter OSGeo4W verfuegbar")
+    np = pytest.importorskip("numpy")
+    osr = pytest.importorskip("osgeo.osr")
+    gdal.UseExceptions()
+    runner_mod = _runner()
+
+    src = str(tmp_path / "rgbn.tif")
+    ds = gdal.GetDriverByName("GTiff").Create(src, 64, 64, 4, gdal.GDT_Byte)
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(2056)
+    ds.SetProjection(srs.ExportToWkt())
+    ds.SetGeoTransform((2600000, 0.1, 0, 1200000, 0, -0.1))
+    for b in range(1, 5):
+        arr = np.full((64, 64), b * 50, dtype=np.uint8)
+        if b == 4:
+            arr[10:20, 10:20] = 0          # "Wasser": NIR = 0, RGB gueltig
+        ds.GetRasterBand(b).WriteArray(arr)
+    for b, ci in enumerate((gdal.GCI_RedBand, gdal.GCI_GreenBand,
+                            gdal.GCI_BlueBand, gdal.GCI_AlphaBand), 1):
+        ds.GetRasterBand(b).SetColorInterpretation(ci)
+    ds = None
+
+    vrt = str(tmp_path / "mosaic.vrt")
+    gdal.BuildVRT(vrt, [src]).FlushCache()
+
+    def water_pixel(path):
+        d = gdal.Open(path)
+        vals = [int(d.GetRasterBand(i).ReadAsArray(15, 15, 1, 1)[0, 0])
+                for i in range(1, 5)]
+        ci = d.GetRasterBand(4).GetColorInterpretation()
+        d = None
+        return vals, ci
+
+    # Rohzustand: das Alpha-Band loescht RGB dort, wo das NIR 0 ist
+    vals, _ = water_pixel(vrt)
+    assert vals == [0, 0, 0, 0], f"Erwartet: unkorrigiertes VRT zerstoert RGB, war {vals}"
+
+    # Nach der Korrektur bleiben die RGB-Werte stehen und der Alpha-Tag ist weg
+    fixed = runner_mod._normalize_alpha_band(vrt, tmp_path, lambda *_: None)
+    assert fixed != vrt, "Es muss eine korrigierte Kopie im Staging entstehen"
+    vals, ci = water_pixel(fixed)
+    assert vals == [50, 100, 150, 0], f"RGB muss erhalten bleiben, war {vals}"
+    assert ci != gdal.GCI_AlphaBand, "Band 4 darf nicht mehr als Alpha getaggt sein"
+    # Der Input bleibt unberuehrt - dort kann ein geliefertes True_Ortho.vrt liegen
+    assert water_pixel(vrt)[0] == [0, 0, 0, 0]
+
+    # Ohne Alpha-Tag ist nichts zu tun: die Quelle wird unveraendert durchgereicht
+    assert runner_mod._normalize_alpha_band(fixed, tmp_path, lambda *_: None) == fixed
+
+
+def test_nodata_collisions_are_resolved(tmp_path):
+    """Wasser darf in der Lieferkachel NICHT als NoData gelten - nur echtes NoData.
+
+    Ein GeoTIFF traegt EINEN NoData-Wert, und der wirkt pro Band: sobald ein Band ihn
+    traegt, gilt das Pixel dort als NoData. Im NIR ist 0 aber ein echter Messwert
+    (Wasser reflektiert im nahen Infrarot praktisch nicht). Solche Pixel werden darum
+    um einen Digitalwert angehoben; Pixel, die den Wert in JEDEM Band tragen, sind
+    echtes NoData (Rand, Clip-Ausschluss) und bleiben unangetastet.
+    """
+    import pytest
+    gdal = pytest.importorskip("osgeo.gdal", reason="GDAL nur unter OSGeo4W verfuegbar")
+    np = pytest.importorskip("numpy")
+    gdal.UseExceptions()
+    runner_mod = _runner()
+
+    def build(path, nodata):
+        """Wie eine fertige Lieferkachel: NoData-Tag gesetzt, Band 4 als 'Undefined'
+        (sonst liest GDAL es als Alpha und die Maske waere das NIR selbst)."""
+        ds = gdal.GetDriverByName("GTiff").Create(path, 100, 100, 4, gdal.GDT_Byte)
+        for b in range(1, 5):
+            arr = np.full((100, 100), b * 50, dtype=np.uint8)
+            arr[:10, :] = nodata            # echter Rand: ALLE Baender
+            if b == 4:
+                arr[20:40, 20:40] = nodata  # "Wasser": nur NIR, 400 Pixel
+            ds.GetRasterBand(b).WriteArray(arr)
+            ds.GetRasterBand(b).SetNoDataValue(float(nodata))
+        for i, ci in enumerate((gdal.GCI_RedBand, gdal.GCI_GreenBand,
+                                gdal.GCI_BlueBand, gdal.GCI_Undefined), 1):
+            ds.GetRasterBand(i).SetColorInterpretation(ci)
+        ds = None
+
+    p = str(tmp_path / "t.tif")
+    build(p, 0)
+    lines = []
+    changed = runner_mod._resolve_nodata_collisions(p, 0.0, "RGBN", lines.append)
+    assert changed == 400, f"nur die 400 Wasser-Pixel, war {changed}"
+
+    ds = gdal.Open(p)
+    bands = [ds.GetRasterBand(i).ReadAsArray() for i in range(1, 5)]
+    # Wasser: NIR angehoben, RGB unangetastet - das Pixel ist jetzt vollstaendig gueltig
+    assert bands[3][30, 30] == 1
+    assert [int(b[30, 30]) for b in bands] == [50, 100, 150, 1]
+    assert all(int(ds.GetRasterBand(i).GetMaskBand().ReadAsArray(30, 30, 1, 1)[0, 0]) == 255
+               for i in range(1, 5)), "Wasser darf in keinem Band als NoData gelten"
+    # Echter Rand: alle Baender bleiben auf 0 und damit NoData
+    assert [int(b[5, 5]) for b in bands] == [0, 0, 0, 0]
+    ds = None
+
+    text = "\n".join(lines)
+    assert "Band 4 (NIR)" in text and "400 Pixel" in text
+    assert "Band 1" not in text              # die uebrigen Baender sind unauffaellig
+
+    # Am oberen Rand des Datentyps wird nach unten ausgewichen (255 -> 254)
+    q = str(tmp_path / "w.tif")
+    build(q, 255)
+    assert runner_mod._resolve_nodata_collisions(q, 255.0, "RGBN", lambda *_: None) == 400
+    ds = gdal.Open(q)
+    assert int(ds.GetRasterBand(4).ReadAsArray()[30, 30]) == 254
+    assert int(ds.GetRasterBand(4).ReadAsArray()[5, 5]) == 255     # echter Rand bleibt
+    ds = None
+
+    # Ohne Kollision bleibt alles unberuehrt und das Log still
+    c = str(tmp_path / "clean.tif")
+    ds = gdal.GetDriverByName("GTiff").Create(c, 50, 50, 4, gdal.GDT_Byte)
+    for b in range(1, 5):
+        arr = np.full((50, 50), b * 50, dtype=np.uint8)
+        arr[:5, :] = 0                       # nur gemeinsamer Rand
+        ds.GetRasterBand(b).WriteArray(arr)
+    ds = None
+    lines = []
+    assert runner_mod._resolve_nodata_collisions(c, 0.0, "RGBN", lines.append) == 0
+    assert lines == []

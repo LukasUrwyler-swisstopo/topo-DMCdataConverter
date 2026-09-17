@@ -24,7 +24,7 @@ ueber die Schaltflaeche **Aendern…** manuell gesetzt werden und wird in
 
 | Tab | Input | Verarbeitung | Output |
 |---|---|---|---|
-| **[1] DMC DOP - TIFFconverter** | technische 200m-DOP-Kacheln (`.tif`), meist 4-Band RGBN | Mosaik → optionaler Bandauszug (RGB / NRG) → Clip auf die gültige Fläche → Zuschnitt ins 1km-Grid | 1km-DOP-Kacheln (`.tif`)<br>4-Band RGBN (Standard) oder 3-Band RGB / NRG<br>optional QC-Mosaik der AOI (COG) |
+| **[1] DMC DOP - TIFFconverter** | technische 200m-DOP-Kacheln (`.tif`), meist 4-BAND RGBN | Mosaik → optionaler Bandauszug (RGB / NRG) → Clip auf die gültige Fläche → Zuschnitt ins 1km-Grid | 1km-DOP-Kacheln (`.tif`)<br>4-BAND RGBN (Standard) oder 3-BAND RGB / NRG<br>optional QC-Mosaik der AOI (COG) |
 | **[2a] DMC DSM - LASconverter [LHN95]** | technische 200m-Punktwolken (`.laz`) | Kacheln je Gitterzelle mergen → Crop auf Zelle + AOI → optional ausdünnen | 1km-Kacheln `…_LV95_LHN95.las` (LAS 1.4 / PF7, mit RGB; `.laz` wählbar)<br>optional DSM + Hillshade |
 | **[2b] DMC DSM - LASconverter [LN02]** | die von GeoSuite nach LN02 reframten 1km-Kacheln (`.laz` oder `.las`) | requantisieren → CRS-VLRs byte-exakt injizieren → vollständig validieren | 1km-Kacheln `…_LV95_LN02.laz` (GDWH-tauglich, LAS 1.4 / PF7 mit RGB)<br>optional QC-COPC der AOI, DSM + Hillshade |
 | **Create DSM-Raster** | beliebiger Ordner mit `.las`/`.laz` | zellweise IDW-Rasterung → mosaikieren → Löcher füllen → AOI-Maske → Hillshade | ein DSM + ein Hillshade (`.tif` + `.tfw`) |
@@ -90,54 +90,142 @@ gültige Fläche ausgeschnitten und das Ergebnis parallelisiert ins 1km-Grid zer
 1. **Projekt-Parameter**: Jahr, AREA/AOI-Name, GSD (z.B. `10cm`) — ergeben zusammen mit dem
    Attribut `NAME` des Grid-Shapes die Ausgabebenennung:
    ```
-   <JAHR>_<AREA>_DOP_<GSD>_<NAME>_LV95.tif  (+ .tfw)
+   <JAHR>_<AREA>_DOP_<GSD>_<BAND>_<NAME>_LV95.tif  (+ .tfw)
    ```
-   Beispiel: `2026_GUPPENFIRN_DOP_10cm_2713_1206_LV95.tif`
+   Beispiel: `2026_GUPPENFIRN_DOP_10cm_RGBN_2713_1206_LV95.tif`
+
+   `<BAND>` benennt die Band-Ausgabe: **`RGBN`** (4-BAND), **`RGB`** oder **`NRG`**. Das
+   Kuerzel stammt aus der tatsaechlichen Bandzahl der Ausgabe, nicht aus der Auswahl —
+   ein 3-BAND-Input ohne Auszug wird also `RGB`, nicht `RGBN`. So liegen RGB und NRG
+   desselben Gebiets im selben Output-Ordner, ohne sich zu ueberschreiben.
+
+   **AREA wird aus dem Input-Pfad vorbelegt.** Sobald ein Input-Ordner gesetzt wird — per
+   Button oder durch Einfügen eines Pfads ins Feld — trägt das GUI den AREA-Namen
+   automatisch ein. Er steht in der VDI-Transfer-Ablage immer eine feste Zahl Ordner über
+   dem Input-Ordner, je nach Tab unterschiedlich tief:
+
+   | Tab | Beispielpfad | AREA |
+   |---|---|---|
+   | **[1]** DOP | `…\2026\_MUSTER\DOP\LV95\01_INPUT_realityStudio` | viertletzter Ordner |
+   | **[2a]** DSM LHN95 | `…\2026\_MUSTER\DSM\LV95_LHN95\01_INPUT_realityStudio` | viertletzter Ordner |
+   | **[2b]** DSM LN02 | `…\2026\_MUSTER\DSM\LV95_LN02\01_DSM_LAZ\01_INPUT_GeoSuite_LN02` | **fünft**letzter Ordner |
+
+   Tab [2b] liegt eine Ebene tiefer, weil dort zusätzlich der Ordner `01_DSM_LAZ` dazwischen
+   liegt.
+
+   Liefert der Pfad einen Namen, **gewinnt er** — auch gegen einen bereits eingetragenen,
+   abweichenden Wert. Der Pfad ist die verlässlichere Quelle: er kommt aus der
+   Ablagestruktur, während ein Handeintrag von einem früheren Gebiet stehengeblieben sein
+   kann. Passt der Pfad dagegen **nicht** zur Konvention (zu kurz), bleibt ein vorhandener
+   Eintrag unangetastet — dann wird nichts geraten.
+
+   Die Ableitung ist rein lexikalisch und greift nicht auf die Platte zu, funktioniert also
+   auch bei einem offline liegenden Netzlaufwerk. Ausgelöst wird sie beim Verlassen des
+   Feldes, mit Enter oder beim Einfügen — bewusst nicht bei jedem Tastendruck, weil beim
+   Tippen jeder Zwischenstand ein gültiger, aber falscher Pfad wäre.
+
+   > Die übrigen Tabs (**Create DSM-Raster**, **Create COGTIFF**, **Create COPC**) haben
+   > diese Vorbelegung bewusst **nicht** — dort laufen spontane Verarbeitungen mit
+   > beliebigen Pfaden ausserhalb der Ablagekonvention.
 
 2. **Band-Ausgabe** (Auswahlfeld direkt unter der GSD-Eingabe): DMC-Orthophotos liegen
-   praktisch immer als **4-Band RGBN** vor (Rot, Gruen, Blau, Nahes Infrarot). Hier wird
+   praktisch immer als **4-BAND RGBN** vor (Rot, Gruen, Blau, Nahes Infrarot). Hier wird
    gesteuert, welche Baender in die 1km-Kacheln geschrieben werden:
 
    | Auswahl | Quellbaender | Ergebnis |
    |---|---|---|
-   | **4-Band  (RGBN, unveraendert)** — *Standard* | 1, 2, 3, 4 | alle Baender der Quelle bleiben erhalten |
-   | **RGBN → RGB  (3-Band, Echtfarbe)** | 1, 2, 3 | Echtfarben-DOP ohne NIR |
-   | **RGBN → NRG  (3-Band, Falschfarben-Infrarot)** | 4, 1, 2 | CIR-Komposit: NIR → Rot, Rot → Gruen, Gruen → Blau |
+   | **4-BAND  (RGBN)** — *Standard* | 1, 2, 3, 4 | Rot, Gruen, Blau, NIR — alle Baender der Quelle |
+   | **RGBN → RGB  (3-BAND, Echtfarbe)** | 1, 2, 3 | Echtfarben-DOP ohne NIR |
+   | **RGBN → NRG  (3-BAND, Falschfarben-Infrarot)** | 4, 1, 2 | CIR-Komposit: NIR → Rot, Rot → Gruen, Gruen → Blau |
 
-   - **Wird nichts gewaehlt, passiert nichts**: die Vorgabe ist „4-Band (RGBN, unveraendert)",
-     die Ausgabe hat dann exakt so viele Baender wie der Input.
-   - Die Auswahl ist **nur bei 4-Band-Input moeglich**. Beim Waehlen des Input-Ordners bzw.
+   - **Wird nichts gewaehlt, passiert nichts**: die Vorgabe ist „4-BAND (RGBN)", die Ausgabe
+     hat dann exakt so viele Baender wie der Input.
+   - Die Auswahl ist **nur bei 4-BAND-Input moeglich**. Beim Waehlen des Input-Ordners bzw.
      ueber **Datei-Info aktualisieren** liest das GUI die Bandzahl der ersten Kachel; bei
-     weniger als 4 Baendern wird das Auswahlfeld gesperrt und auf „4-Band" zurueckgestellt.
-     Startet man einen Lauf trotzdem mit einem 3-Band-Input (z.B. gemischter Ordner), bricht
+     weniger als 4 Baendern wird das Auswahlfeld gesperrt und auf „4-BAND" zurueckgestellt.
+     Startet man einen Lauf trotzdem mit einem 3-BAND-Input (z.B. gemischter Ordner), bricht
      der Runner mit einer klaren Meldung ab, statt stillschweigend etwas Falsches zu schreiben.
    - Der Bandauszug passiert **vor** dem Cutline-Clip und wird als VRT gebaut — das kopiert
      keine Pixel. Warp und Grid-Zuschnitt arbeiten dadurch auf 3 statt 4 Baendern, also rund
      ein Viertel weniger I/O.
-   - Die Ausgabe wird explizit mit `PHOTOMETRIC=RGB` und ColorInterp Rot/Gruen/Blau getaggt.
-     Das ist vor allem bei NRG wichtig: Band 4 eines RGBN-TIFF ist haeufig als `Alpha` oder
-     `Undefined` getaggt und wuerde sonst als Transparenzkanal in die Kachel wandern.
-   - **Der Dateiname aendert sich dadurch nicht.** Wer RGB und NRG desselben Gebiets
-     nebeneinander ablegen will, braucht getrennte Output-Ordner (oder einen abweichenden
-     AREA-Namen).
+   - **Band 4 ist NIR, nicht Alpha.** Die Ausgabe wird ab drei Baendern explizit mit
+     `PHOTOMETRIC=RGB` und ColorInterp Rot/Gruen/Blau getaggt, Band 4 ausdruecklich als
+     **NIR** (`GCI_NIRBand`, GDAL ab 3.10 — aeltere Versionen kennen nur `Undefined`).
+     In der Quelle traegt es haeufig faelschlich `Alpha`; entscheidend ist, dass es das
+     in der Ausgabe nicht mehr tut, sonst wird es als Transparenz gelesen. Der Tag
+     ueberlebt die ganze Kette: Quelle → VRT → Warp → Kachel → COG.
+   - **Alpha-Korrektur vor allem anderen** (siehe eigener Abschnitt unten): Band 4 eines
+     RGBN-TIFF traegt haeufig den Tag `Alpha`. Ohne Korrektur verliert die Ausgabe dort
+     die RGB-Werte, wo das NIR 0 ist — typischerweise ueber Wasser.
+   - Der Dateiname traegt das Band-Kuerzel (`RGBN`/`RGB`/`NRG`), RGB und NRG desselben
+     Gebiets koennen also im selben Output-Ordner liegen.
 
-3. **NoData-Werte** (Feld unter der Band-Auswahl, Default `0 0 0`, änderbar, Vorschlag
-   `255 255 255`): Pixelwert je Band, der als NoData gilt. Daraus werden der Clip-Wert (alles
+3. **NoData-Werte** (Feld unter der Band-Auswahl, Vorschlag `0 0 0 0` bzw.
+   `255 255 255 255`): Pixelwert je Band, der als NoData gilt. Die **Anzahl der Werte folgt
+   der Band-Ausgabe**: bei 4-BAND (RGBN) stehen vier Werte im Feld, bei einem 3-BAND-Auszug
+   drei. Sobald die Datei-Info die Bandzahl kennt, zieht das Feld automatisch nach. Daraus werden der Clip-Wert (alles
    ausserhalb der gültigen Fläche), der NoData-Tag der 1km-Kacheln und die Maske des
    QC-Mosaiks. GeoTIFF kennt nur **einen** NoData-Wert für alle Bänder, darum muss hier jedes
-   Band denselben Wert haben (`0 0 255` bricht vor dem Start mit einer Meldung ab). Bei 4-Band
-   (RGBN) gilt `0 0 0` als `0 0 0 0` — fehlende Werte werden mit dem letzten aufgefüllt. Den
-   NoData-Tag der Input-Kacheln zeigt die **Datei-Info**.
+   Band denselben Wert haben (`0 0 255` bricht vor dem Start mit einer Meldung ab). Bei 4-BAND
+   (RGBN) gilt `0 0 0` weiterhin als `0 0 0 0` — fehlende Werte werden mit dem letzten
+   aufgefüllt, die Anzeige beschreibt nur die Ausgabe genauer. Den NoData-Tag der
+   Input-Kacheln zeigt die **Datei-Info**.
+
+   **Nur echtes NoData wird geflaggt (NIR/Wasser):** Der NoData-Tag wirkt **pro Band** —
+   sobald *ein* Band ihn traegt, gilt das Pixel dort als NoData. Im NIR ist 0 aber ein echter
+   Messwert: Wasser reflektiert im nahen Infrarot praktisch nicht. Seen, Schmelzwasser und
+   nasser Fels wuerden so als Loecher in der Lieferkachel landen, obwohl RGB gueltige Daten
+   fuehrt.
+
+   Der Runner loest das nach dem Clip an der Quelle (`_resolve_nodata_collisions`):
+
+   | Pixel | Erkennung | Behandlung |
+   |---|---|---|
+   | echtes NoData (Rand, Clip-Ausschluss) | Wert in **jedem** Band | bleibt NoData |
+   | Messwert (Wasser im NIR) | Wert nur in **einzelnen** Baendern | um einen DN angehoben (`0` → `1`, am oberen Rand `255` → `254`) |
+
+   Danach bedeutet der NoData-Wert in der Kachel wirklich nur noch „kein Datum", und zwar
+   fuer jeden Konsumenten — GDWH, QGIS und ArcGIS brauchen keine Sonderbehandlung pro Band.
+   Der radiometrische Eingriff betraegt einen Digitalwert von 255 (0.4 %) und trifft nur die
+   kollidierenden Pixel; es ist dasselbe Verfahren, das GDAL bei Bedarf selbst anwendet
+   (*„Value 0 in the source dataset has been changed to 1 … to avoid being treated as
+   NoData"*). Das Log nennt Bandzahl, Pixelzahl und Flaechenanteil. Bei 3-BAND RGB war das
+   kein Thema: exakt R=G=B=0 kommt in echten Bilddaten praktisch nicht vor.
 
 4. **Create COGTIFF** (Checkbox unter den NoData-Werten) + **JPEG-Qualität** (Default 90 %):
    baut nach dem Zuschnitt zusätzlich **ein** Mosaik aller Kacheln der AOI als COG —
-   `cog_QC\<JAHR>_<AREA>_DOP_<GSD>_checkData_LV95.tif`. Nur zur Sichtkontrolle, siehe
-   „QC-Mosaik" unten.
+   `cog_QC\<JAHR>_<AREA>_DOP_<GSD>_<BAND>_checkData_LV95.tif`. Nur zur Sichtkontrolle,
+   siehe „QC-Mosaik" unten. Das Mosaik uebernimmt Bandzahl und Metadaten der Kacheln, bei
+   4-BAND also ein 4-BAND-COG. Seine Maske bildet den NoData-Tag der Kacheln **exakt** ab
+   (ungueltig, sobald ein Band den Wert traegt) — das Mosaik zeigt also genau das, was die
+   Lieferkacheln zeigen. Wasserflaechen kostet das nichts, weil die Kollisionen vorher an
+   der Quelle beseitigt wurden.
 
 5. **Input-Ordner**: Ordner mit den technischen 200m x 200m-Kacheln (`.tif` + `.tfw`).
    Enthaelt der Ordner bereits ein Mosaik-VRT (z.B. `True_Ortho.vrt`), wird dieses direkt
    uebernommen — sonst wird automatisch ein frisches VRT aus allen gefundenen `.tif`-Kacheln
-   gebaut (`gdalbuildvrt`-Aequivalent).
+   gebaut (`gdalbuildvrt`-Aequivalent). Das Setzen des Ordners belegt zugleich das Feld
+   **AREA/AOI-Name** vor (siehe Punkt 1).
+
+   **Alpha-Korrektur (4-BAND):** Band 4 eines RGBN-TIFF traegt haeufig den Tag `Alpha`.
+   GDAL wertet ein Alpha-Band als Gueltigkeitsmaske der Quelle — `gdalbuildvrt` schreibt
+   daraufhin in *jedes* Band ein `<UseMaskBand>true</UseMaskBand>`, und das VRT liefert
+   ueberall dort Nullen, wo das Alpha 0 ist, **in allen vier Baendern**. Im NIR ist 0 aber
+   ein plausibler Messwert (Wasser reflektiert im nahen Infrarot praktisch nicht), die
+   RGB-Werte solcher Flaechen waeren damit still verloren — schon bevor geclippt oder
+   gekachelt wird. Gemessen an einem Quellpixel `[146, 104, 68, 0]`:
+
+   | Zustand | Ergebnis |
+   |---|---|
+   | unveraendertes VRT | `[0, 0, 0, 0]` — RGB zerstoert |
+   | nur `<ColorInterp>` geaendert | `[0, 0, 0, 0]` — reicht **nicht** |
+   | ohne `<UseMaskBand>` | `[146, 104, 68, 0]` — korrekt |
+
+   Der Runner legt darum eine korrigierte VRT-Kopie im Staging an (`01c_no_alpha.vrt`):
+   `<UseMaskBand>` entfernt, der Alpha-Tag weg (Band 4 wird anschliessend als **NIR**
+   gekennzeichnet), relative Quellpfade absolut. Der
+   Input-Ordner bleibt unberuehrt. Ohne Alpha-Band passiert nichts. Solange die Ausgabe
+   3-BAND RGB war, konnte der Fall nicht auftreten — da gab es kein viertes Band.
 
 6. **Clip-Shape (gueltige Flaeche)**: Polygon-Shape, das die manuell erfasste gueltige Flaeche
    des Orthophotos beschreibt. Alles ausserhalb wird per Cutline-Clip (`gdal.Warp`) zu
@@ -148,7 +236,7 @@ gültige Fläche ausgeschnitten und das Ergebnis parallelisiert ins 1km-Grid zer
    `swissGRID_1km2_shp/chGRID_1km2.shp`. Wird bei Bedarf automatisch nach EPSG:2056
    reprojiziert.
 
-8. **Staging & Parallelisierung**: Zwischenergebnisse (VRT, Band-VRT, geclipptes Mosaik) werden in einem
+8. **Staging & Parallelisierung**: Zwischenergebnisse (VRT, Alpha-korrigiertes VRT, Band-VRT, geclipptes Mosaik) werden in einem
    Staging-Ordner abgelegt (Standard `Y:\02_DMC_tempProcessingFolder`), damit mehrere Kerne
    parallel auf dieselbe geclippte Rasterquelle zugreifen koennen. **CPU-Kerne** steuert die
    Anzahl paralleler Prozesse fuer den Grid-Zuschnitt (Standard: 6). Nach erfolgreichem Lauf
@@ -177,7 +265,7 @@ automatisch geloescht (`.tif` + `.tfw`).
 ### QC-Mosaik (Create COGTIFF) — nur zur Kontrolle
 
 Bei aktivierter Option entsteht nach dem Zuschnitt
-`cog_QC\<JAHR>_<AREA>_DOP_<GSD>_checkData_LV95.tif`: **ein** Mosaik aller Kacheln der AOI als
+`cog_QC\<JAHR>_<AREA>_DOP_<GSD>_<BAND>_checkData_LV95.tif`: **ein** Mosaik aller Kacheln der AOI als
 Cloud Optimized GeoTIFF, zum schnellen Durchsehen in QGIS. Es ist kein Lieferprodukt —
 `checkData` im Namen, eigener Unterordner; die offizielle COG-Ableitung macht später das GDWH
 selbst aus den verlustfreien Kacheln.
@@ -188,7 +276,7 @@ selbst aus den verlustfreien Kacheln.
 | Overviews | `AUTO`, Resampling `AVERAGE` | ruhige Übersichten beim Herauszoomen |
 | Blockgrösse | 256 | wie das Mosaik in `topo-COGTIFFconverter` |
 | NoData | **interne Maske** (Flag `PER_DATASET`) aus den **NoData-Werten** (Punkt 3): ungültig, sobald **ein** Band den Wert trägt; kein NoData-Tag | zeigt die Löcher der Kacheln so, wie QGIS sie darstellt; JPEG verändert die 0-Werte, ein NoData-Tag gäbe schwarze Säume und falsche Löcher — die 1-bit-Maske bleibt verlustfrei |
-| Band 4 (NIR) | als „undefiniert" deklariert | ein als Alpha markiertes Band 4 würde der COG-Treiber bei JPEG in eine Maske umwandeln (NIR weg), und QGIS zeigte das Bild halbtransparent |
+| Band 4 (NIR) | als **NIR** deklariert (`GCI_NIRBand`, GDAL ab 3.10; ältere Versionen: „undefiniert") | ein als Alpha markiertes Band 4 würde der COG-Treiber bei JPEG in eine Maske umwandeln (NIR weg), und QGIS zeigte das Bild halbtransparent |
 
 Die Maske entsteht zweistufig und blockweise wie in `topo-COGTIFFconverter`: VRT über die fertigen
 Kacheln → Zwischenraster (LZW) im Staging → Maske → COG. So bleibt der Speicherbedarf auch bei
@@ -198,9 +286,11 @@ Anders als im Tab „Create COGTIFF" ist ein Pixel hier schon ungültig, wenn **
 NoData-Wert trägt. Grund: Der NoData-Tag der Kacheln gilt pro Band — ein Pixel `0 12 7` ist in
 Band 1 NoData, und QGIS blendet es ganz aus. Das QC-Mosaik zeigt so dieselben Löcher wie die
 Kacheln. Eine Maske pro Band kann GeoTIFF nicht speichern (nur `PER_DATASET`), und ein NoData-Tag
-übersteht JPEG nicht. Bei 4-Band (RGBN) zählt auch Band 4: Ein Pixel mit NIR = 0 fehlt im Mosaik,
-obwohl QGIS es in der RGB-Ansicht der Kacheln zeigt. Vor dem Ablegen wird das Ergebnis geprüft
-(COG-Layout, JPEG, Bandzahl, interne Maske, kein Alpha-Band); ein alter Stand wird vorher
+übersteht JPEG nicht. Bei 4-BAND (RGBN) zählt auch Band 4 — das kostet Wasserflächen aber nichts
+mehr: die Kollisionen zwischen NoData und echten NIR-Messwerten sind vorher an der Quelle beseitigt
+(siehe „Nur echtes NoData wird geflaggt"), innerhalb der gültigen Fläche gibt es keine
+Einzelband-Nullen. Maskiert wird also nur echtes NoData. Vor dem Ablegen wird das Ergebnis geprüft
+(COG-Layout, JPEG, Bandzahl, interne Maske, Band 4 als NIR, kein Alpha-Band); ein alter Stand wird vorher
 entfernt. Die Eingabe ist 8 bit (neue Kamera), JPEG passt also. Scheitert der Bau, gibt es eine
 Warnung im Log, der Lauf bleibt erfolgreich.
 
@@ -212,7 +302,10 @@ Verarbeitet technische 200m-LAZ-Kacheln (Punktwolke, Koordinatensystem CH1903+/L
 via [PDAL](https://pdal.io/) (nicht GDAL — GDAL kennt keine Punktwolken). `pdal.exe` wird
 automatisch erkannt (PATH, OSGeo4W-/QGIS-Installationspfade), kein eigenes GUI-Feld dafuer.
 
-1. **Projekt-Parameter**: Jahr, AREA/AOI-Name, **Thinning** (Dropdown: kein Thinning / 0.1m /
+1. **Projekt-Parameter**: Jahr, AREA/AOI-Name (wird aus dem Input-Pfad vorbelegt — hier der
+   **viertletzte** Ordner, z.B. `…\2026\_MUSTER\DSM\LV95_LHN95\01_INPUT_realityStudio` →
+   `_MUSTER`; Regeln siehe [TIFFconverter, Punkt 1](#details-tiffconverter)), **Thinning**
+   (Dropdown: kein Thinning / 0.1m /
    0.2m / 0.4m / 1m / 2m — Poisson-Disk-Sampling via `filters.sample`, Mindestabstand nach
    Reduktion), **Create DSM-Raster from LAZ** (Checkbox — blendet bei Aktivierung das GSD-Feld
    und den Raster-Output-Ordner ein; erzeugt neben dem DSM automatisch auch ein Hillshade, kein
@@ -378,7 +471,11 @@ swissSURFACE3D bzw. `SB_DSM_PUNKTWOLKE` (Projekt `topo-importDATAtoGDWH-STAC`).
 das fertige, AOI-gecroppte 1km-Grid. Das Footprint-/AOI-Shape wird ausschliesslich für die
 Raster-Maskierung gebraucht und ist nur sichtbar, wenn die Raster-Option aktiv ist.
 
-1. **Projekt-Parameter**: Jahr, AREA/AOI-Name, **Create DSM-Raster from LAS/LAZ** (Checkbox —
+1. **Projekt-Parameter**: Jahr, AREA/AOI-Name (wird aus dem Input-Pfad vorbelegt — hier der
+   **fünftletzte** Ordner, weil `01_DSM_LAZ` dazwischenliegt, z.B.
+   `…\2026\_MUSTER\DSM\LV95_LN02\01_DSM_LAZ\01_INPUT_GeoSuite_LN02` → `_MUSTER`; Regeln
+   siehe [TIFFconverter, Punkt 1](#details-tiffconverter)), **Create DSM-Raster from LAS/LAZ**
+   (Checkbox —
    blendet GSD-Feld, Raster-Output-Ordner und Footprint-/AOI-Shape ein). **Kein Thinning-Feld**:
    ausgedünnt wird ausschliesslich im Tab [LHN95], der Token `thinnedout<NN>_` gehört damit zur
    Kachel und wird — wie die Kachelkoordinaten `<E>_<N>` — aus dem Input-Dateinamen übernommen.
@@ -697,7 +794,7 @@ wird nach dem Lauf gelöscht.
 
 Profil und Prüfung wie beim QC-Mosaik: Overviews `AUTO` / `AVERAGE`, Blockgrösse 256, Band 4 als
 „undefiniert" (nie Alpha). Die Temp-Datei kommt erst nach bestandener Prüfung (COG-Layout,
-Kompression, Bandzahl, ggf. Maske, kein Alpha-Band) an ihren Platz.
+Kompression, Bandzahl, ggf. Maske, Band 4 als NIR, kein Alpha-Band) an ihren Platz.
 
 ## Details: Create COPC
 
