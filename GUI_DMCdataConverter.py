@@ -351,9 +351,15 @@ def _pc_version(meta: dict, path: str) -> str:
 # Kachelname der Konverter-Tabs, z.B.
 # "2026_GUPPENFIRN_v2_TIN_thinnedout02_raw_2713_1206_LV95_LN02.laz".
 # Daraus lassen sich Jahr, AREA und Hoehenbezug fuer den Tab "Create DSM-Raster"
-# vorbelegen - eintippen muss man sie dann nur bei Fremddaten.
+# vorbelegen - eintippen muss man sie dann nur bei Fremddaten. Der Tab "Create COPC"
+# nimmt daraus nur den Hoehenbezug.
 _TILE_PROJECT_PATTERN = re.compile(
     r"^(\d{4})_(.+?)_TIN_.*_LV95_(LHN95|LN02)\.(?:las|laz)$", re.IGNORECASE)
+
+# Hoehenbezug im Tab "Create COPC": Standard ist das CRS der Kacheln, unveraendert.
+# LHN95/LN02 ergaenzt den Hoehenbezug im CRS-Tag, wenn die Kacheln keinen tragen.
+COPC_HREF_KEEP    = "wie Kacheln"
+COPC_HREF_CHOICES = [COPC_HREF_KEEP, "LHN95", "LN02"]
 
 
 # Ablage-Konvention der VDI-Transfer-Struktur: der AREA-Name steht immer eine feste
@@ -1238,7 +1244,8 @@ class DMCConverterApp(tk.Tk):
         ttk.Combobox(sec, textvariable=self._dsm_href_var, values=["LHN95", "LN02"],
                      state="readonly", width=10
                      ).grid(row=3, column=1, sticky="w", padx=(8, 0), pady=3)
-        h3 = ttk.Label(sec, text="Nur Benennung + SRS-Tag, Z bleibt unveraendert. Vorbelegt aus dem Kachelnamen.",
+        h3 = ttk.Label(sec, text="Benennung + CRS-Tag des DSM (EPSG:2056+5729 bzw. +5728), Z bleibt unveraendert.\n"
+                                  "Vorbelegt aus dem Kachelnamen.",
                         font=("", 8), justify="left")
         h3.grid(row=4, column=1, columnspan=2, sticky="w", padx=(8, 0))
         self._dim_labels.append(h3)
@@ -1814,25 +1821,36 @@ class DMCConverterApp(tk.Tk):
         self._copc_in_var = tk.StringVar()
         ttk.Entry(sec, textvariable=self._copc_in_var
                    ).grid(row=1, column=1, sticky="ew", padx=(8, 4), pady=3)
-        ttk.Button(sec, text="Ordner\u2026",
-                    command=lambda: self._browse_dir_into(self._copc_in_var,
-                                                          "Input-Ordner (LAS/LAZ) auswaehlen")
+        ttk.Button(sec, text="Ordner\u2026", command=self._browse_copc_input
                     ).grid(row=1, column=2, pady=3)
         h = ttk.Label(sec, text="Alle .las/.laz im Ordner (meist .laz), CRS von den Kacheln",
                        font=("", 8))
         h.grid(row=2, column=1, sticky="w", padx=(8, 0))
         self._dim_labels.append(h)
 
+        lbl3 = ttk.Label(sec, text="Hoehenbezug:", font=("Segoe UI", 9, "bold"))
+        lbl3.grid(row=3, column=0, sticky="w", pady=(8, 3))
+        self._copc_href_var = tk.StringVar(value=COPC_HREF_KEEP)
+        ttk.Combobox(sec, textvariable=self._copc_href_var, values=COPC_HREF_CHOICES,
+                     state="readonly", width=14
+                     ).grid(row=3, column=1, sticky="w", padx=(8, 0), pady=(8, 3))
+        h3 = ttk.Label(sec, text="LHN95/LN02 ergaenzt den Hoehenbezug im CRS-Tag (EPSG:2056+5729 bzw. +5728), "
+                                  "wenn die Kacheln keinen tragen.\n"
+                                  "Z bleibt unveraendert. Vorbelegt aus dem Kachelnamen.",
+                        font=("", 8), justify="left")
+        h3.grid(row=4, column=1, columnspan=2, sticky="w", padx=(8, 0))
+        self._dim_labels.append(h3)
+
         lbl2 = ttk.Label(sec, text="Output-Datei (COPC):", font=("Segoe UI", 9, "bold"))
-        lbl2.grid(row=3, column=0, sticky="w", pady=(8, 3))
+        lbl2.grid(row=5, column=0, sticky="w", pady=(8, 3))
         self._copc_out_var = tk.StringVar()
         ttk.Entry(sec, textvariable=self._copc_out_var
-                   ).grid(row=3, column=1, sticky="ew", padx=(8, 4), pady=(8, 3))
+                   ).grid(row=5, column=1, sticky="ew", padx=(8, 4), pady=(8, 3))
         ttk.Button(sec, text="Datei\u2026", command=self._browse_copc_output
-                    ).grid(row=3, column=2, pady=(8, 3))
+                    ).grid(row=5, column=2, pady=(8, 3))
         h2 = ttk.Label(sec, text="Pfad inkl. Dateiname, endet auf .copc.laz (wird sonst ergaenzt)",
                         font=("", 8))
-        h2.grid(row=4, column=1, sticky="w", padx=(8, 0))
+        h2.grid(row=6, column=1, sticky="w", padx=(8, 0))
         self._dim_labels.append(h2)
 
     def _build_copc_staging(self, parent):
@@ -1866,6 +1884,21 @@ class DMCConverterApp(tk.Tk):
                          variable=self._copc_keep_staging_var
                          ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
+    def _browse_copc_input(self):
+        if not self._browse_dir_into(self._copc_in_var, "Input-Ordner (LAS/LAZ) auswaehlen"):
+            return
+        self._copc_href_var.set(self._copc_href_from_dir(self._copc_in_var.get()))
+
+    @staticmethod
+    def _copc_href_from_dir(path: str) -> str:
+        """Hoehenbezug aus dem ersten Kachelnamen im Ordner. Folgt er der Konvention
+        nicht (Fremddaten), bleibt es beim CRS der Kacheln - eine Auswahl vom vorigen
+        Ordner darf nicht stehen bleiben."""
+        tiles = sorted(_glob.glob(os.path.join(path, "*.laz")) +
+                       _glob.glob(os.path.join(path, "*.las")))
+        parsed = _project_from_tile_name(tiles[0]) if tiles else None
+        return parsed[2] if parsed else COPC_HREF_KEEP
+
     def _browse_copc_output(self):
         path = filedialog.asksaveasfilename(
             title="Output-Datei (COPC) festlegen", defaultextension=".copc.laz",
@@ -1897,6 +1930,8 @@ class DMCConverterApp(tk.Tk):
             errors.append("Output-Datei (COPC) fehlt.")
         elif not os.path.isabs(out):
             errors.append("Output-Datei bitte mit vollstaendigem Pfad angeben.")
+        if self._copc_href_var.get() not in COPC_HREF_CHOICES:
+            errors.append("Hoehenbezug ungueltig (wie Kacheln, LHN95 oder LN02).")
         if not self._copc_staging_var.get().strip():
             errors.append("Staging-Ordner fehlt.")
         try:
@@ -1911,10 +1946,12 @@ class DMCConverterApp(tk.Tk):
             return
         out = _normalize_copc_path(self._copc_out_var.get())
         self._copc_out_var.set(out)
+        href = self._copc_href_var.get()
         cfg = {
             "action":       "create_copc",
             "input_dir":    self._copc_in_var.get().strip(),
             "output_path":  out,
+            "height_ref":   "" if href == COPC_HREF_KEEP else href,
             "untwine_exe":  self._untwine_exe,
             "pdal_exe":     self._pdal_exe,
             "staging_dir":  self._copc_staging_var.get().strip(),

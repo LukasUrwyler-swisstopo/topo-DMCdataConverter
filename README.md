@@ -338,6 +338,8 @@ automatisch erkannt (PATH, OSGeo4W-/QGIS-Installationspfade), kein eigenes GUI-F
 
 4. **Output-Ordner (DSM-Raster)**: nur sichtbar, wenn "Create DSM-Raster from LAZ" aktiv ist.
    Ziel fuer das eine DSM-TIFF+TFW und das Hillshade-TIFF+TFW der AOI (beide im selben Ordner).
+   CRS-Tag: DSM `EPSG:2056+5729` (LV95 + LHN95), Hillshade `EPSG:2056` — siehe
+   [Koordinatensystem](#koordinatensystem).
 
 5. **Clip-Shape (AOI)**: Bei den LAZ-Kacheln ein echter Crop (Punkte ausserhalb werden aus der
    Punktwolke entfernt), bei DSM und Hillshade je eine Maskierung (ausserhalb -> NoData, Extent
@@ -369,11 +371,21 @@ automatisch erkannt (PATH, OSGeo4W-/QGIS-Installationspfade), kein eigenes GUI-F
 
    Jobs, die fehlschlagen, werden anschliessend **seriell wiederholt** (ein `pdal.exe` mit dem
    vollen Arbeitsspeicher) — bleibt der Fehler, ist er echt und der Lauf endet mit Fehler.
-3. *(falls "Create DSM-Raster" aktiv)*: Zell-Raster als VRT mosaikieren, per AOI-Cutline
-   maskieren (NoData = `-3.4028235e+38`, analog GDWH-Konvention bei SB_DSM) und aus diesem
-   fertigen (bereits geclippten) DSM den Hillshade rechnen (`gdal.DEMProcessing`), ebenfalls
-   per AOI-Cutline maskiert (NoData = `255`). Beim Mosaikieren wird ausserdem der
-   NoData-Sentinel der Zell-Raster auf den GDWH-Sentinel umgesetzt — siehe unten.
+3. *(falls "Create DSM-Raster" aktiv)*: Zell-Raster als VRT mosaikieren und die NoData-Loecher
+   fuellen. Daraus entstehen zwei Produkte auf demselben Gitter:
+   - **DSM**: nur Loecher bis 900 m² bleiben interpoliert, groessere stehen wieder als echtes
+     NoData drin. Danach per AOI-Cutline maskiert (NoData = `-3.4028235e+38`, analog
+     GDWH-Konvention bei SB_DSM).
+   - **Hillshade**: gerechnet (`gdal.DEMProcessing`) aus dem Zwischenstand, in dem **alle**
+     Loecher gefuellt sind — also nicht aus dem fertigen DSM. Die grossen DSM-Loecher bekommen
+     so eine plausible Schattierung statt einer weissen Flaeche, und am AOI-Rand entsteht kein
+     NoData-Saum. Danach separat mit derselben AOI-Cutline maskiert (NoData = `255`, steht
+     innerhalb der AOI fuer nichts anderes).
+
+   Beim Mosaikieren wird ausserdem der NoData-Sentinel der Zell-Raster auf den GDWH-Sentinel
+   umgesetzt — siehe unten. Zuletzt bekommt das DSM den Hoehenbezug in den CRS-Tag
+   (`EPSG:2056+5729`), der zurueckgelesen und geprueft wird; laesst er sich nicht bestaetigen,
+   bricht der Lauf ab.
 
 Alle Punktwolken-Zugriffe lesen direkt aus den komprimierten `.laz`-Inputs (PDAL entpackt
 on-the-fly, kein Zwischenschritt "erst alles zu LAS konvertieren"). Ob eine Punktwolken-Kachel
@@ -420,8 +432,10 @@ als `.las` oder `.laz` geschrieben wird, entscheidet sich rein an der Dateiendun
   Datenminimum: der Tab [LN02] macht es genauso, damit liegt die Zwischenstufe schon auf dem
   Ganzzahl-Gitter des Endprodukts und die dortige Requantisierung verschiebt keine Koordinaten.
 
-  Der Hoehenbezug wird bewusst **nicht** getaggt: REFRAME bekommt Ein- und Ausgangsrahmen aus
-  der Batch-Konfiguration, den autoritativen LV95/LN02-Tag setzt erst der Tab [LN02].
+  Der Hoehenbezug wird in der **Punktwolke** bewusst **nicht** getaggt: REFRAME bekommt Ein-
+  und Ausgangsrahmen aus der Batch-Konfiguration, den autoritativen LV95/LN02-Tag setzt erst
+  der Tab [LN02]. Das gilt nicht fuer das DSM-Raster — das geht nicht durch REFRAME und traegt
+  `EPSG:2056+5729`.
 
   Nach dem Schreiben wird der Header jeder Kachel geprueft (die Metadaten werden fuer den
   Punktzahl-Check ohnehin gelesen) — stimmt er nicht, wird die Kachel verworfen statt eine fuer
@@ -505,7 +519,8 @@ Raster-Maskierung gebraucht und ist nur sichtbar, wenn die Raster-Option aktiv i
 5. **Output-Ordner (DSM-Raster)** und **Footprint / AOI-Shape**: nur sichtbar bei aktivierter
    Raster-Option. DSM und Hillshade landen als je ein Gesamtbild (`.tif` + `.tfw`) im selben
    Ordner, per Cutline maskiert (DSM NoData `-3.4028235e+38`, Hillshade NoData `255`) — exakt
-   wie im Tab [LHN95].
+   wie im Tab [LHN95]. CRS-Tag: DSM `EPSG:2056+5728` (LV95 + LN02), Hillshade `EPSG:2056` —
+   siehe [Koordinatensystem](#koordinatensystem).
 
 6. **Datei-Info**: zeigt zusätzlich **LAS-Version/Point-Format**, **Farbe (RGB)** und
    **global_encoding** der Quelle. Steht dort bereits `LAS 1.4 / PF7` und `17`, ist die Kachel
@@ -710,16 +725,19 @@ schon fertig sind (oder von woanders kommen) und nur noch ein Raster gebraucht w
    <JAHR>_<AREA>_DSM_<GSD>cm_LV95_<LHN95|LN02>.tif        (+ .tfw)
    <JAHR>_<AREA>_hillshade_<GSD>cm_LV95_<LHN95|LN02>.tif  (+ .tfw)
    ```
-   Der Höhenbezug steuert **nur die Benennung und den SRS-Tag der Reader** — die Z-Werte werden
-   nirgends umgerechnet. Beim Wählen des Input-Ordners werden Jahr, AREA und Höhenbezug aus dem
-   ersten Kachelnamen vorbelegt, sofern er der Konvention der Konverter-Tabs folgt; bei
-   Fremddaten bleibt alles wie eingetippt.
+   Der Höhenbezug steuert **die Benennung, den SRS-Tag der Reader und den CRS-Tag des DSM**
+   (`EPSG:2056+5729` bei LHN95, `EPSG:2056+5728` bei LN02) — die Z-Werte werden nirgends
+   umgerechnet. Er muss deshalb zu den Kacheln passen: eine falsche Wahl ergibt ein DSM, das
+   im Header einen Höhenbezug deklariert, den die Werte nicht haben. Beim Wählen des
+   Input-Ordners werden Jahr, AREA und Höhenbezug aus dem ersten Kachelnamen vorbelegt, sofern
+   er der Konvention der Konverter-Tabs folgt; bei Fremddaten bleibt alles wie eingetippt.
 
 2. **Input-Ordner (LAS/LAZ)**: alle `.las`/`.laz` im Ordner. Die Kachelung ist **beliebig** — die
    Dateinamen müssen keiner Konvention folgen (anders als im Tab [LN02], wo der Kachelursprung
    aus dem Namen kommt).
 
-3. **Output-Ordner (Raster)**: DSM und Hillshade als je ein `.tif` + `.tfw`.
+3. **Output-Ordner (Raster)**: DSM und Hillshade als je ein `.tif` + `.tfw`. Der Hillshade trägt
+   unabhängig vom Höhenbezug nur `EPSG:2056`.
 
 4. **Footprint / AOI-Shape**: Maskierung wie in den anderen Tabs — ausserhalb NoData, Extent
    bleibt. Kein Crop der Punkte.
@@ -752,7 +770,7 @@ Zwei Eigenschaften, auf die es dabei ankommt (beide in `_dsm_cell_jobs`, mit Tes
 
 Mosaik, Löcherfüllung (klein interpoliert, gross bleibt NoData), AOI-Maskierung und Hillshade
 laufen anschliessend über dieselbe Funktion wie in den anderen Tabs — inklusive der dortigen
-Kontrollen (Pixelraster-Check, NoData-Kontrolle, Deckungsgleichheit DSM/Hillshade).
+Kontrollen (Pixelraster-Check, CRS-Tag, NoData-Kontrolle, Deckungsgleichheit DSM/Hillshade).
 
 ## Details: Create COGTIFF
 
@@ -806,14 +824,27 @@ im Tab [LN02].
 
 1. **Input-Ordner**: alle `.las`/`.laz` darin. Liegen dort schon `.copc.laz`, werden sie
    mitgemerged (Warnung im Log); die Ausgabedatei selbst ist immer ausgenommen.
-2. **Output-Datei**: vollständiger Pfad inklusive Dateiname, muss auf `.copc.laz` enden — `.laz`
+2. **Höhenbezug**: `wie Kacheln` (Default), `LHN95` oder `LN02` — siehe „CRS" unten. Beim Wählen
+   des Input-Ordners über den Button wird er aus dem ersten Kachelnamen vorbelegt
+   (`…_LV95_LHN95` / `…_LV95_LN02`); bei Fremddaten fällt er auf `wie Kacheln` zurück.
+3. **Output-Datei**: vollständiger Pfad inklusive Dateiname, muss auf `.copc.laz` enden — `.laz`
    wird zu `.copc.laz`, sonst wird ergänzt.
-3. **Staging & CPU-Kerne**: Temp-Dateien von untwine, parallele Header-Prüfung. Die Thread-Zahl
+4. **Staging & CPU-Kerne**: Temp-Dateien von untwine, parallele Header-Prüfung. Die Thread-Zahl
    wählt untwine selbst — das untwine von QGIS 3.42 kennt `--threads` nicht und bricht damit ab.
 
 **CRS**: von den Kacheln übernommen — horizontal und, falls getaggt, vertikal (z.B.
 `EPSG:2056+5728` für Kacheln aus Tab [LN02], `EPSG:2056` für die aus Tab [LHN95]) — und untwine
 explizit mitgegeben. Verschiedene CRS → Abbruch; keine Kachel mit CRS → EPSG:2056 mit Warnung.
+
+Mit der Auswahl **Höhenbezug** `LHN95` bzw. `LN02` wird ein **fehlender** Höhenbezug im CRS-Tag
+ergänzt (`EPSG:2056+5729` bzw. `EPSG:2056+5728`). Das ist der Weg für die Kacheln aus Tab
+[LHN95], die bewusst nur `EPSG:2056` tragen. Es ist ein reiner Tag: die Punkte und ihre
+Z-Werte bleiben unverändert. Überschrieben wird nichts — tragen die Kacheln bereits einen
+anderen Höhenbezug oder horizontal nicht LV95, bricht der Lauf ab, bevor untwine startet.
+
+> **Achtung bei GeoSuite-Output:** Die reframten Kacheln heissen weiterhin `…_LV95_LHN95`,
+> enthalten aber LN02-Höhen und tragen keinen Höhenbezug im Header. Die Vorbelegung liest
+> dort `LHN95` — von Hand auf `LN02` stellen. Dasselbe gilt für den Tab „Create DSM-Raster".
 
 **Geprüft**, bevor die Datei abgelegt wird: Punktanzahl = Summe der Kachel-Header, CRS wie
 übernommen. Braucht `untwine.exe` und `pdal.exe` (siehe Voraussetzungen).
@@ -908,6 +939,29 @@ Fest **EPSG:2056** (CH1903+ / LV95), massgebend fuer swisstopo-Daten. Kachel-TIF
 (Tab [2a]) ist die Hoehe fest **LHN95** (EPSG:5729) — Input wie Output; ein Reframe nach LN02
 findet nicht im Tool statt (siehe Abschnitt [2a] oben). Tab [2b] setzt fest **LN02** (EPSG:5728)
 als Höhenbezug — er taggt die extern reframten Kacheln, transformiert aber selbst nichts.
+
+CRS-Tag der Ausgaben aus der Punktwolken-Kette:
+
+| Produkt | Tab [2a] LHN95 | Tab [2b] LN02 | Create DSM-Raster |
+|---|---|---|---|
+| Punktwolke (`.las`/`.laz`) | `EPSG:2056` — bewusst ohne Höhenbezug (GeoSuite/REFRAME) | `EPSG:2056+5728`, byte-exakte VLRs 34735 + 2112 | – |
+| DSM | `EPSG:2056+5729` | `EPSG:2056+5728` | je nach gewähltem Höhenbezug |
+| Hillshade | `EPSG:2056` | `EPSG:2056` | `EPSG:2056` |
+
+Für LV95 mit Höhenbezug gibt es keinen einzelnen EPSG-Code; `EPSG:2056+5728` ist ein
+Compound-CRS, das GDAL als GeoTIFF 1.1 mit VerticalGeoKey schreibt (OGC 19-008r4). Im DSM ist
+er ein reiner Header-Eintrag: das Mosaik läuft rein horizontal in `EPSG:2056`, der Höhenbezug
+wird danach gesetzt, zurückgelesen und geprüft — Pixel und Geotransformation bleiben
+unberührt. Der Hillshade enthält keine Höhenwerte und bleibt deshalb ohne Höhenbezug.
+
+Lässt sich der Tag nicht bestätigen, trägt das DSM nur `EPSG:2056` — und der GDWH-Import
+taggt ein solches DSM als LN02. Bei LN02 ist das derselbe Tag, es bleibt bei einer `WARNUNG`
+im Log. Bei LHN95 **bricht der Lauf ab**: das DSM liegt dann ohne Höhenbezug im Output-Ordner
+und darf nicht weitergegeben werden, ein Hillshade wird nicht mehr erzeugt.
+
+Beim GDWH-Import (`topo-GDWHimport`) ist `EPSG:2056+5728` der Soll-Tag für SB_DSM. Ein DSM mit
+`EPSG:2056+5729` wird dort abgelehnt — das verhindert, dass LHN95-Höhen als LN02 ins GDWH
+gelangen.
 
 ---
 

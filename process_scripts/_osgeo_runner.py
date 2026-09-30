@@ -116,11 +116,14 @@ PC_FORMATS_WITH_RGB = (2, 3, 5, 7, 8, 10)
 # Konfiguration, und ein VerticalCSTypeGeoKey (5729) in den GeoTIFF-Keys ist genau die
 # Art Header-Zusatz, die die etablierten Quell-Tiles nicht haben. Den autoritativen
 # LV95/LN02-Tag setzt erst der Tab [LN02] per byte-exakter VLR-Injektion.
+# Gilt nur fuer die Punktwolke: das DSM-Raster traegt den Hoehenbezug im CRS-Tag
+# (dsm_srs in _mosaic_las_raster), der Hillshade wiederum nur EPSG:2056.
 LAS_OUT_SRS = "EPSG:2056"
 
 # Erwartetes SRS der Input-.laz-Kacheln (LV95 + LHN95). Wird den Readern explizit
 # aufgezwungen (override_srs), damit eine Kachel mit fehlendem/falschem SRS-Tag
 # nicht still mit einer abweichenden Referenz in den Merge einfliesst.
+# Zugleich der CRS-Tag des DSM-Rasters aus LHN95-Kacheln.
 LAS_INPUT_SRS = "EPSG:2056+5729"
 
 # ─── Zielwerte fuer die GDWH-taugliche LAS-1.4-Ausgabe (Tab "[2b] DMC DSM - LASconverter [LN02]") ──
@@ -145,10 +148,14 @@ LN02_GLOBAL_ENCODING  = 17     # Bit 0 (Adjusted Standard GPS Time) + Bit 4 (WKT
 LN02_SCALE            = 0.01   # Schweizer Konvention (keine uebertriebene Praezision)
 LN02_BBOX_TOLERANCE_M = 0.01   # zulaessige BBox-Abweichung Quelle vs. Ziel nach Requantisierung
 
-# SRS der LN02-Kacheln (LV95 + LN02). Wird NUR den Readern der Raster-Pipeline
-# aufgezwungen; die CRS-Tags der Punktwolken-Ausgabe kommen ausschliesslich aus den
-# byte-exakten Referenz-VLRs (siehe _inject_reference_vlrs).
+# SRS der LN02-Kacheln (LV95 + LN02). Wird den Readern der Raster-Pipeline
+# aufgezwungen und ist der CRS-Tag des DSM-Rasters aus LN02-Kacheln. Die CRS-Tags der
+# Punktwolken-Ausgabe kommen dagegen ausschliesslich aus den byte-exakten
+# Referenz-VLRs (siehe _inject_reference_vlrs).
 LAS_LN02_SRS = "EPSG:2056+5728"
+
+# Hoehenbezug-Auswahl im Tab "Create COPC" -> EPSG-Code des Vertikal-CRS
+HEIGHT_REF_EPSG = {"LHN95": 5729, "LN02": 5728}
 
 # ─── QC-Ansichtsprodukte (COPC / COG) ─────────────────────────────────────────
 # Reine Sichtkontrolle der Ausgabe, KEINE Lieferprodukte: je EINE Datei fuer die
@@ -2026,10 +2033,15 @@ def _prepare_hillshade_values(path: str) -> tuple:
 
 def _mosaic_las_raster(cell_rasters, run_dir: Path, output_path: str,
                         hillshade_output_path: str, gsd: float, clip_shape_path: str,
-                        snap_bounds: tuple, num_threads: str, log, progress) -> None:
+                        snap_bounds: tuple, num_threads: str, log, progress,
+                        dsm_srs: str = LAS_OUT_SRS) -> None:
     """Setzt die Zell-Raster zum Gesamt-DSM zusammen (VRT-Mosaik), interpoliert kleine
     NoData-Loecher (LAS_FILL_NODATA_HOLES, grosse bleiben NoData), maskiert per
     AOI-Shape (gdal.Warp Cutline, NoData ausserhalb) und rechnet den Hillshade.
+
+    dsm_srs ist der CRS-Tag des fertigen DSM samt Hoehenbezug (LN02: LAS_LN02_SRS =
+    EPSG:2056+5728, LHN95: LAS_INPUT_SRS = EPSG:2056+5729). Der Hillshade traegt immer
+    nur EPSG:2056 - er enthaelt keine Hoehenwerte.
 
     Der Hillshade kommt NICHT aus dem geclippten DSM, sondern aus dem vollstaendig
     gefuellten, ungeclippten Mosaik: so bekommen die grossen DSM-Loecher eine
@@ -2037,7 +2049,7 @@ def _mosaic_las_raster(cell_rasters, run_dir: Path, output_path: str,
     NoData-Saum (gdaldem sieht dort sonst die Cutline-Kante als Datenrand). Innerhalb
     des AOI ist der Hillshade damit lochfrei - 255 steht dort ausschliesslich fuer
     "ausserhalb des AOI". Beide Raster liegen auf demselben Gitter."""
-    from osgeo import gdal
+    from osgeo import gdal, osr
     gdal.UseExceptions()
 
     snap_minx, snap_miny, snap_maxx, snap_maxy = snap_bounds
@@ -2130,6 +2142,44 @@ def _mosaic_las_raster(cell_rasters, run_dir: Path, output_path: str,
     out_ds.FlushCache()
     out_ds = None
     log(f"  Gesamt-Raster (DSM) geschrieben: {output_path}")
+
+    # Hoehenbezug im CRS-Tag: der Warp oben laeuft bewusst rein horizontal und entfernt
+    # dabei das Vertikal-CRS der PDAL-Zellraster. Gesetzt wird er deshalb danach als
+    # reiner Header-Eintrag (GeoTIFF 1.1 VerticalGeoKey, OGC 19-008r4) - Pixel und
+    # Geotransformation bleiben unberuehrt, es wird nichts umgerechnet.
+    # Laesst er sich nicht bestaetigen, traegt das DSM nur EPSG:2056 - und
+    # topo-GDWHimport taggt ein solches DSM beim Import als LN02. Bei LN02 ist das
+    # derselbe Tag (nur Warnung); bei jedem anderen Hoehenbezug kaemen so z.B.
+    # LHN95-Hoehen als LN02 ins GDWH -> harter Abbruch.
+    if dsm_srs != LAS_OUT_SRS:
+        tag_ds = check_ds = None
+        try:
+            target_srs = osr.SpatialReference()
+            target_srs.SetFromUserInput(dsm_srs)
+            tag_ds = gdal.Open(output_path, gdal.GA_Update)
+            tag_ds.SetSpatialRef(target_srs)
+            tag_ds.FlushCache()
+            tag_ds = None
+            check_ds = gdal.Open(output_path, gdal.GA_ReadOnly)
+            written_srs = check_ds.GetSpatialRef()
+            check_ds = None
+            if written_srs is None or not written_srs.IsCompound() \
+                    or not written_srs.IsSame(target_srs):
+                raise RuntimeError(f"Tag nach dem Schreiben: "
+                                   f"{written_srs.GetName() if written_srs else 'keiner'}")
+            log(f"  CRS-Tag gesetzt und geprueft: {dsm_srs}  ({written_srs.GetName()})")
+        except Exception as e:
+            if dsm_srs != LAS_LN02_SRS:
+                raise RuntimeError(
+                    f"CRS-Tag {dsm_srs} im DSM nicht bestaetigt ({e}) - ohne Hoehenbezug "
+                    f"im Header wuerde der GDWH-Import das DSM als LN02 taggen. Raster "
+                    f"nicht auslieferbar: {output_path}") from e
+            log(f"  WARNUNG: CRS-Tag {dsm_srs} im DSM nicht bestaetigt ({e}) - Hoehenbezug "
+                f"im Header vor der Weitergabe pruefen (gdalinfo).")
+        finally:
+            # Auch im Fehlerfall schliessen: ein offenes Update-Handle wuerde sonst erst
+            # am Funktionsende geschrieben - nach den Kontrollen unten.
+            tag_ds = check_ds = None
 
     # Kontrolle statt Annahme: der GDWH-Sentinel MUSS bitgenau im Header stehen (das,
     # was 'gdalinfo' meldet). Verglichen wird der in Float32 gespeicherte Wert - GTiff
@@ -2570,7 +2620,7 @@ def _process_las(cfg: dict) -> None:
             raise RuntimeError("Keine DSM-Zelle wurde erzeugt - Gesamt-Raster nicht moeglich.")
         _mosaic_las_raster(cell_rasters, run_dir, raster_out_path, hillshade_out_path,
                             gsd_raster, clip_shape_path, snap_bounds, str(num_workers),
-                            _log, _progress)
+                            _log, _progress, dsm_srs=LAS_INPUT_SRS)
 
     if not keep_staging:
         _log(f"\nRaeume Staging-Ordner auf: {run_dir}")
@@ -3249,10 +3299,37 @@ def _fmt_crs(h_epsg, v_epsg=None) -> str:
     return f"EPSG:{h_epsg}+{v_epsg}" if v_epsg else f"EPSG:{h_epsg}"
 
 
-def _copc_crs_from_tiles(crs_list: list, log) -> tuple:
+def _copc_crs_from_tiles(crs_list: list, log, vertical_epsg: int = None) -> tuple:
     """CRS fuer das COPC, von den Kacheln uebernommen. Verschiedene CRS -> Fehler.
     Keine Kachel mit aufloesbarem CRS -> EPSG:2056 (ohne Hoehenbezug) mit Warnung.
-    Nur einige mit CRS -> dieses fuer alle, mit Warnung."""
+    Nur einige mit CRS -> dieses fuer alle, mit Warnung.
+
+    vertical_epsg (Auswahl 'Hoehenbezug' im Tab 'Create COPC') ERGAENZT einen fehlenden
+    Hoehenbezug: die Kacheln aus Tab [LHN95] tragen bewusst nur EPSG:2056 (LAS_OUT_SRS),
+    das COPC daraus bekommt so trotzdem 2056+5729. Ueberschrieben wird nichts - tragen
+    Kacheln bereits einen anderen Hoehenbezug oder horizontal nicht LV95, ist das ein
+    Fehler: sonst deklarierte das COPC etwas, das den Kacheln widerspricht."""
+    if vertical_epsg:
+        declared = sorted({c[1] for c in crs_list if c[1] and c[1] != vertical_epsg})
+        if declared:
+            raise ValueError(
+                "Die Kacheln tragen bereits einen anderen Hoehenbezug ("
+                + ", ".join(f"EPSG:{v}" for v in declared)
+                + f") als die Auswahl (EPSG:{vertical_epsg}) - er wird nicht ueberschrieben.")
+        foreign = sorted({c[0] for c in crs_list if c[0] and c[0] != 2056})
+        if foreign:
+            raise ValueError(
+                "Die Auswahl 'Hoehenbezug' gilt nur fuer LV95 (EPSG:2056) - die Kacheln "
+                "tragen " + ", ".join(f"EPSG:{h}" for h in foreign) + ".")
+        if not any(c[0] for c in crs_list):
+            log(f"  WARNUNG: keine Kachel traegt ein aufloesbares CRS - "
+                f"{_fmt_crs(2056, vertical_epsg)} (LV95, Hoehenbezug aus der Auswahl) "
+                f"wird gesetzt.")
+        elif any(c[1] is None for c in crs_list):
+            log(f"  Hoehenbezug EPSG:{vertical_epsg} aus der Auswahl ergaenzt - die "
+                f"Kacheln tragen keinen.")
+        return (2056, vertical_epsg)
+
     known = [c for c in crs_list if c[0] is not None]
     if len(known) > 1:
         raise ValueError("Die Kacheln tragen verschiedene CRS: "
@@ -3321,10 +3398,12 @@ def _validate_copc(md: dict, expected_count: int,
 
 
 def _write_copc(tile_paths: list, copc_path: str, untwine_exe: str, pdal_exe: str,
-                run_dir: Path, num_workers: int, log, crs: tuple = None) -> int:
+                run_dir: Path, num_workers: int, log, crs: tuple = None,
+                vertical_epsg: int = None) -> int:
     """Baut EIN COPC aus Kacheln - fuer die QC-Option im Tab [LN02] und fuer den Tab
     'Create COPC' - und gibt die Punktanzahl zurueck. crs=None: von den Kacheln
-    uebernehmen; sonst (horizontal, vertikal) fest vorgegeben.
+    uebernehmen, vertical_epsg ergaenzt dabei einen fehlenden Hoehenbezug (siehe
+    _copc_crs_from_tiles); sonst (horizontal, vertikal) fest vorgegeben.
 
     Geschrieben wird in eine Temp-Datei, die erst nach bestandener Pruefung an ihren
     Platz geschoben wird. Ein alter Stand wird vorher entfernt: eine veraltete Datei
@@ -3342,7 +3421,7 @@ def _write_copc(tile_paths: list, copc_path: str, untwine_exe: str, pdal_exe: st
 
     expected, crs_list = _collect_tile_facts(pdal_exe, tile_paths, num_workers)
     if crs is None:
-        crs = _copc_crs_from_tiles(crs_list, log)
+        crs = _copc_crs_from_tiles(crs_list, log, vertical_epsg)
     a_srs = _fmt_crs(*crs)
 
     Path(copc_path).parent.mkdir(parents=True, exist_ok=True)
@@ -3702,7 +3781,7 @@ def _process_las_ln02(cfg: dict) -> None:
             raise RuntimeError("Keine DSM-Zelle wurde erzeugt - Gesamt-Raster nicht moeglich.")
         _mosaic_las_raster(cell_rasters, run_dir, raster_out_path, hillshade_out_path,
                             gsd_raster, clip_shape_path, snap_bounds, str(num_workers),
-                            _log, _progress)
+                            _log, _progress, dsm_srs=LAS_LN02_SRS)
 
     if not keep_staging:
         _log(f"\nRaeume Staging-Ordner auf: {run_dir}")
@@ -3729,7 +3808,8 @@ def _process_las_ln02(cfg: dict) -> None:
 
 # ─── Tab "Create COPC" (eigenstaendig) ────────────────────────────────────────
 # Beliebige LAS/LAZ-Kacheln -> EIN COPC. Keine Converter-Funktionen - nur der Merge
-# via untwine, CRS von den Kacheln.
+# via untwine, CRS von den Kacheln. Optional ergaenzt 'height_ref' einen Hoehenbezug,
+# den die Kacheln nicht tragen (reiner CRS-Tag, die Punkte bleiben unveraendert).
 def _create_copc(cfg: dict) -> None:
     input_dir    = cfg["input_dir"]
     output_path  = cfg["output_path"]
@@ -3738,10 +3818,15 @@ def _create_copc(cfg: dict) -> None:
     staging_dir  = cfg["staging_dir"]
     num_workers  = int(cfg.get("num_workers", 6))
     keep_staging = bool(cfg.get("keep_staging", False))
+    # leer = CRS unveraendert von den Kacheln
+    height_ref   = str(cfg.get("height_ref") or "").strip().upper()
 
     def _log(msg: str) -> None:
         print(msg, flush=True)
 
+    if height_ref and height_ref not in HEIGHT_REF_EPSG:
+        raise ValueError(f"Hoehenbezug '{height_ref}' unbekannt - erwartet LHN95, LN02 "
+                         f"oder leer (CRS von den Kacheln).")
     if not output_path.lower().endswith(".copc.laz"):
         raise ValueError(f"Die Ausgabedatei muss auf .copc.laz enden: {output_path}")
     if not pdal_exe or not os.path.isfile(pdal_exe):
@@ -3760,9 +3845,13 @@ def _create_copc(cfg: dict) -> None:
     _log(f"untwine : {untwine_exe}")
     run_dir = Path(staging_dir) / f"COPC_{Path(output_path).name[:-len('.copc.laz')]}"
     run_dir.mkdir(parents=True, exist_ok=True)
+    _log(f"Hoehe   : " + (f"{height_ref} (EPSG:{HEIGHT_REF_EPSG[height_ref]}) - wird im "
+                          f"CRS-Tag ergaenzt, falls die Kacheln keinen Hoehenbezug tragen"
+                          if height_ref else "wie Kacheln"))
     _log(f"Staging : {run_dir}\n")
     try:
-        _write_copc(tiles, output_path, untwine_exe, pdal_exe, run_dir, num_workers, _log)
+        _write_copc(tiles, output_path, untwine_exe, pdal_exe, run_dir, num_workers, _log,
+                    vertical_epsg=HEIGHT_REF_EPSG.get(height_ref))
     finally:
         if not keep_staging:
             shutil.rmtree(run_dir, ignore_errors=True)
@@ -3848,8 +3937,9 @@ def _process_dsm(cfg: dict) -> None:
     output_dir_raster = cfg["output_dir_raster"]
     clip_shape_path   = cfg["clip_shape_path"]
     gsd_raster        = float(cfg["gsd"])
-    # Nur fuer die Benennung und den SRS-Tag der Reader - gerastert wird in beiden
-    # Faellen identisch (die Hoehe wird nirgends umgerechnet, siehe _mosaic_las_raster).
+    # Steuert die Benennung, den SRS-Tag der Reader und den CRS-Tag des DSM - gerastert
+    # wird in beiden Faellen identisch (die Hoehe wird nirgends umgerechnet, siehe
+    # _mosaic_las_raster). Eine falsche Wahl ergibt also ein falsch deklariertes DSM.
     height_ref        = str(cfg.get("height_ref", "LHN95")).strip().upper()
     staging_dir       = cfg["staging_dir"]
     num_workers       = int(cfg.get("num_workers", 6))
@@ -3943,9 +4033,10 @@ def _process_dsm(cfg: dict) -> None:
     src_srs = LAS_LN02_SRS if height_ref == "LN02" else LAS_INPUT_SRS
 
     _log(f"\nRaster-Aufloesung   : {format(gsd_raster, 'g')} m")
-    _log(f"Hoehenbezug         : {height_ref}  (nur Benennung und SRS-Tag der Reader - "
-         f"die Z-Werte werden nirgends umgerechnet)")
+    _log(f"Hoehenbezug         : {height_ref}  (Benennung und CRS-Tag - die Z-Werte "
+         f"werden nirgends umgerechnet)")
     _log(f"SRS der Eingabe     : {src_srs}  (den Readern aufgezwungen)")
+    _log(f"CRS-Tag der Ausgabe : DSM {src_srs}, Hillshade {LAS_OUT_SRS}")
     _log(f"Raster-Benennung    : {raster_name}  (+ .tfw)")
     _log(f"Hillshade-Benennung : {hillshade_name}  (+ .tfw)")
     _log(f"AOI/Footprint-Shape : {clip_shape_path}")
@@ -4013,7 +4104,7 @@ def _process_dsm(cfg: dict) -> None:
         raise RuntimeError("Keine DSM-Zelle wurde erzeugt - Gesamt-Raster nicht moeglich.")
     _mosaic_las_raster(cell_rasters, run_dir, raster_out_path, hillshade_out_path,
                         gsd_raster, clip_shape_path, snap_bounds, str(num_workers),
-                        _log, _progress)
+                        _log, _progress, dsm_srs=src_srs)
 
     if not keep_staging:
         _log(f"\nRaeume Staging-Ordner auf: {run_dir}")

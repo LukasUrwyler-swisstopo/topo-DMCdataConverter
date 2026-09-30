@@ -1558,21 +1558,129 @@ def test_create_copc_excludes_output_from_inputs(tmp_path, monkeypatch):
     pdal.write_bytes(b"")
     captured = {}
 
-    def fake_write_copc(tiles, copc_path, untwine_exe, pdal_exe, run_dir, n, log, crs=None):
+    def fake_write_copc(tiles, copc_path, untwine_exe, pdal_exe, run_dir, n, log, crs=None,
+                        vertical_epsg=None):
         captured["tiles"], captured["crs"] = tiles, crs
+        captured["vertical_epsg"] = vertical_epsg
         with open(copc_path, "wb") as f:
             f.write(b"copc")
         return 1
 
     monkeypatch.setattr(runner_mod, "_write_copc", fake_write_copc)
     staging = tmp_path / "staging"
-    runner_mod._create_copc({
+    cfg = {
         "input_dir": str(src), "output_path": str(src / "out.copc.laz"),
         "untwine_exe": "untwine.exe", "pdal_exe": str(pdal),
-        "staging_dir": str(staging), "num_workers": 1, "keep_staging": False})
+        "staging_dir": str(staging), "num_workers": 1, "keep_staging": False}
+    runner_mod._create_copc(cfg)
     assert [os.path.basename(t) for t in captured["tiles"]] == ["a.laz", "b.las"]
     assert captured["crs"] is None
+    assert captured["vertical_epsg"] is None   # ohne Auswahl: CRS wie Kacheln
     assert not any(staging.iterdir())          # Staging aufgeraeumt
+
+    # Auswahl 'Hoehenbezug' geht als Vertikal-Code weiter; leer = wie Kacheln
+    import pytest
+    for ref, code in (("LHN95", 5729), ("ln02", 5728), ("", None)):
+        runner_mod._create_copc(dict(cfg, height_ref=ref))
+        assert captured["vertical_epsg"] == code
+        assert captured["crs"] is None
+    with pytest.raises(ValueError, match="Hoehenbezug"):
+        runner_mod._create_copc(dict(cfg, height_ref="NAP"))
+
+
+def test_copc_height_ref_completes_but_never_overrides():
+    """Tab 'Create COPC', Auswahl 'Hoehenbezug': ein FEHLENDER Hoehenbezug wird
+    ergaenzt (Kacheln aus Tab [LHN95] tragen bewusst nur EPSG:2056), ein vorhandener
+    nie ueberschrieben - sonst widerspraeche das COPC seinen Kacheln."""
+    import pytest
+    runner_mod = _runner()
+    logged = []
+    crs = runner_mod._copc_crs_from_tiles
+
+    # Kacheln ohne Hoehenbezug -> ergaenzt, mit Hinweis im Log
+    assert crs([(2056, None)], logged.append, 5729) == (2056, 5729)
+    assert "ergaenzt" in logged[-1] and "WARNUNG" not in logged[-1]
+    # Kacheln tragen ihn schon -> unveraendert, ohne Meldung
+    n = len(logged)
+    assert crs([(2056, 5728)], logged.append, 5728) == (2056, 5728)
+    assert len(logged) == n
+    # gemischt mit/ohne denselben Hoehenbezug ist mit Auswahl kein Widerspruch mehr
+    assert crs([(2056, 5729), (2056, None)], logged.append, 5729) == (2056, 5729)
+    # keine Kachel mit CRS -> LV95 + Auswahl, aber als Warnung
+    assert crs([(None, None)], logged.append, 5729) == (2056, 5729)
+    assert "WARNUNG" in logged[-1]
+
+    # vorhandener anderer Hoehenbezug wird nicht ueberschrieben
+    with pytest.raises(ValueError, match="nicht ueberschrieben"):
+        crs([(2056, 5728)], logged.append, 5729)
+    with pytest.raises(ValueError, match="nicht ueberschrieben"):
+        crs([(2056, None), (2056, 5728)], logged.append, 5729)
+    # horizontal nicht LV95 -> die Auswahl passt nicht
+    with pytest.raises(ValueError, match="nur fuer LV95"):
+        crs([(25832, None)], logged.append, 5729)
+
+    assert runner_mod.HEIGHT_REF_EPSG == {"LHN95": 5729, "LN02": 5728}
+
+
+def test_write_copc_adds_selected_height_ref(tmp_path, monkeypatch):
+    """Mit Auswahl bekommt untwine das ergaenzte CRS, und die Pruefung des fertigen
+    COPC erwartet genau dieses."""
+    import pytest
+    runner_mod = _runner()
+    tile = tmp_path / "a.laz"
+    tile.write_bytes(b"x")
+    untwine = tmp_path / "untwine.exe"
+    untwine.write_bytes(b"")
+    calls = {}
+
+    def fake_untwine(cmd, cwd):
+        calls["cmd"] = cmd
+        with open(cmd[cmd.index("-o") + 1], "wb") as f:
+            f.write(b"copc")
+        return 0, ""
+
+    monkeypatch.setattr(runner_mod, "_collect_tile_facts",
+                        lambda exe, paths, n: (10, [(2056, None)]))
+    monkeypatch.setattr(runner_mod, "_run_untwine", fake_untwine)
+    monkeypatch.setattr(runner_mod, "_pdal_info_metadata",
+                        lambda exe, path, driver=None: dict(_compound_srs_md(v=5729), count=10))
+    out = str(tmp_path / "out" / "x.copc.laz")
+    assert runner_mod._write_copc([str(tile)], out, str(untwine), "pdal.exe",
+                                  tmp_path, 1, lambda m: None, vertical_epsg=5729) == 10
+    assert calls["cmd"][calls["cmd"].index("--a_srs") + 1] == "EPSG:2056+5729"
+    assert os.path.isfile(out)
+
+    # Kommt das COPC ohne den Hoehenbezug zurueck, wird es nicht abgelegt
+    monkeypatch.setattr(runner_mod, "_pdal_info_metadata",
+                        lambda exe, path, driver=None: dict(_compound_srs_md(v=None), count=10))
+    out2 = str(tmp_path / "out" / "y.copc.laz")
+    with pytest.raises(RuntimeError, match="EPSG:2056 statt EPSG:2056\\+5729"):
+        runner_mod._write_copc([str(tile)], out2, str(untwine), "pdal.exe",
+                               tmp_path, 1, lambda m: None, vertical_epsg=5729)
+    assert not os.path.exists(out2)
+
+
+def test_copc_tab_height_ref_from_tile_name(tmp_path):
+    """Tab 'Create COPC': der Hoehenbezug wird aus dem ersten Kachelnamen vorbelegt;
+    bei Fremddaten (oder leerem Ordner) faellt er auf 'wie Kacheln' zurueck."""
+    gui_mod = load_module_from_path(
+        "gui_module", os.path.join(PROJECT_ROOT, "GUI_DMCdataConverter.py"))
+    from_dir = gui_mod.DMCConverterApp._copc_href_from_dir
+    assert gui_mod.COPC_HREF_CHOICES == [gui_mod.COPC_HREF_KEEP, "LHN95", "LN02"]
+
+    assert from_dir(str(tmp_path)) == gui_mod.COPC_HREF_KEEP          # leer
+    lhn95 = tmp_path / "lhn95"
+    lhn95.mkdir()
+    (lhn95 / "2026_G_TIN_raw_2713_1206_LV95_LHN95.las").write_bytes(b"x")
+    assert from_dir(str(lhn95)) == "LHN95"
+    ln02 = tmp_path / "ln02"
+    ln02.mkdir()
+    (ln02 / "2026_G_TIN_thinnedout02_raw_2713_1206_LV95_LN02.laz").write_bytes(b"x")
+    assert from_dir(str(ln02)) == "LN02"
+    fremd = tmp_path / "fremd"
+    fremd.mkdir()
+    (fremd / "irgendeine_wolke.laz").write_bytes(b"x")
+    assert from_dir(str(fremd)) == gui_mod.COPC_HREF_KEEP
 
 
 def _fake_osgeo(monkeypatch):
