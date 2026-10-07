@@ -190,6 +190,11 @@ LN02_TILE_NAME_PATTERN = re.compile(
 # wird fuer die LN02-Benennung aus dem Quellnamen uebernommen, nicht neu erfragt.
 LN02_THIN_TOKEN_PATTERN = re.compile(r"_(thinnedout\d+)_", re.IGNORECASE)
 
+# Namens-Suffix der GeoSuite-Ausgabe: REFRAME transformiert die Hoehe nach LN02, laesst
+# den Dateinamen aber auf "_LHN95" stehen. Der Tab [LN02] benennt das beim Start im
+# Input-Ordner um (siehe _rename_lhn95_inputs).
+LHN95_NAME_SUFFIX_PATTERN = re.compile(r"_LHN95$", re.IGNORECASE)
+
 # Plausibilitaet der Kachelkoordinaten: Schweizer Landesgrenzen in km, LV95
 LV95_EASTING_KM_RANGE  = (2480, 2840)
 LV95_NORTHING_KM_RANGE = (1070, 1300)
@@ -316,32 +321,35 @@ def _delete_tile_files(tif_path: str) -> None:
 
 # ─── Band-Ausgabe des TIFFconverters ───────────────────────────────────────────
 # Die DMC-Ausgangsdaten sind praktisch immer 4-Band (RGBN: Rot, Gruen, Blau, NIR).
-# Fuer die Publikation wird daraus je nach Produkt ein 3-Band-Auszug gebildet:
-#   rgb  -> Quellbaender 1,2,3  (Echtfarbe)
-#   nrg  -> Quellbaender 4,1,2  (Falschfarben-Infrarot, Standard-CIR-Reihenfolge)
+# Fuer die Publikation wird daraus je nach Produkt ein Auszug bzw. eine Umsortierung:
+#   rgb  -> Quellbaender 1,2,3    (Echtfarbe)
+#   nrg  -> Quellbaender 4,1,2    (Falschfarben-Infrarot, Standard-CIR-Reihenfolge)
+#   nrgb -> Quellbaender 4,1,2,3  (alle vier Baender; Anzeige wie NRG, Blau als Band 4)
 #   keep -> keine Auswahl, alle Baender der Quelle bleiben erhalten (Default)
 BAND_MODES = {
     "keep": None,
     "rgb":  [1, 2, 3],
     "nrg":  [4, 1, 2],
+    "nrgb": [4, 1, 2, 3],
 }
 BAND_MODE_LABELS = {
     "keep": "4-BAND (RGBN)",
     "rgb":  "RGBN -> RGB (3-BAND, Echtfarbe)",
     "nrg":  "RGBN -> NRG (3-BAND, Falschfarben-Infrarot)",
+    "nrgb": "RGBN -> NRGB (4-BAND, Falschfarben-Infrarot + Blau)",
 }
 
 # Kuerzel der Band-Ausgabe im Dateinamen der Kacheln, z.B.
 # "2026_GUPPENFIRN_DOP_10cm_RGBN_2713_1206_LV95.tif". Ein Auszug bestimmt das
-# Kuerzel ueber die Bandreihenfolge (rgb/nrg), ohne Auszug ("keep") zaehlt die
+# Kuerzel ueber die Bandreihenfolge (rgb/nrg/nrgb), ohne Auszug ("keep") zaehlt die
 # tatsaechliche Bandzahl der Quelle - so beschreibt der Name immer den echten
 # Inhalt, auch wenn ausnahmsweise ein 3-Band-Input kommt.
-BAND_TOKEN_BY_MODE  = {"rgb": "RGB", "nrg": "NRG"}
+BAND_TOKEN_BY_MODE  = {"rgb": "RGB", "nrg": "NRG", "nrgb": "NRGB"}
 BAND_TOKEN_BY_COUNT = {3: "RGB", 4: "RGBN"}
 
 
 def _band_token(band_mode: str, band_count) -> str:
-    """Namens-Kuerzel der Band-Ausgabe: 'RGB' | 'NRG' | 'RGBN' | '<n>BAND'."""
+    """Namens-Kuerzel der Band-Ausgabe: 'RGB' | 'NRG' | 'NRGB' | 'RGBN' | '<n>BAND'."""
     token = BAND_TOKEN_BY_MODE.get(str(band_mode).strip().lower())
     if token:
         return token
@@ -381,18 +389,20 @@ def _resolve_mosaic_source(input_dir: str, staging_run_dir: Path, log) -> str:
 # --- Schritt 1b: Band-Auswahl (nur bei 4-Band-Input RGBN) ---
 
 def _select_bands(mosaic_src: str, band_mode: str, staging_run_dir: Path, log) -> str:
-    """Reduziert eine 4-BAND-Quelle (RGBN) per VRT auf drei Baender.
+    """Waehlt aus einer 4-BAND-Quelle (RGBN) per VRT Baender aus bzw. sortiert sie um.
 
-    'rgb' -> Quellbaender 1,2,3 (echtfarbig)
-    'nrg' -> Quellbaender 4,1,2 (Falschfarben-Infrarot: NIR/Rot/Gruen)
+    'rgb'  -> Quellbaender 1,2,3   (echtfarbig)
+    'nrg'  -> Quellbaender 4,1,2   (Falschfarben-Infrarot: NIR/Rot/Gruen)
+    'nrgb' -> Quellbaender 4,1,2,3 (wie NRG, Blau als viertes Band)
     'keep' -> unveraendert (Rueckgabe der Original-Quelle)
 
-    Der Auszug passiert bewusst VOR dem Cutline-Clip: der Warp-Schritt und alle
-    Kachel-Schreibvorgaenge arbeiten dadurch auf 3 statt 4 Baendern (rund ein
-    Viertel weniger I/O). Ein VRT ist dafuer kostenlos - es kopiert keine Pixel.
-    Die Farbinterpretation wird im VRT explizit auf Rot/Gruen/Blau gesetzt, damit
-    das Band 4 der Quelle (haeufig als 'Alpha' oder 'Undefined' getaggt) im
-    NRG-Auszug nicht als Transparenzkanal missverstanden wird.
+    Die Auswahl passiert bewusst VOR dem Cutline-Clip: bei einem 3-Band-Auszug
+    arbeiten der Warp-Schritt und alle Kachel-Schreibvorgaenge auf 3 statt 4 Baendern
+    (rund ein Viertel weniger I/O). Ein VRT ist dafuer kostenlos - es kopiert keine
+    Pixel. Die Farbinterpretation wird im VRT explizit gesetzt (Baender 1-3 Rot/Gruen/
+    Blau, siehe _set_display_colour_interpretation), damit das Band 4 der Quelle
+    (haeufig als 'Alpha' oder 'Undefined' getaggt) nicht als Transparenzkanal
+    missverstanden wird.
     """
     from osgeo import gdal
 
@@ -431,8 +441,7 @@ def _select_bands(mosaic_src: str, band_mode: str, staging_run_dir: Path, log) -
     if vrt_ds is None:
         raise RuntimeError("gdal.Translate hat None zurueckgegeben - Bandauswahl fehlgeschlagen.")
     try:
-        for idx, ci in enumerate((gdal.GCI_RedBand, gdal.GCI_GreenBand, gdal.GCI_BlueBand), start=1):
-            vrt_ds.GetRasterBand(idx).SetColorInterpretation(ci)
+        _set_display_colour_interpretation(vrt_ds, BAND_TOKEN_BY_MODE[band_mode])
     except Exception as e:
         log(f"  WARNUNG          : ColorInterp im Band-VRT nicht setzbar ({e}) - "
             f"die Ausgabe wird ueber PHOTOMETRIC=RGB dennoch korrekt getaggt.")
@@ -598,7 +607,7 @@ def _check_pixel_alignment(path: str, log) -> tuple:
 
 def _clip_to_valid_area(mosaic_src: str, clip_shape_path: str, staged_path: Path,
                          nodata_val: float, px_w: float, px_h: float,
-                         num_threads: str, log, progress) -> None:
+                         num_threads: str, log, progress, band_token: str = "RGBN") -> None:
     from osgeo import gdal
 
     log(f"\nClippe Mosaik auf gueltige Flaeche (Cutline): {clip_shape_path}")
@@ -631,7 +640,7 @@ def _clip_to_valid_area(mosaic_src: str, clip_shape_path: str, staged_path: Path
     # 4. Messkanals. PHOTOMETRIC=RGB allein genuegt dafuer nicht (gemessen).
     fix_ds = gdal.Open(str(staged_path), gdal.GA_Update)
     if fix_ds is not None:
-        _set_display_colour_interpretation(fix_ds)
+        _set_display_colour_interpretation(fix_ds, band_token)
         fix_ds.FlushCache()
         fix_ds = None
     log(f"  Zwischenraster (geclippt): {staged_path}")
@@ -709,13 +718,20 @@ def _nir_colour_interpretation():
     return getattr(gdal, "GCI_NIRBand", gdal.GCI_Undefined)
 
 
-def _set_display_colour_interpretation(ds) -> None:
-    """Baender 1-3 als Rot/Gruen/Blau, Band 4 als NIR, alles weitere 'undefiniert'.
+def _set_display_colour_interpretation(ds, band_token: str = "RGBN") -> None:
+    """Baender 1-3 als Rot/Gruen/Blau, Band 4 je nach Reihenfolge (band_token, das
+    Kuerzel im Dateinamen), alles weitere 'undefiniert'.
 
-    Bei RGBN IST das vierte Band das Nahe Infrarot - ein Messkanal wie die drei
-    anderen. In der Quelle ist es haeufig als 'Alpha' getaggt; der COG-Treiber machte
-    daraus bei JPEG eine 1-bit-Maske (das NIR waere weg) und QGIS zeigte das Bild
+    RGBN: das vierte Band IST das Nahe Infrarot - ein Messkanal wie die drei anderen.
+    In der Quelle ist es haeufig als 'Alpha' getaggt; der COG-Treiber machte daraus
+    bei JPEG eine 1-bit-Maske (das NIR waere weg) und QGIS zeigte das Bild
     halbtransparent. Darum wird es hier ausdruecklich als NIR gekennzeichnet.
+
+    NRGB: Baender 1-3 sind NIR/Rot/Gruen und werden - wie beim NRG-Auszug - als
+    Rot/Gruen/Blau getaggt, damit Viewer standardmaessig Falschfarben-Infrarot zeigen.
+    Das vierte Band ist dort Blau: als NIR getaggt waere es falsch, als 'Blau' gaebe es
+    zwei Blau-Baender. Es bleibt 'undefiniert' - kein Alpha, und die Bedeutung steht
+    im Kuerzel NRGB des Dateinamens.
 
     Ab Band 5 (kommt bei DMC-Produkten nicht vor) bleibt es bei 'undefiniert' - was
     dort steht, ist nicht bekannt."""
@@ -725,7 +741,8 @@ def _set_display_colour_interpretation(ds) -> None:
     for i, ci in enumerate((gdal.GCI_RedBand, gdal.GCI_GreenBand, gdal.GCI_BlueBand), 1):
         ds.GetRasterBand(i).SetColorInterpretation(ci)
     if ds.RasterCount >= 4:
-        ds.GetRasterBand(4).SetColorInterpretation(_nir_colour_interpretation())
+        ds.GetRasterBand(4).SetColorInterpretation(
+            gdal.GCI_Undefined if band_token == "NRGB" else _nir_colour_interpretation())
     for i in range(5, ds.RasterCount + 1):
         ds.GetRasterBand(i).SetColorInterpretation(gdal.GCI_Undefined)
 
@@ -825,6 +842,7 @@ BAND_LABELS_BY_TOKEN = {
     "RGBN": ("Rot", "Gruen", "Blau", "NIR"),
     "RGB":  ("Rot", "Gruen", "Blau"),
     "NRG":  ("NIR", "Rot", "Gruen"),
+    "NRGB": ("NIR", "Rot", "Gruen", "Blau"),
 }
 
 
@@ -963,7 +981,8 @@ def _check_cog(path: str, band_count: int, compress: str, expect_mask: bool) -> 
 
 def _write_cog_mosaic(tile_paths: list, cog_path: str, work_dir: Path, log, progress,
                       band_mode: str = "keep", compress: str = "JPEG", quality: int = 90,
-                      nodata_val=None, srs: str = None, mask_any_band: bool = False) -> None:
+                      nodata_val=None, srs: str = None, mask_any_band: bool = False,
+                      tile_token: str = "RGBN") -> None:
     """Mosaik aus Kacheln als EIN COG - fuer die QC-Option im Tab TIFFconverter und
     fuer den Tab 'Create COGTIFF'.
 
@@ -978,6 +997,8 @@ def _write_cog_mosaic(tile_paths: list, cog_path: str, work_dir: Path, log, prog
     verlustfrei. Neben der Maske bleibt der NoData-Tag weg ('conflicting mask sources' -
     GDAL verwuerfe die Maske). nodata_val=None: keine Maske, das COG uebernimmt den
     NoData-Tag der Kacheln. mask_any_band: Masken-Logik, siehe _write_nodata_mask.
+    tile_token: Bandreihenfolge der Kacheln (Kuerzel im Namen, z.B. NRGB) - bestimmt
+    die Interpretation von Band 4, siehe _set_display_colour_interpretation.
 
     Geschrieben wird in eine Temp-Datei, die erst nach bestandener Pruefung an ihren
     Platz kommt; ein alter Stand wird vorher entfernt."""
@@ -1011,7 +1032,7 @@ def _write_cog_mosaic(tile_paths: list, cog_path: str, work_dir: Path, log, prog
         src_vrt = _normalize_alpha_band(str(vrt_path), work_dir, log)
         fix_ds = gdal.Open(src_vrt, gdal.GA_Update)
         if fix_ds is not None:
-            _set_display_colour_interpretation(fix_ds)
+            _set_display_colour_interpretation(fix_ds, tile_token)
             fix_ds.FlushCache()
             fix_ds = None
         src = _select_bands(src_vrt, band_mode, work_dir, log)
@@ -1158,7 +1179,7 @@ def _process(cfg: dict) -> None:
     # --- Schritt 2: Cutline-Clip ---
     staged_path = run_dir / "02_clipped_mosaic.tif"
     _clip_to_valid_area(mosaic_src, clip_shape_path, staged_path, nodata_val,
-                         px_w, px_h, str(num_workers), _log, _progress)
+                         px_w, px_h, str(num_workers), _log, _progress, band_token)
 
     # Echte Messwerte, die auf den NoData-Wert fallen, um einen DN anheben - sonst
     # gaelten Wasserflaechen (NIR = 0) in der Lieferkachel als NoData. Siehe
@@ -1230,9 +1251,9 @@ def _process(cfg: dict) -> None:
             if create_cog else "inaktiv"))
 
     # PHOTOMETRIC=RGB ab drei Baendern - auch ohne Bandauswahl. Bei 4-Band (RGBN)
-    # bekommt das TIFF damit PhotometricInterpretation=RGB und das NIR ein
-    # ExtraSample, statt als Alphakanal gelesen zu werden. Die ColorInterp selbst
-    # stellt _clip_to_valid_area auf der gemeinsamen Quelle richtig.
+    # bekommt das TIFF damit PhotometricInterpretation=RGB und das NIR (bei NRGB das
+    # Blau) ein ExtraSample, statt als Alphakanal gelesen zu werden. Die ColorInterp
+    # selbst stellt _clip_to_valid_area auf der gemeinsamen Quelle richtig.
     photometric = "RGB" if src_bands >= 3 else None
 
     jobs = []
@@ -1313,7 +1334,8 @@ def _process(cfg: dict) -> None:
             # (Rand, Clip-Ausschluss) - dort tragen ohnehin alle Baender den Wert.
             _write_cog_mosaic(cog_tiles, cog_path, run_dir, _log, _progress,
                               compress="JPEG", quality=cog_quality,
-                              nodata_val=nodata_val, srs="EPSG:2056", mask_any_band=True)
+                              nodata_val=nodata_val, srs="EPSG:2056", mask_any_band=True,
+                              tile_token=band_token)
             _log(f"  Geschrieben und geprueft: {cog_path}")
         except Exception as e:
             _log(f"  WARNUNG: QC-COG nicht geschrieben ({e}) - die Kacheln selbst "
@@ -2653,6 +2675,8 @@ def _process_las(cfg: dict) -> None:
 # GDWH-taugliche Form.
 #
 # Ablauf:
+#   0) Input-Kacheln im Input-Ordner von "..._LHN95" auf "..._LN02" umbenennen -
+#      REFRAME laesst den alten Namen stehen (frueher ein manueller Schritt)
 #   1) Dateinamen aller Input-Kacheln pruefen (Kachelursprung), Metadaten
 #      (Bounding Box) parallel einlesen
 #   2) Pro Kachel: Requantisierung auf LAS 1.4 / Point Data Record Format 7
@@ -2830,6 +2854,43 @@ def _parse_thin_token(filename: str) -> str:
     Ohne Token im Namen (= nicht ausgeduennt) ein leerer String."""
     match = LN02_THIN_TOKEN_PATTERN.search(filename)
     return f"{match.group(1).lower()}_" if match else ""
+
+
+def _rename_lhn95_inputs(input_dir: str) -> list:
+    """Benennt die reframten Kacheln im Input-Ordner von '..._LHN95.<las|laz>' auf
+    '..._LN02.<las|laz>' um - nur der Dateiname, der Inhalt bleibt unangetastet.
+    Gibt die Paare (alt, neu) als volle Pfade zurueck.
+
+    Alle Ziele werden VOR dem ersten Umbenennen geprueft: existiert eines schon, wird
+    gar nichts umbenannt (os.rename bricht unter Windows ab, unter POSIX wuerde es
+    still ueberschreiben). Umbenannte Dateien passen nicht mehr ins Muster - ein
+    erneuter Lauf, auch nach einem Abbruch mittendrin, ist damit harmlos."""
+    pairs = []
+    for name in sorted(os.listdir(input_dir)):
+        stem, ext = os.path.splitext(name)
+        if ext.lower() not in (".las", ".laz") or not LHN95_NAME_SUFFIX_PATTERN.search(stem):
+            continue
+        src = os.path.join(input_dir, name)
+        if os.path.isfile(src):
+            new_name = LHN95_NAME_SUFFIX_PATTERN.sub("_LN02", stem) + ext
+            pairs.append((src, os.path.join(input_dir, new_name)))
+
+    conflicts = [f"{os.path.basename(s)} -> {os.path.basename(d)}"
+                 for s, d in pairs if os.path.exists(d)]
+    if conflicts:
+        raise FileExistsError(
+            "Umbenennen _LHN95 -> _LN02 nicht moeglich, das Ziel existiert bereits "
+            "(es wurde nichts umbenannt):\n  - " + "\n  - ".join(conflicts))
+
+    for i, (src, dst) in enumerate(pairs):
+        try:
+            os.rename(src, dst)
+        except OSError as e:
+            raise OSError(
+                f"Umbenennen von {os.path.basename(src)} fehlgeschlagen ({e}) - "
+                f"{i} von {len(pairs)} Datei(en) sind bereits umbenannt. Datei freigeben "
+                f"(z.B. in anderem Programm geoeffnet?) und den Lauf neu starten.") from e
+    return pairs
 
 
 def _check_ln02_tile_frame(md: dict, origin_x: float, origin_y: float, filename: str) -> None:
@@ -3491,6 +3552,17 @@ def _process_las_ln02(cfg: dict) -> None:
         # Frueh pruefen: sonst faellt das erst nach dem kompletten Metadaten-Scan auf.
         raise FileNotFoundError(
             f"AOI/Footprint-Shape fuer die Raster-Maskierung nicht gefunden: {clip_shape_path}")
+
+    # --- Schritt 0: GeoSuite-Output umbenennen (_LHN95 -> _LN02) ---
+    # Vor allem anderen: ab hier passen die Namen im Input-Ordner zu ihrem Inhalt,
+    # auch wenn der Lauf spaeter scheitert.
+    renamed = _rename_lhn95_inputs(input_dir)
+    if renamed:
+        _log(f"Input umbenannt (_LHN95 -> _LN02): {len(renamed)} Datei(en)")
+        for src, dst in renamed:
+            _log(f"  {os.path.basename(src)}  ->  {os.path.basename(dst)}")
+    else:
+        _log("Input umbenennen   : keine Datei mit Suffix _LHN95 - nichts zu tun")
 
     gdal.UseExceptions()
     ogr.UseExceptions()

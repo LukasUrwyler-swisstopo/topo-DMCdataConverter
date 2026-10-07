@@ -26,11 +26,11 @@ ueber die Schaltflaeche **Aendern…** manuell gesetzt werden und wird in
 
 | Tab | Input | Verarbeitung | Output |
 |---|---|---|---|
-| **[1] DMC DOP - TIFFconverter** | technische 200m-DOP-Kacheln (`.tif`), meist 4-BAND RGBN | Mosaik → optionaler Bandauszug (RGB / NRG) → Clip auf die gültige Fläche → Zuschnitt ins 1km-Grid | 1km-DOP-Kacheln (`.tif`)<br>4-BAND RGBN (Standard) oder 3-BAND RGB / NRG<br>optional QC-Mosaik der AOI (COG) |
+| **[1] DMC DOP - TIFFconverter** | technische 200m-DOP-Kacheln (`.tif`), meist 4-BAND RGBN | Mosaik → optionaler Bandauszug (RGB / NRG / NRGB) → Clip auf die gültige Fläche → Zuschnitt ins 1km-Grid | 1km-DOP-Kacheln (`.tif`), NoData fix 0<br>4-BAND RGBN (Standard), 4-BAND NRGB oder 3-BAND RGB / NRG<br>optional QC-Mosaik der AOI (COG) |
 | **[2a] DMC DSM - LASconverter [LHN95]** | technische 200m-Punktwolken (`.laz`) | Kacheln je Gitterzelle mergen → Crop auf Zelle + AOI → optional ausdünnen | 1km-Kacheln `…_LV95_LHN95.las` (LAS 1.4 / PF7, mit RGB; `.laz` wählbar)<br>optional DSM + Hillshade |
-| **[2b] DMC DSM - LASconverter [LN02]** | die von GeoSuite nach LN02 reframten 1km-Kacheln (`.laz` oder `.las`) | requantisieren → CRS-VLRs byte-exakt injizieren → vollständig validieren | 1km-Kacheln `…_LV95_LN02.laz` (GDWH-tauglich, LAS 1.4 / PF7 mit RGB)<br>optional QC-COPC der AOI, DSM + Hillshade |
+| **[2b] DMC DSM - LASconverter [LN02]** | die von GeoSuite nach LN02 reframten 1km-Kacheln (`.laz` oder `.las`) | Input `…_LHN95` → `…_LN02` umbenennen → requantisieren → CRS-VLRs byte-exakt injizieren → vollständig validieren | 1km-Kacheln `…_LV95_LN02.laz` (GDWH-tauglich, LAS 1.4 / PF7 mit RGB)<br>optional QC-COPC der AOI, DSM + Hillshade |
 | **Create DSM-Raster** | beliebiger Ordner mit `.las`/`.laz` | zellweise IDW-Rasterung → mosaikieren → Löcher füllen → AOI-Maske → Hillshade | ein DSM + ein Hillshade (`.tif` + `.tfw`) |
-| **Create COGTIFF** | beliebiger Ordner mit `.tif`-Kacheln (+ `.tfw`) | VRT-Mosaik → optionaler Bandauszug (RGB / NRG) → COG → Prüfung | ein COGTIFF (Name frei wählbar) |
+| **Create COGTIFF** | beliebiger Ordner mit `.tif`-Kacheln (+ `.tfw`) | VRT-Mosaik → optionaler Bandauszug (RGB / NRG / NRGB) → COG → Prüfung | ein COGTIFF (Name frei wählbar) |
 | **Create COPC** | beliebiger Ordner mit `.las`/`.laz`-Kacheln | Merge via untwine → Prüfung | ein COPC `….copc.laz` (Name frei wählbar) |
 
 ### Reihenfolge bei den Punktwolken
@@ -45,9 +45,9 @@ technische 200m-LAZ  (RealityStudio)
 …_LV95_LHN95.las             LAS 1.4 / PF7, mit RGB  (`.laz` wählbar)
       │
       ▼   GeoSuite / REFRAME     ←  ausserhalb dieses Tools, transformiert NUR die Höhe
-…_LV95_LN02.las
+…_LV95_LHN95.las             Inhalt jetzt LN02, Name noch LHN95
       │
-      ▼   Tab [2b]           GDWH-Header · CRS-VLRs · Validierung
+      ▼   Tab [2b]           Rename _LHN95 → _LN02 · GDWH-Header · CRS-VLRs · Validierung
 …_LV95_LN02.laz              LAS 1.4 / PF7, mit RGB  →  Lieferung
       │
       ▼   topo-importDATAtoGDWH-STAC   ←  ausserhalb dieses Tools, dort CameraSystem „Leica DMC-4“
@@ -96,10 +96,10 @@ gültige Fläche ausgeschnitten und das Ergebnis parallelisiert ins 1km-Grid zer
    ```
    Beispiel: `2026_GUPPENFIRN_DOP_10cm_RGBN_2713_1206_LV95.tif`
 
-   `<BAND>` benennt die Band-Ausgabe: **`RGBN`** (4-BAND), **`RGB`** oder **`NRG`**. Das
-   Kuerzel stammt aus der tatsaechlichen Bandzahl der Ausgabe, nicht aus der Auswahl —
-   ein 3-BAND-Input ohne Auszug wird also `RGB`, nicht `RGBN`. So liegen RGB und NRG
-   desselben Gebiets im selben Output-Ordner, ohne sich zu ueberschreiben.
+   `<BAND>` benennt die Band-Ausgabe: **`RGBN`** (4-BAND), **`RGB`**, **`NRG`** oder
+   **`NRGB`**. Ohne Auszug stammt das Kuerzel aus der tatsaechlichen Bandzahl der Ausgabe,
+   nicht aus der Auswahl — ein 3-BAND-Input ohne Auszug wird also `RGB`, nicht `RGBN`. So
+   liegen die Varianten desselben Gebiets im selben Output-Ordner, ohne sich zu ueberschreiben.
 
    **AREA wird aus dem Input-Pfad vorbelegt.** Sobald ein Input-Ordner gesetzt wird — per
    Button oder durch Einfügen eines Pfads ins Feld — trägt das GUI den AREA-Namen
@@ -139,6 +139,12 @@ gültige Fläche ausgeschnitten und das Ergebnis parallelisiert ins 1km-Grid zer
    | **4-BAND  (RGBN)** — *Standard* | 1, 2, 3, 4 | Rot, Gruen, Blau, NIR — alle Baender der Quelle |
    | **RGBN → RGB  (3-BAND, Echtfarbe)** | 1, 2, 3 | Echtfarben-DOP ohne NIR |
    | **RGBN → NRG  (3-BAND, Falschfarben-Infrarot)** | 4, 1, 2 | CIR-Komposit: NIR → Rot, Rot → Gruen, Gruen → Blau |
+   | **RGBN → NRGB  (4-BAND, Falschfarben-Infrarot + Blau)** | 4, 1, 2, 3 | wie NRG, zusaetzlich Blau als Band 4 — alle vier Baender bleiben |
+
+   **NRGB** ist eine reine Umsortierung: Baender 1–3 werden wie beim NRG-Auszug als
+   Rot/Gruen/Blau getaggt, QGIS und ArcGIS zeigen also standardmaessig Falschfarben-Infrarot.
+   Band 4 (Blau) bleibt `Undefined` — als `Blau` gaebe es zwei Blau-Baender, als NIR waere es
+   falsch. Was in welchem Band steht, sagt das Kuerzel `NRGB` im Dateinamen.
 
    - **Wird nichts gewaehlt, passiert nichts**: die Vorgabe ist „4-BAND (RGBN)", die Ausgabe
      hat dann exakt so viele Baender wie der Input.
@@ -148,30 +154,27 @@ gültige Fläche ausgeschnitten und das Ergebnis parallelisiert ins 1km-Grid zer
      Startet man einen Lauf trotzdem mit einem 3-BAND-Input (z.B. gemischter Ordner), bricht
      der Runner mit einer klaren Meldung ab, statt stillschweigend etwas Falsches zu schreiben.
    - Der Bandauszug passiert **vor** dem Cutline-Clip und wird als VRT gebaut — das kopiert
-     keine Pixel. Warp und Grid-Zuschnitt arbeiten dadurch auf 3 statt 4 Baendern, also rund
-     ein Viertel weniger I/O.
+     keine Pixel. Bei RGB/NRG arbeiten Warp und Grid-Zuschnitt dadurch auf 3 statt 4
+     Baendern, also rund ein Viertel weniger I/O.
    - **Band 4 ist NIR, nicht Alpha.** Die Ausgabe wird ab drei Baendern explizit mit
-     `PHOTOMETRIC=RGB` und ColorInterp Rot/Gruen/Blau getaggt, Band 4 ausdruecklich als
-     **NIR** (`GCI_NIRBand`, GDAL ab 3.10 — aeltere Versionen kennen nur `Undefined`).
+     `PHOTOMETRIC=RGB` und ColorInterp Rot/Gruen/Blau getaggt, Band 4 bei RGBN ausdruecklich
+     als **NIR** (`GCI_NIRBand`, GDAL ab 3.10 — aeltere Versionen kennen nur `Undefined`),
+     bei NRGB als `Undefined` (dort ist es Blau).
      In der Quelle traegt es haeufig faelschlich `Alpha`; entscheidend ist, dass es das
      in der Ausgabe nicht mehr tut, sonst wird es als Transparenz gelesen. Der Tag
      ueberlebt die ganze Kette: Quelle → VRT → Warp → Kachel → COG.
    - **Alpha-Korrektur vor allem anderen** (siehe eigener Abschnitt unten): Band 4 eines
      RGBN-TIFF traegt haeufig den Tag `Alpha`. Ohne Korrektur verliert die Ausgabe dort
      die RGB-Werte, wo das NIR 0 ist — typischerweise ueber Wasser.
-   - Der Dateiname traegt das Band-Kuerzel (`RGBN`/`RGB`/`NRG`), RGB und NRG desselben
-     Gebiets koennen also im selben Output-Ordner liegen.
+   - Der Dateiname traegt das Band-Kuerzel (`RGBN`/`RGB`/`NRG`/`NRGB`), die Varianten
+     desselben Gebiets koennen also im selben Output-Ordner liegen.
 
-3. **NoData-Werte** (Feld unter der Band-Auswahl, Vorschlag `0 0 0 0` bzw.
-   `255 255 255 255`): Pixelwert je Band, der als NoData gilt. Die **Anzahl der Werte folgt
-   der Band-Ausgabe**: bei 4-BAND (RGBN) stehen vier Werte im Feld, bei einem 3-BAND-Auszug
-   drei. Sobald die Datei-Info die Bandzahl kennt, zieht das Feld automatisch nach. Daraus werden der Clip-Wert (alles
-   ausserhalb der gültigen Fläche), der NoData-Tag der 1km-Kacheln und die Maske des
-   QC-Mosaiks. GeoTIFF kennt nur **einen** NoData-Wert für alle Bänder, darum muss hier jedes
-   Band denselben Wert haben (`0 0 255` bricht vor dem Start mit einer Meldung ab). Bei 4-BAND
-   (RGBN) gilt `0 0 0` weiterhin als `0 0 0 0` — fehlende Werte werden mit dem letzten
-   aufgefüllt, die Anzeige beschreibt nur die Ausgabe genauer. Den NoData-Tag der
-   Input-Kacheln zeigt die **Datei-Info**.
+3. **NoData-Werte** (Anzeige unter der Band-Auswahl, **fix 0**, nicht waehlbar): bei 4-BAND
+   (RGBN, NRGB) steht dort `0 0 0 0`, bei einem 3-BAND-Auszug (RGB, NRG) `0 0 0`. Sobald die
+   Datei-Info die Bandzahl kennt, zieht die Anzeige automatisch nach. Daraus werden der
+   Clip-Wert (alles ausserhalb der gültigen Fläche), der NoData-Tag der 1km-Kacheln und die
+   Maske des QC-Mosaiks. An den Runner geht nur `0`; er setzt den Wert in jedem Band der
+   tatsaechlichen Ausgabe. Den NoData-Tag der Input-Kacheln zeigt die **Datei-Info**.
 
    **Nur echtes NoData wird geflaggt (NIR/Wasser):** Der NoData-Tag wirkt **pro Band** —
    sobald *ein* Band ihn traegt, gilt das Pixel dort als NoData. Im NIR ist 0 aber ein echter
@@ -231,7 +234,7 @@ gültige Fläche ausgeschnitten und das Ergebnis parallelisiert ins 1km-Grid zer
 
 6. **Clip-Shape (gueltige Flaeche)**: Polygon-Shape, das die manuell erfasste gueltige Flaeche
    des Orthophotos beschreibt. Alles ausserhalb wird per Cutline-Clip (`gdal.Warp`) zu
-   NoData — mit dem Wert aus **NoData-Werte** (Punkt 3, Default 0).
+   NoData — Wert 0 (Punkt 3).
 
 7. **Grid-Shape (1km x 1km)**: Shapefile mit Attributfeld `NAME`, liefert Geometrie und
    Benennung der Ausgabekacheln. Standardmaessig vorausgefuellt mit dem mitgelieferten
@@ -246,8 +249,8 @@ gültige Fläche ausgeschnitten und das Ergebnis parallelisiert ins 1km-Grid zer
    **"Staging-Dateien behalten"** aktiviert ist.
 
 9. **Ausgabe-Format** (automatisch): klassisches TIFF (kein COG — das optionale QC-Mosaik siehe
-   Punkt 4) + `.tfw`-Weltdatei je Ausgabekachel, Blockgroesse fix 256, NoData-Tag aus
-   **NoData-Werte** (Punkt 3, Default 0, alle Baender gleich). Die Kompression wird von der
+   Punkt 4) + `.tfw`-Weltdatei je Ausgabekachel, Blockgroesse fix 256, NoData-Tag 0
+   (Punkt 3). Die Kompression wird von der
    ersten gefundenen Input-Kachel automatisch uebernommen (LZW/DEFLATE/ZSTD/unkomprimiert) —
    nie verlustbehaftet: liegt eine Input-Kachel ausnahmsweise JPEG-komprimiert vor, weicht die
    Ausgabe auf LZW aus, damit sie nie schlechter als der Input wird.
@@ -509,9 +512,16 @@ Raster-Maskierung gebraucht und ist nur sichtbar, wenn die Raster-Option aktiv i
    deterministisch geparst (siehe unten). Passt der Name bei einer Kachel nicht, bricht der Lauf
    ab, **bevor** irgendetwas geschrieben wird.
 
+   **Rename beim Start**: GeoSuite/REFRAME transformiert die Höhe, lässt den Dateinamen aber
+   auf `_LHN95` stehen. Als allererster Schritt des Laufs werden deshalb alle `*_LHN95.las/.laz`
+   **im Input-Ordner** auf `*_LN02.las/.laz` umbenannt (nur der Name, der Inhalt bleibt
+   unverändert) — der manuelle Rename entfällt. Existiert ein Zielname schon, wird gar nichts
+   umbenannt und der Lauf bricht ab. Bereits umbenannte Dateien passen nicht mehr ins Muster;
+   ein erneuter Start ist damit harmlos.
+
 3. **Output-Ordner (Kacheln)** + **Ausgabeformat** (Dropdown `las`/`laz`, Default `laz` —
    GDWH-Auslieferungsformat analog `SB_DSM_PUNKTWOLKE`). Muss ein anderer Ordner als der Input
-   sein; die Quelldateien werden nie verändert.
+   sein; der Inhalt der Quelldateien wird nie verändert (nur ihr Name, siehe Punkt 2).
 
 4. **Create COPC**: legt `copc_QC\<JAHR>_<AREA>_checkData_LV95_LN02.copc.laz` im Output-Ordner
    an — siehe „QC-COPC" unten. Unabhängig von der Raster-Option.
@@ -660,7 +670,7 @@ für `pdal info --metadata` lesbar, aber jeder echte Dekompressions-Durchlauf br
 
 - **Atomares Schreiben**: die Zielkachel entsteht als Temp-Datei im Zielordner und wird erst
   nach vollständiger Validierung per `os.replace` an ihren Platz gelegt. Bei jedem Fehler bleibt
-  eine evtl. vorhandene Zieldatei unangetastet; die Quelle wird nie verändert.
+  eine evtl. vorhandene Zieldatei unangetastet; der Inhalt der Quelle wird nie verändert.
 - **Nachkonversions-Validierung** je Kachel: Punktanzahl identisch, BBox identisch innerhalb
   1 cm, Header-Zielwerte (siehe Tabelle), beide CRS-VLRs vorhanden (VLR 2112 endet auf
   Nullbyte), **kein weiterer CRS-VLR daneben**, CRS auflösbar als 2056 + 5728 — und
@@ -784,7 +794,7 @@ Einstellungen.
    Bändern.
 2. **Output-Datei**: vollständiger Pfad inklusive Dateiname; fehlt die Endung, wird `.tif`
    ergänzt. Liegt die Datei im Input-Ordner, geht ein alter Stand nicht ins neue Mosaik ein.
-3. **Band-Ausgabe**: RGBN (unverändert), RGB (1,2,3) oder NRG (4,1,2) — wie im TIFFconverter.
+3. **Band-Ausgabe**: RGBN (unverändert), RGB (1,2,3), NRG (4,1,2) oder NRGB (4,1,2,3) — wie im TIFFconverter.
 4. **Kompression**: JPEG (Default, Qualität 90 %, änderbar), DEFLATE, LZW, ZSTD oder NONE — die
    Auswahl aus dem Mosaik-Tab von `topo-COGTIFFconverter`.
    - **JPEG**: nur 8 bit (sonst Abbruch mit klarer Meldung).
@@ -859,7 +869,7 @@ GUI_DMCdataConverter.py            (Standard-Python, tkinter)
 process_scripts/_osgeo_runner.py   (OSGeo4W Python, GDAL/OGR)
     Aktion "process"      (Tab "[1] DMC DOP - TIFFconverter"):
         │  1) Mosaik-VRT (uebernommen oder frisch gebaut)
-        │  1b) optionaler Bandauszug RGBN -> RGB / NRG als VRT (band_mode)
+        │  1b) optionaler Bandauszug RGBN -> RGB / NRG / NRGB als VRT (band_mode)
         │  2) Cutline-Clip auf gueltige Flaeche  -> Staging
         │  3) Grid-Zuschnitt, parallelisiert (ProcessPoolExecutor)
         │  4) optional QC-Mosaik (COG) aus den fertigen Kacheln
@@ -871,6 +881,7 @@ process_scripts/_osgeo_runner.py   (OSGeo4W Python, GDAL/OGR)
         │  3) Zell-Raster mosaikieren (VRT) -> Cutline-Clip -> Hillshade
         │
     Aktion "process_las_ln02"  (Tab "[2b] DMC DSM - LASconverter [LN02]"):
+        │  0) Input-Kacheln umbenennen: *_LHN95.las/laz -> *_LN02.las/laz
         │  1) Kachelursprung aus allen Dateinamen parsen (Abbruch vor dem
         │     ersten Schreibzugriff), Metadaten-Scan parallel
         │  2) Job-Pool: je Kachel Requantisierung auf LAS 1.4/PF7 + VLR-Byte-

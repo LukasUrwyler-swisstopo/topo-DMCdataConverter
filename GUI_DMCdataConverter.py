@@ -59,26 +59,31 @@ DEFAULT_STAGING_DIR  = r"Y:\02_DMC_tempProcessingFolder"
 
 # ─── Band-Ausgabe (Tab "[1] DMC DOP - TIFFconverter") ────────────────────────
 # DMC-Ausgangsdaten sind praktisch immer 4-Band (RGBN: Rot, Gruen, Blau, NIR).
-# Fuer die Publikation wird daraus optional ein 3-Band-Auszug gebildet. Die
-# Schluessel entsprechen 1:1 _osgeo_runner.BAND_MODES.
+# Fuer die Publikation wird daraus optional ein Auszug bzw. eine Umsortierung
+# gebildet. Die Schluessel entsprechen 1:1 _osgeo_runner.BAND_MODES.
 BAND_KEEP = "4-BAND  (RGBN)"
 BAND_RGB  = "RGBN → RGB  (3-BAND, Echtfarbe)"
 BAND_NRG  = "RGBN → NRG  (3-BAND, Falschfarben-Infrarot)"
-BAND_CHOICES   = [BAND_KEEP, BAND_RGB, BAND_NRG]
-BAND_MODE_KEYS = {BAND_KEEP: "keep", BAND_RGB: "rgb", BAND_NRG: "nrg"}
+BAND_NRGB = "RGBN → NRGB  (4-BAND, Falschfarben-Infrarot + Blau)"
+BAND_CHOICES   = [BAND_KEEP, BAND_RGB, BAND_NRG, BAND_NRGB]
+BAND_MODE_KEYS = {BAND_KEEP: "keep", BAND_RGB: "rgb", BAND_NRG: "nrg", BAND_NRGB: "nrgb"}
 BAND_PREVIEW_TEXT = {
     "keep": "4-BAND RGBN  –  Rot, Gruen, Blau, NIR",
     "rgb":  "3-BAND RGB  –  Quellbaender 1,2,3",
     "nrg":  "3-BAND NRG  –  Quellbaender 4,1,2  (NIR, Rot, Gruen)",
+    "nrgb": "4-BAND NRGB  –  Quellbaender 4,1,2,3  (NIR, Rot, Gruen, Blau)",
 }
-BAND_HINT_UNKNOWN = "RGB-/NRG-Auszug nur bei 4-BAND-Input (RGBN)"
-BAND_HINT_4BAND   = "4-BAND erkannt  |  Band 4 = NIR  |  RGB = 1,2,3  |  NRG = 4,1,2"
+BAND_HINT_UNKNOWN = "RGB / NRG / NRGB nur bei 4-BAND-Input (RGBN)"
+BAND_HINT_4BAND   = "4-BAND erkannt  |  Band 4 = NIR  |  RGB = 1,2,3  |  NRG = 4,1,2  |  NRGB = 4,1,2,3"
 BAND_HINT_NOT4    = "Input hat {count} Band/Baender - Auswahl nur bei 4-BAND (RGBN)"
 
-# ─── NoData-Werte (Tabs "[1] DMC DOP - TIFFconverter" / "Create COGTIFF") ────
-# Pixelwert je Band -> interne COG-Maske (Flag PER_DATASET); im TIFFconverter auch
-# Clip-Wert und NoData-Tag der Kacheln. Fehlende Werte fuellt der Runner mit dem
-# letzten auf ("0 0 0" auf RGBN = 0 0 0 0). 8 bit: praktisch immer 0 0 0.
+# ─── NoData-Werte ─────────────────────────────────────────────────────────────
+# Tab "[1] DMC DOP - TIFFconverter": fix 0 in allen Baendern (Clip-Wert und
+# NoData-Tag der Kacheln) - die Anzeige folgt nur der Bandzahl der Ausgabe.
+# Tab "Create COGTIFF": waehlbar, Pixelwert je Band -> interne COG-Maske (Flag
+# PER_DATASET). Fehlende Werte fuellt der Runner mit dem letzten auf ("0 0 0" auf
+# RGBN = 0 0 0 0).
+NODATA_TAB1    = "0"
 NODATA_DEFAULT = "0 0 0 0"
 NODATA_CHOICES = ["0 0 0 0", "255 255 255 255"]
 NODATA_NO_MASK = "(keine Maske)"
@@ -115,12 +120,14 @@ def _fit_nodata_text(text: str, band_count) -> str:
 
 # ─── Band-Kuerzel im Dateinamen (Spiegel von _osgeo_runner._band_token) ───────
 # Beispiel: 2026_GUPPENFIRN_DOP_10cm_RGBN_2713_1206_LV95.tif
-BAND_TOKEN_BY_MODE  = {"rgb": "RGB", "nrg": "NRG"}
+BAND_TOKEN_BY_MODE  = {"rgb": "RGB", "nrg": "NRG", "nrgb": "NRGB"}
 BAND_TOKEN_BY_COUNT = {3: "RGB", 4: "RGBN"}
+# Bandzahl der Ausgabe bei Auszug/Umsortierung - unabhaengig von der Quelle
+BAND_COUNT_BY_MODE  = {"rgb": 3, "nrg": 3, "nrgb": 4}
 
 
 def _band_token(band_mode: str, band_count) -> str:
-    """Namens-Kuerzel der Band-Ausgabe: 'RGB' | 'NRG' | 'RGBN' | '<n>BAND'."""
+    """Namens-Kuerzel der Band-Ausgabe: 'RGB' | 'NRG' | 'NRGB' | 'RGBN' | '<n>BAND'."""
     token = BAND_TOKEN_BY_MODE.get(str(band_mode).strip().lower())
     if token:
         return token
@@ -132,12 +139,14 @@ def _band_token(band_mode: str, band_count) -> str:
 
 
 def _output_band_count(band_mode: str, src_bands):
-    """Bandzahl der Ausgabe. Ein Auszug (rgb/nrg) liefert immer 3. Ohne Auszug zaehlt
-    die erkannte Bandzahl der Quelle - und solange die Datei-Info sie nicht kennt, die
-    Zusage der Auswahl selbst: '4-BAND (RGBN)' bedeutet vier Baender. Sonst stuende im
-    NoData-Feld '0 0 0', obwohl vier Baender gewaehlt sind."""
-    if str(band_mode).strip().lower() in BAND_TOKEN_BY_MODE:
-        return 3
+    """Bandzahl der Ausgabe. Ein Auszug liefert immer 3 (rgb/nrg), die Umsortierung
+    nrgb immer 4. Ohne Auszug zaehlt die erkannte Bandzahl der Quelle - und solange die
+    Datei-Info sie nicht kennt, die Zusage der Auswahl selbst: '4-BAND (RGBN)' bedeutet
+    vier Baender. Sonst stuende im NoData-Feld '0 0 0', obwohl vier Baender gewaehlt
+    sind."""
+    fixed = BAND_COUNT_BY_MODE.get(str(band_mode).strip().lower())
+    if fixed:
+        return fixed
     try:
         return int(src_bands)
     except (TypeError, ValueError):
@@ -1063,7 +1072,9 @@ class DMCConverterApp(tk.Tk):
         ttk.Button(sec, text="Ordner…", command=self._browse_ln02_input
                     ).grid(row=row, column=2, pady=3)
         row += 1
-        h = ttk.Label(sec, text="Name muss auf _<E>_<N>_LV95_<LHN95|LN02>.las/.laz enden (daraus der Tile-Ursprung)", font=("", 8), justify="left")
+        h = ttk.Label(sec, text="Name muss auf _<E>_<N>_LV95_<LHN95|LN02>.las/.laz enden (daraus der Tile-Ursprung)\n"
+                                "Beim Start werden *_LHN95.las/.laz HIER auf *_LN02 umbenannt (nur der Name)",
+                      font=("", 8), justify="left")
         h.grid(row=row, column=1, sticky="w", padx=(8, 0))
         self._dim_labels.append(h)
         row += 1
@@ -2028,13 +2039,14 @@ class DMCConverterApp(tk.Tk):
 
         lbl5 = ttk.Label(sec, text="NoData-Werte:", font=("Segoe UI", 9, "bold"))
         lbl5.grid(row=5, column=0, sticky="w", pady=(8, 3))
-        self._nodata_var = tk.StringVar(value=NODATA_DEFAULT)
-        self._nodata_combo = ttk.Combobox(sec, textvariable=self._nodata_var,
-                                           values=NODATA_CHOICES, width=18)
-        self._nodata_combo.grid(row=5, column=1, sticky="w", padx=(8, 0), pady=(8, 3))
-        h_nd = ttk.Label(sec, text="derselbe Wert in allen Baendern (NoData-Tag der Kacheln, wirkt pro Band)\n"
-                                   "Clip ausserhalb  |  Anzahl Werte folgt der Band-Ausgabe (RGBN: 0 0 0 0)\n"
-                                   "Nur echtes NoData wird geflaggt: trifft der Wert echte Messwerte\n"
+        # Fix 0 - die Anzeige zeigt nur, wie viele Baender die Ausgabe hat
+        self._nodata_var = tk.StringVar(value=_fit_nodata_text(NODATA_TAB1, 4))
+        self._nodata_lbl = ttk.Label(sec, textvariable=self._nodata_var, font=("Courier New", 9))
+        self._nodata_lbl.grid(row=5, column=1, sticky="w", padx=(8, 0), pady=(8, 3))
+        self._accent_labels.append(self._nodata_lbl)
+        h_nd = ttk.Label(sec, text="fix 0 in allen Baendern (NoData-Tag der Kacheln, wirkt pro Band)\n"
+                                   "Clip ausserhalb  |  4-BAND: 0 0 0 0, 3-BAND (RGB / NRG): 0 0 0\n"
+                                   "Nur echtes NoData wird geflaggt: trifft 0 echte Messwerte\n"
                                    "(NIR = 0 ueber Wasser), hebt der Runner sie um einen DN an",
                           font=("", 8), justify="left")
         h_nd.grid(row=6, column=1, columnspan=2, sticky="w", padx=(8, 0))
@@ -2093,27 +2105,30 @@ class DMCConverterApp(tk.Tk):
         return _band_token(self._band_mode(), getattr(self, "_src_bands", None))
 
     def _on_band_mode_change(self):
-        """Band-Ausgabe gewechselt: NoData-Auswahl und Namensvorschau nachziehen."""
-        self._sync_nodata_widget(getattr(self, "_nodata_combo", None),
-                                 getattr(self, "_nodata_var", None),
-                                 self._band_mode(), getattr(self, "_src_bands", None))
+        """Band-Ausgabe gewechselt: NoData-Anzeige und Namensvorschau nachziehen."""
+        self._sync_tab1_nodata()
         self._update_name_preview()
 
+    def _sync_tab1_nodata(self) -> None:
+        """NoData-Anzeige im Tab [1]: fix 0, so viele Werte wie die Ausgabe Baender hat."""
+        nd_var = getattr(self, "_nodata_var", None)
+        if nd_var is not None:
+            n = _output_band_count(self._band_mode(), getattr(self, "_src_bands", None))
+            nd_var.set(_fit_nodata_text(NODATA_TAB1, n))
+
     def _band_mode(self) -> str:
-        """Combobox-Beschriftung -> Runner-Schluessel ('keep' | 'rgb' | 'nrg')."""
+        """Combobox-Beschriftung -> Runner-Schluessel ('keep' | 'rgb' | 'nrg' | 'nrgb')."""
         return BAND_MODE_KEYS.get(self._band_var.get(), "keep")
 
     def _sync_nodata_widget(self, nd_combo, nd_var, band_mode: str, src_bands) -> None:
-        """Haelt die NoData-Auswahl an der Bandzahl der Ausgabe: bei 4-Band (RGBN)
-        stehen dort vier Werte, bei einem 3-Band-Auszug drei. Der Runner fuellt
+        """Haelt die NoData-Auswahl ('Create COGTIFF') an der Bandzahl der Ausgabe: bei
+        4-Band stehen dort vier Werte, bei einem 3-Band-Auszug drei. Der Runner fuellt
         fehlende Werte ohnehin mit dem letzten auf - die Anzeige soll die Ausgabe
         aber nicht falsch beschreiben. '(keine Maske)' bleibt unangetastet."""
         if nd_combo is None or nd_var is None:
             return
         n = _output_band_count(band_mode, src_bands)
-        choices = _nodata_choices(n)
-        if nd_combo is getattr(self, "_cog_nodata_combo", None):
-            choices = choices + [NODATA_NO_MASK]
+        choices = _nodata_choices(n) + [NODATA_NO_MASK]
         try:
             nd_combo.config(values=choices)
         except Exception:
@@ -2126,9 +2141,9 @@ class DMCConverterApp(tk.Tk):
 
     def _apply_band_availability(self, band_count, combo=None, var=None, hint=None,
                                   nd_combo=None, nd_var=None) -> None:
-        """Die 3-Band-Auszuege setzen einen 4-Band-Input (RGBN) voraus. Passt der
-        erkannte Input nicht dazu, wird die Auswahl gesperrt und auf '4-Band'
-        zurueckgesetzt - sonst laeuft der Job erst im Runner in einen Fehler.
+        """Auszuege und Umsortierung (RGB/NRG/NRGB) setzen einen 4-Band-Input (RGBN)
+        voraus. Passt der erkannte Input nicht dazu, wird die Auswahl gesperrt und auf
+        '4-Band' zurueckgesetzt - sonst laeuft der Job erst im Runner in einen Fehler.
         band_count=None bedeutet 'unbekannt' (keine Datei-Info gelesen).
         Ohne Widget-Angabe die des Tabs [1]; 'Create COGTIFF' uebergibt
         seine eigenen."""
@@ -2136,8 +2151,6 @@ class DMCConverterApp(tk.Tk):
         var = var or self._band_var
         hint = hint or self._band_hint_lbl
         is_tab1 = combo is self._band_combo
-        nd_combo = nd_combo or (self._nodata_combo if is_tab1 else None)
-        nd_var = nd_var or (self._nodata_var if is_tab1 else None)
         try:
             count = int(band_count)
         except (TypeError, ValueError):
@@ -2157,10 +2170,12 @@ class DMCConverterApp(tk.Tk):
             combo.config(state="disabled")
             hint.config(text=BAND_HINT_NOT4.format(count=count))
 
-        self._sync_nodata_widget(nd_combo, nd_var,
-                                 BAND_MODE_KEYS.get(var.get(), "keep"), count)
         if is_tab1:
+            self._sync_tab1_nodata()
             self._update_name_preview()
+        else:
+            self._sync_nodata_widget(nd_combo, nd_var,
+                                     BAND_MODE_KEYS.get(var.get(), "keep"), count)
 
     def _build_dateien(self, parent):
         sec = ttk.LabelFrame(parent, text="Ordner & Shapes", padding=10,
@@ -2927,19 +2942,6 @@ class DMCConverterApp(tk.Tk):
             except Exception:
                 errors.append("JPEG-Qualitaet ungueltig (ganze Zahl von 1 bis 100, z.B. 90).")
 
-        try:
-            nd = _parse_nodata_text(self._nodata_var.get())
-            if len(set(nd)) > 1:
-                errors.append("NoData-Werte: die Kacheln tragen EINEN NoData-Wert fuer alle "
-                              "Baender - bitte in jedem Band denselben Wert, z.B. 0 0 0.")
-            # Mehr Werte als Baender laesst der Runner nicht zu - hier statt erst dort melden.
-            n_out = _output_band_count(self._band_mode(), getattr(self, "_src_bands", None))
-            if n_out and len(nd) > n_out:
-                errors.append(f"NoData-Werte: {len(nd)} Werte angegeben, die Ausgabe hat aber "
-                              f"nur {n_out} Band/Baender.")
-        except ValueError:
-            errors.append("NoData-Werte ungueltig (Zahlen durch Leerzeichen getrennt, z.B. 0 0 0).")
-
         in_dir = self._in_var.get().strip()
         if not in_dir:
             errors.append("Input-Ordner fehlt.")
@@ -3000,7 +3002,8 @@ class DMCConverterApp(tk.Tk):
             "num_workers":      int(self._workers_var.get()),
             "keep_staging":     bool(self._keep_staging_var.get()),
             "band_mode":        self._band_mode(),
-            "nodata":           " ".join(self._nodata_var.get().split()),
+            # fix 0 - der Runner fuellt auf die tatsaechliche Bandzahl der Ausgabe auf
+            "nodata":           NODATA_TAB1,
             "create_cog":       bool(self._create_cog_var.get()),
             "cog_quality":      (int(self._cog_quality_var.get().strip().rstrip("%"))
                                  if self._create_cog_var.get() else 90),
@@ -3156,7 +3159,8 @@ class DMCConverterApp(tk.Tk):
             "transformieren (nur die Höhe, X/Y bleiben LV95).\n\n"
             "Danach im Tab \"[2b] DMC DSM - LASconverter [LN02]\":\n"
             "den GeoSuite-Output als Input-Ordner wählen. Dort werden die Kacheln\n"
-            "GDWH-tauglich finalisiert - LAS 1.4 / PF7 mit RGB, global_encoding 17\n"
+            "zuerst von _LHN95 auf _LN02 umbenannt und dann GDWH-tauglich\n"
+            "finalisiert - LAS 1.4 / PF7 mit RGB, global_encoding 17\n"
             "und der autoritative CRS-Tag LV95 + LN02 (EPSG:2056 + 5728)."
         ).format(cfg["output_dir_laz"], cfg["out_format"])
 
@@ -3210,7 +3214,7 @@ class DMCConverterApp(tk.Tk):
                 os.path.normcase(os.path.abspath(in_dir)) == os.path.normcase(os.path.abspath(out_dir)):
             # Sonst wuerde die Ausgabe je nach Benennung die Quelle ueberschreiben.
             errors.append("Input- und Output-Ordner sind identisch - bitte ein separates "
-                           "Zielverzeichnis waehlen (die Quelldateien bleiben so unangetastet).")
+                           "Zielverzeichnis waehlen (die Quelldateien werden so nie ueberschrieben).")
 
         if self._ln02_create_raster_var.get():
             try:

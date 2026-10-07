@@ -169,6 +169,8 @@ def test_tiff_tab_name_preview():
         text = app._name_preview_lbl.cget("text")
         assert "2026_GUPPENFIRN_DOP_10cm_NRG_<NAME>_LV95.tif" in text
         assert "cog_QC\\2026_GUPPENFIRN_DOP_10cm_NRG_checkData_LV95.tif" in text
+        app._band_var.set(gui_mod.BAND_NRGB)
+        assert "2026_GUPPENFIRN_DOP_10cm_NRGB_<NAME>_LV95.tif" in app._name_preview_lbl.cget("text")
         # 3-Band-Input ohne Auszug -> RGB statt RGBN
         app._band_var.set(gui_mod.BAND_KEEP)
         app._apply_band_availability(3)
@@ -187,7 +189,7 @@ def test_band_token_matches_between_gui_and_runner():
         "runner_module", os.path.join(PROJECT_ROOT, "process_scripts", "_osgeo_runner.py"))
     for mode, count, expected in [
         ("keep", 4, "RGBN"), ("keep", 3, "RGB"), ("keep", 5, "5BAND"),
-        ("rgb", 4, "RGB"), ("nrg", 4, "NRG"),
+        ("rgb", 4, "RGB"), ("nrg", 4, "NRG"), ("nrgb", 4, "NRGB"), ("nrgb", None, "NRGB"),
         ("keep", None, "RGBN"),          # Bandzahl unbekannt -> Normalfall 4-BAND
     ]:
         assert gui_mod._band_token(mode, count) == expected, (mode, count)
@@ -195,8 +197,9 @@ def test_band_token_matches_between_gui_and_runner():
 
 
 def test_nodata_choices_follow_band_count():
-    """Die NoData-Auswahl beschreibt die Ausgabe: 4-BAND -> vier Werte. Inhaltlich
-    aendert das nichts (der Runner fuellt auf), die Anzeige darf aber nicht luegen."""
+    """Die NoData-Auswahl ('Create COGTIFF') beschreibt die Ausgabe: 4-BAND -> vier
+    Werte. Inhaltlich aendert das nichts (der Runner fuellt auf), die Anzeige darf aber
+    nicht luegen."""
     gui_mod = load_module_from_path(
         "gui_module", os.path.join(PROJECT_ROOT, "GUI_DMCdataConverter.py"))
     assert gui_mod._nodata_choices(4) == ["0 0 0 0", "255 255 255 255"]
@@ -206,13 +209,16 @@ def test_nodata_choices_follow_band_count():
     assert gui_mod._fit_nodata_text("0 0 0", 4) == "0 0 0 0"
     assert gui_mod._fit_nodata_text("255 255 255 255", 3) == "255 255 255"
     assert gui_mod._fit_nodata_text("0 0 0", None) == "0 0 0"
-    # Ein Auszug liefert immer 3 Baender, unabhaengig von der Quelle
+    # Ein Auszug liefert immer 3 Baender, die Umsortierung NRGB immer 4 - unabhaengig
+    # von der Quelle
     assert gui_mod._output_band_count("nrg", 4) == 3
+    assert gui_mod._output_band_count("nrgb", 4) == 4
     assert gui_mod._output_band_count("keep", 4) == 4
     assert gui_mod._output_band_count("keep", 3) == 3
     # Ohne gelesene Datei-Info zaehlt die Zusage der Auswahl: "4-BAND (RGBN)" = 4
     assert gui_mod._output_band_count("keep", None) == 4
     assert gui_mod._output_band_count("nrg", None) == 3
+    assert gui_mod._output_band_count("nrgb", None) == 4
 
 
 def test_tiff_tab_band_selection():
@@ -252,21 +258,23 @@ def test_tiff_tab_band_selection():
         app._apply_band_availability(None)
         assert str(app._band_combo.cget("state")) == "readonly"
 
-        # Die NoData-Auswahl folgt der Bandzahl der AUSGABE: bei 4-BAND (RGBN)
-        # vier Werte, bei einem 3-Band-Auszug drei. Der Runner fuellt fehlende
-        # Werte ohnehin auf - die Anzeige soll die Ausgabe nur nicht falsch
-        # beschreiben.
+        # NRGB: 4-Band-Umsortierung, ebenfalls nur bei 4-BAND-Input waehlbar
         app._apply_band_availability(4)
-        assert app._nodata_var.get() == "0 0 0 0"
-        assert list(app._nodata_combo.cget("values")) == ["0 0 0 0", "255 255 255 255"]
-        app._band_var.set(gui_mod.BAND_RGB)
-        assert app._nodata_var.get() == "0 0 0"
-        app._band_var.set(gui_mod.BAND_KEEP)
-        assert app._nodata_var.get() == "0 0 0 0"
-        # Weisses NoData bleibt weiss, nur die Anzahl folgt
-        app._nodata_var.set("255 255 255 255")
-        app._band_var.set(gui_mod.BAND_NRG)
-        assert app._nodata_var.get() == "255 255 255"
+        app._band_var.set(gui_mod.BAND_NRGB)
+        assert app._band_mode() == "nrgb"
+        app._apply_band_availability(3)
+        assert app._band_mode() == "keep"
+
+        # NoData im Tab [1]: fix 0, keine Auswahl (kein 255) - die Anzeige folgt nur
+        # der Bandzahl der AUSGABE
+        assert not hasattr(app, "_nodata_combo")
+        assert str(app._nodata_lbl.cget("textvariable")) == str(app._nodata_var)
+        app._apply_band_availability(4)
+        for choice, expected in ((gui_mod.BAND_KEEP, "0 0 0 0"), (gui_mod.BAND_RGB, "0 0 0"),
+                                 (gui_mod.BAND_NRG, "0 0 0"), (gui_mod.BAND_NRGB, "0 0 0 0")):
+            app._band_var.set(choice)
+            assert app._nodata_var.get() == expected, choice
+        assert gui_mod.NODATA_TAB1 == "0"
     finally:
         app.destroy()
 
@@ -283,9 +291,48 @@ def test_band_modes_match_between_gui_and_runner():
         os.path.join(PROJECT_ROOT, "process_scripts", "_osgeo_runner.py"),
     )
     assert set(gui_mod.BAND_MODE_KEYS.values()) == set(runner_mod.BAND_MODES)
-    # RGB = Quellbaender 1,2,3  |  NRG = Quellbaender 4,1,2 (NIR, Rot, Gruen)
-    assert runner_mod.BAND_MODES == {"keep": None, "rgb": [1, 2, 3], "nrg": [4, 1, 2]}
+    # RGB = Quellbaender 1,2,3  |  NRG = 4,1,2 (NIR, Rot, Gruen)  |  NRGB = 4,1,2,3
+    assert runner_mod.BAND_MODES == {"keep": None, "rgb": [1, 2, 3], "nrg": [4, 1, 2],
+                                     "nrgb": [4, 1, 2, 3]}
+    assert set(runner_mod.BAND_MODE_LABELS) == set(runner_mod.BAND_MODES)
     assert callable(runner_mod._select_bands)
+
+
+def test_display_colour_interpretation_band4_follows_order(monkeypatch):
+    """Band 4 ist bei RGBN das NIR, bei NRGB das Blau - dort darf es weder als NIR
+    noch als Alpha gelten. Baender 1-3 bleiben in beiden Faellen Rot/Gruen/Blau."""
+    import sys
+    import types
+    fake_gdal = types.SimpleNamespace(GCI_RedBand="R", GCI_GreenBand="G", GCI_BlueBand="B",
+                                      GCI_Undefined="U", GCI_NIRBand="NIR")
+    monkeypatch.setitem(sys.modules, "osgeo", types.SimpleNamespace(gdal=fake_gdal))
+    runner_mod = _runner()
+
+    class _Band:
+        ci = None
+
+        def SetColorInterpretation(self, ci):
+            self.ci = ci
+
+    class _DS:
+        def __init__(self, n):
+            self.RasterCount = n
+            self.bands = [_Band() for _ in range(n)]
+
+        def GetRasterBand(self, i):
+            return self.bands[i - 1]
+
+    for token, expected in (("RGBN", ["R", "G", "B", "NIR"]), ("NRGB", ["R", "G", "B", "U"])):
+        ds = _DS(4)
+        runner_mod._set_display_colour_interpretation(ds, token)
+        assert [b.ci for b in ds.bands] == expected, token
+    ds = _DS(4)
+    runner_mod._set_display_colour_interpretation(ds)          # Default = RGBN
+    assert ds.bands[3].ci == "NIR"
+    ds = _DS(3)
+    runner_mod._set_display_colour_interpretation(ds, "NRG")
+    assert [b.ci for b in ds.bands] == ["R", "G", "B"]
+    assert runner_mod.BAND_LABELS_BY_TOKEN["NRGB"] == ("NIR", "Rot", "Gruen", "Blau")
 
 
 def test_band_selection_needs_four_band_input(tmp_path, monkeypatch):
@@ -428,6 +475,73 @@ def test_ln02_parse_tile_origin():
         runner_mod._parse_tile_origin("irgendwas_ohne_muster.las")
     with pytest.raises(ValueError):  # ausserhalb der Schweizer LV95-Ausdehnung
         runner_mod._parse_tile_origin("2026_X_TIN_raw_9999_1206_LV95_LN02.las")
+
+
+def test_ln02_rename_lhn95_inputs(tmp_path):
+    """GeoSuite laesst den Namen auf _LHN95 stehen: nur .las/.laz mit diesem Suffix
+    werden auf _LN02 umbenannt, alles andere bleibt; ein zweiter Lauf ist harmlos."""
+    runner_mod = _runner()
+    for name in ("2026_G_TIN_raw_2713_1206_LV95_LHN95.las",
+                 "2026_G_TIN_thinnedout04_raw_2714_1206_LV95_LHN95.laz",
+                 "2026_G_TIN_raw_2715_1206_LV95_LN02.laz",       # schon richtig
+                 "2026_G_TIN_raw_2713_1206_LV95_LHN95.lax",      # kein LAS/LAZ
+                 "2026_G_LHN95_TIN_raw_2716_1206_LV95.las",      # LHN95 nicht am Ende
+                 "notiz_LHN95.txt"):
+        (tmp_path / name).write_bytes(b"x")
+
+    pairs = runner_mod._rename_lhn95_inputs(str(tmp_path))
+
+    assert [(os.path.basename(s), os.path.basename(d)) for s, d in pairs] == [
+        ("2026_G_TIN_raw_2713_1206_LV95_LHN95.las",
+         "2026_G_TIN_raw_2713_1206_LV95_LN02.las"),
+        ("2026_G_TIN_thinnedout04_raw_2714_1206_LV95_LHN95.laz",
+         "2026_G_TIN_thinnedout04_raw_2714_1206_LV95_LN02.laz")]
+    assert sorted(os.listdir(tmp_path)) == sorted([
+        "2026_G_TIN_raw_2713_1206_LV95_LN02.las",
+        "2026_G_TIN_thinnedout04_raw_2714_1206_LV95_LN02.laz",
+        "2026_G_TIN_raw_2715_1206_LV95_LN02.laz",
+        "2026_G_TIN_raw_2713_1206_LV95_LHN95.lax",
+        "2026_G_LHN95_TIN_raw_2716_1206_LV95.las",
+        "notiz_LHN95.txt"])
+    assert runner_mod._rename_lhn95_inputs(str(tmp_path)) == []
+
+
+def test_ln02_rename_lhn95_inputs_conflict_renames_nothing(tmp_path):
+    """Existiert ein Zielname schon, wird GAR NICHTS umbenannt - auch die
+    konfliktfreien Dateien nicht."""
+    import pytest
+    runner_mod = _runner()
+    ok = tmp_path / "2026_G_TIN_raw_2713_1206_LV95_LHN95.laz"
+    clash_src = tmp_path / "2026_G_TIN_raw_2714_1206_LV95_LHN95.laz"
+    clash_dst = tmp_path / "2026_G_TIN_raw_2714_1206_LV95_LN02.laz"
+    for p in (ok, clash_src, clash_dst):
+        p.write_bytes(b"x")
+
+    with pytest.raises(FileExistsError, match="2714_1206"):
+        runner_mod._rename_lhn95_inputs(str(tmp_path))
+    assert ok.exists() and clash_src.exists() and clash_dst.exists()
+
+
+def test_ln02_process_renames_before_anything_else(tmp_path, monkeypatch):
+    """Der Rename ist der allererste Schritt: auch wenn der Lauf danach an einem
+    unlesbaren Namen scheitert, sind die _LHN95-Kacheln bereits umbenannt."""
+    import pytest
+    _fake_osgeo(monkeypatch)
+    runner_mod = _runner()
+    in_dir = tmp_path / "in"
+    in_dir.mkdir()
+    (in_dir / "2026_G_TIN_raw_2713_1206_LV95_LHN95.laz").write_bytes(b"x")
+    (in_dir / "ohne_muster.las").write_bytes(b"x")
+    pdal_exe = tmp_path / "pdal.exe"
+    pdal_exe.write_bytes(b"")
+
+    cfg = {"jahr": "2026", "area": "G", "input_dir": str(in_dir),
+           "output_dir_las": str(tmp_path / "out"), "staging_dir": str(tmp_path / "stg"),
+           "pdal_exe": str(pdal_exe), "num_workers": 1}
+    with pytest.raises(ValueError, match="ohne_muster.las"):
+        runner_mod._process_las_ln02(cfg)
+    assert sorted(os.listdir(in_dir)) == ["2026_G_TIN_raw_2713_1206_LV95_LN02.laz",
+                                          "ohne_muster.las"]
 
 
 def test_ln02_inject_reference_vlrs(tmp_path):
@@ -2030,6 +2144,34 @@ def test_alpha_band_would_destroy_rgb_without_normalisation(tmp_path):
 
     # Ohne Alpha-Tag ist nichts zu tun: die Quelle wird unveraendert durchgereicht
     assert runner_mod._normalize_alpha_band(fixed, tmp_path, lambda *_: None) == fixed
+
+
+def test_select_bands_nrgb_reorders_and_tags(tmp_path):
+    """NRGB: alle vier Baender, Reihenfolge NIR/Rot/Gruen/Blau. Baender 1-3 als
+    Rot/Gruen/Blau getaggt (Anzeige Falschfarben-Infrarot), Band 4 (Blau) weder NIR
+    noch Alpha."""
+    import pytest
+    gdal = pytest.importorskip("osgeo.gdal", reason="GDAL nur unter OSGeo4W verfuegbar")
+    np = pytest.importorskip("numpy")
+    gdal.UseExceptions()
+    runner_mod = _runner()
+
+    src = str(tmp_path / "rgbn.tif")
+    ds = gdal.GetDriverByName("GTiff").Create(src, 16, 16, 4, gdal.GDT_Byte)
+    ds.SetGeoTransform((2600000, 0.1, 0, 1200000, 0, -0.1))
+    for b in range(1, 5):                       # R=10, G=20, B=30, N=40
+        ds.GetRasterBand(b).WriteArray(np.full((16, 16), b * 10, dtype=np.uint8))
+    ds = None
+
+    out = runner_mod._select_bands(src, "nrgb", tmp_path, lambda *_: None)
+    d = gdal.Open(out)
+    assert d.RasterCount == 4
+    assert [int(d.GetRasterBand(i).ReadAsArray(0, 0, 1, 1)[0, 0]) for i in range(1, 5)] \
+        == [40, 10, 20, 30]
+    cis = [d.GetRasterBand(i).GetColorInterpretation() for i in range(1, 5)]
+    assert cis[:3] == [gdal.GCI_RedBand, gdal.GCI_GreenBand, gdal.GCI_BlueBand]
+    assert cis[3] == gdal.GCI_Undefined
+    d = None
 
 
 def test_nodata_collisions_are_resolved(tmp_path):
